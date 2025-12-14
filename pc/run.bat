@@ -4,6 +4,9 @@ setlocal ENABLEDELAYEDEXPANSION
 set REPO_RAW=https://raw.githubusercontent.com/GonzalesLabVU/Behavior-BCI/main
 set REPO_ZIP=https://github.com/GonzalesLabVU/Behavior-BCI/archive/refs/heads/main.zip
 
+set "REPO_URL=https://github.com/GonzalesLabVU/Behavior-BCI.git"
+set "BRANCH=main"
+
 set SCRIPT_DIR=%~dp0
 cd /d "%SCRIPT_DIR%"
 
@@ -61,10 +64,117 @@ echo   Running Python script...
 echo ================================================
 
 python behavioral_master.py
+set "PY_EXIT=%ERRORLEVEL%"
 
 echo.
+echo ================================================
+echo Script finished (exit code %PY_EXIT%)
+echo Preparing to push latest .xlsx data file...
+echo ================================================
+
+set "LATEST_FILE="
+for /f "usebackq delims=" %%F in (`
+  powershell -NoProfile -Command ^
+    "$f=Get-ChildItem -LiteralPath '%SCRIPT_DIR%' -Filter *_data.xlsx -File -ErrorAction SilentlyContinue ^| Sort-Object LastWriteTime -Descending ^| Select-Object -First 1; if($null -eq $f){ exit 2 } else { $f.Name }"
+`) do set "LATEST_FILE=%%F"
+
+if "%LATEST_FILE%"=="" (
+  echo No .xlsx files found in "%SCRIPT_DIR%". Skipping push.
+  goto :after_push
+)
+
+echo Latest .xlsx detected: "%LATEST_FILE%"
+
+REM --- Check git ---
+git --version >nul 2>&1
+if errorlevel 1 (
+  echo WARNING: git not found. Skipping push.
+  goto :after_push
+)
+
+set "REPO_DIR=%SCRIPT_DIR%Behavior-BCI_repo"
+
+if not exist "%REPO_DIR%\.git" (
+  echo Cloning repo into: "%REPO_DIR%"
+  git clone "%REPO_URL%" "%REPO_DIR%"
+  if errorlevel 1 (
+    echo WARNING: git clone failed. Skipping push.
+    goto :after_push
+  )
+)
+
+cd /d "%REPO_DIR%"
+
+git fetch origin >nul 2>&1
+git checkout "%BRANCH%" >nul 2>&1 || goto :after_push
+git pull origin "%BRANCH%" >nul 2>&1 || goto :after_push
+
+set "DEST_PATH="
+set "MATCH_COUNT=0"
+
+for /f "usebackq delims=" %%P in (`git ls-files`) do (
+  for %%B in ("%%P") do (
+    if /I "%%~nxB"=="%LATEST_FILE%" (
+      set "DEST_PATH=%%P"
+      set /a MATCH_COUNT+=1
+    )
+  )
+)
+
+if "%DEST_PATH%"=="" (
+  echo WARNING: "%LATEST_FILE%" is not tracked in the repo. Skipping push.
+  cd /d "%SCRIPT_DIR%"
+  goto :after_push
+)
+
+if %MATCH_COUNT% GTR 1 (
+  echo WARNING: Multiple tracked files named "%LATEST_FILE%" found. Skipping push to avoid ambiguity.
+  cd /d "%SCRIPT_DIR%"
+  goto :after_push
+)
+
+echo Repo destination: "%DEST_PATH%"
+
+copy /Y "%SCRIPT_DIR%%LATEST_FILE%" "%DEST_PATH%" >nul
+if errorlevel 1 (
+  echo WARNING: Copy into repo failed. Skipping push.
+  cd /d "%SCRIPT_DIR%"
+  goto :after_push
+)
+
+git add "%DEST_PATH%"
+
+git diff --cached --quiet
+if not errorlevel 1 (
+  echo No changes detected in "%LATEST_FILE%". Nothing to push.
+  cd /d "%SCRIPT_DIR%"
+  goto :after_push
+)
+
+for /f "usebackq delims=" %%T in (`
+  powershell -NoProfile -Command "Get-Date -Format 'yyyy-MM-dd HH:mm:ss'"
+`) do set "NOW_TS=%%T"
+
+git commit -m "Update %LATEST_FILE% (%NOW_TS%)"
+if errorlevel 1 (
+  echo WARNING: Commit failed. Skipping push.
+  cd /d "%SCRIPT_DIR%"
+  goto :after_push
+)
+
+git push origin "%BRANCH%"
+if errorlevel 1 (
+  echo WARNING: Push failed. Check GitHub auth.
+) else (
+  echo Push complete: "%LATEST_FILE%"
+)
+
+cd /d "%SCRIPT_DIR%"
+
+:after_push
+echo.
 pause
-exit /b 0
+exit /b %PY_EXIT%
 
 :download_fail
 echo.
