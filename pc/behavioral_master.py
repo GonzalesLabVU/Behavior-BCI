@@ -27,8 +27,6 @@ ANIMAL_MAP_PATH = os.path.join(SCRIPT_DIR, 'animal_map.json')
 EVT_QUEUE: "Queue[tuple[str, str]]" = Queue()
 ENC_QUEUE: "Queue[tuple[str, str]]" = Queue()
 
-RAW_LOG = deque()
-
 
 # ----- STARTUP -----
 def _load_animal_map(path=ANIMAL_MAP_PATH):
@@ -220,13 +218,10 @@ def _update_workbook_filename(cohort_name, old_animals, new_animals):
         print(f'\nRenamed workbook {old_base} to {new_base}\n', flush=True)
 
 
-def _write_to_sheet(ws, date_str, animal, phase, data):
+def _write_to_sheet(ws, date_str, animal_str, phase_str, data):
     col = 1
     while ws.cell(row=1, column=col).value is not None:
         col += 2
-    
-    animal_str = 'Animal ' + animal
-    phase_str = 'Phase ' + phase
     
     ws.cell(row=1, column=col, value=date_str)
     ws.cell(row=2, column=col, value=animal_str)
@@ -251,6 +246,9 @@ def _save_data(data, animal_id, phase_id):
     session_date = datetime.now().date()
     session_date_str = f'{session_date.month}/{session_date.day}/{session_date.year}'
 
+    animal_str = f'Animal {animal_id}' if animal_id is not None else 'Animal [unknown]'
+    phase_str = f'Phase {phase_id}' if phase_id is not None else 'Phase [unknown]'
+
     event_data = data['EVT']
     encoder_data = data['ENC']
 
@@ -262,7 +260,7 @@ def _save_data(data, animal_id, phase_id):
         else:
             ws = wb.create_sheet('Event')
         
-        _write_to_sheet(ws, session_date_str, animal_id, phase_id, event_data)
+        _write_to_sheet(ws, session_date_str, animal_str, phase_str, event_data)
     
     if encoder_data:
         if 'Encoder' in wb.sheetnames:
@@ -270,7 +268,7 @@ def _save_data(data, animal_id, phase_id):
         else:
             ws = wb.create_sheet('Encoder')
         
-        _write_to_sheet(ws, session_date_str, animal_id, phase_id, encoder_data)
+        _write_to_sheet(ws, session_date_str, animal_str, phase_str, encoder_data)
     
     try:
         wb.save(save_path)
@@ -281,25 +279,6 @@ def _save_data(data, animal_id, phase_id):
 
         wb.save(alt)
         print(f'\nWorkbook was locked; saved data to {alt}', flush=True)
-    
-    if len(RAW_LOG) > 0:
-        t_lick = [t for (t, e) in event_data if e == 'lick']
-        t_hit = [t for (t, e) in event_data if e == 'hit']
-
-        log = {
-            'cap': {
-                'time': [t for (t, _) in RAW_LOG],
-                'value': [float(v) for (_, v) in RAW_LOG]
-                },
-            't_lick': t_lick,
-            't_hit': t_hit
-            }
-        
-        fname = f'Animal_{animal_id}_raw_cap.json'
-        path = os.path.join(SCRIPT_DIR, fname)
-
-        with open(path, 'w', encoding='utf-8') as f:
-            json.dump(log, f, indent=4)
 
 
 def _save_on_error(session_data, animal_id=None, phase_id=None):
@@ -322,16 +301,16 @@ def _save_on_error(session_data, animal_id=None, phase_id=None):
     session_date = datetime.now().date()
     session_date_str = f'{session_date.month}/{session_date.day}/{session_date.year}'
 
+    animal_str = f'Animal {animal_id}' if animal_id is not None else 'Animal [unknown]'
+    phase_str = f'Phase {phase_id}' if phase_id is not None else 'Phase [unknown]'
+
     if evt:
         if 'Event' in wb.sheetnames:
             ws = wb['Event']
         else:
             ws = wb.create_sheet('Event')
         
-        _write_to_sheet(ws, session_date_str,
-                        animal_id if animal_id is not None else '[unknown]',
-                        phase_id if phase_id is not None else '[unknown]',
-                        evt)
+        _write_to_sheet(ws, session_date_str, animal_str, phase_str, evt)
     
     if enc:
         if 'Encoder' in wb.sheetnames:
@@ -339,39 +318,13 @@ def _save_on_error(session_data, animal_id=None, phase_id=None):
         else:
             ws = wb.create_sheet('Encoder')
         
-        _write_to_sheet(ws, session_date_str,
-                        animal_id if animal_id is not None else '[unknown]',
-                        phase_id if phase_id is not None else '[unknown]',
-                        enc)
+        _write_to_sheet(ws, session_date_str, animal_str, phase_str, enc)
 
     try:
         wb.save(backup_path)
         print(f'\n[ERROR] Saved session data to {backup_path}\n', flush=True)
     except Exception as e:
         print(f'\n[ERROR] Failed to save session data: {e}\n', flush=True)
-    
-    if len(RAW_LOG) > 0:
-        t_lick = [t for (t, e) in evt if e == 'lick']
-        t_hit = [t for (t, e) in evt if e == 'hit']
-
-        log = {
-            'cap': {
-                'time': [t for (t, _) in RAW_LOG],
-                'value': [float(v) for (_, v) in RAW_LOG]
-                },
-            't_lick': t_lick,
-            't_hit': t_hit
-            }
-        
-        if animal_id is not None:
-            fname = f'Animal_{animal_id}_raw_cap.json'
-        else:
-            fname = 'Animal_unknown_raw_cap.json'
-        
-        path = os.path.join(SCRIPT_DIR, fname)
-
-        with open(path, 'w', encoding='utf-8') as f:
-            json.dump(log, f, indent=4)
 
 
 def _now_ts():
@@ -423,15 +376,6 @@ def _handle_line(line, session_data, N=None, trial_stack=None):
         
         session_data["ENC"].append([ts, payload])
         ENC_QUEUE.put((ts, payload))
-
-        return None
-    
-    if line.startswith("[RAW]"):
-        parts = line.split("]", 1)
-        payload = parts[1].strip() if len(parts) > 1 else ""
-        ts = _now_ts()
-
-        RAW_LOG.append([ts, payload])
 
         return None
 
@@ -680,6 +624,13 @@ def main(ser, session_data, phase_id):
                     break
             
             time.sleep(0.01)
+
+    except KeyboardInterrupt:
+        _terminate_session(ser, session_data, msg='Session terminated by user')
+
+        t_stop = time.time()
+        finished = True
+
     finally:
         if ser and ser.is_open:
             ser.close()
@@ -726,14 +677,7 @@ if __name__ == "__main__":
         # [plotting logic]
 
     except KeyboardInterrupt:
-        try:
-            if ser is not None and ser.is_open:
-                _terminate_session(ser, session_data, msg='Session terminated by keyboard interrupt')
-        except Exception as e:
-            print(f'\n[WARNING] Failed to terminate session cleanly after KeyboardInterrupt: {e}\n')
-
         _save_on_error(session_data, animal_id, phase_id)
 
     except Exception as e:
-        print(f'\n[ERROR] Unhandled exception: {e}\n')
         _save_on_error(session_data, animal_id, phase_id)
