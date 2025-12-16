@@ -12,9 +12,16 @@ from collections import deque
 from queue import Queue
 import serial
 import serial.tools.list_ports
-from threading import Thread
+from threading import Thread, Event, Lock
 from openpyxl import load_workbook, Workbook
 import json
+import hashlib
+import re
+import requests
+import shutil
+import tempfile
+import subprocess
+from pathlib import Path
 from cursor_utils import cursor_fcn
 
 BAUDRATE = 1000000
@@ -24,8 +31,25 @@ SESSION_END_STRING = "S"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 ANIMAL_MAP_PATH = os.path.join(SCRIPT_DIR, 'animal_map.json')
 
+TMP_FILE = "session_data_tmp.json"
+TMP_PATH = os.path.join(SCRIPT_DIR, TMP_FILE)
+TMP_FLUSH_SEC = 150.0
+
+SESSION_LOCK = Lock()
+TMP_STOP = Event()
+TMP_META = {}
+
 EVT_QUEUE: "Queue[tuple[str, str]]" = Queue()
 ENC_QUEUE: "Queue[tuple[str, str]]" = Queue()
+
+REPO_URL = "https://github.com/GonzalesLabVU/Behavior-BCI.git"
+REPO_OWNER = "GonzalesLabVU"
+REPO_NAME = "Behavior-BCI"
+REPO_BRANCH = "main"
+REPO_XLSX_SUBDIR = "pc/data"
+LOCK_REF_PREFIX = "refs/heads/write_flag_"
+LOCK_POLL_SEC = 30
+LOCK_MAX_WAIT_SEC = 600
 
 
 # ----- STARTUP -----
@@ -60,6 +84,184 @@ ANIMAL_TO_COHORT = {
     for (cohort_name, animals) in COHORTS.items()
     for animal in animals
     }
+
+
+# ----- GITHUB -----
+def _gh_headers():
+    token = os.environ.get("GITHUB_TOKEN")
+    if not token:
+        raise RuntimeError("Missing GITHUB_TOKEN env var")
+    
+    return {
+        'Authorization': f'Bearer {token}',
+        'Accept': 'application/vnd.github+json',
+        'X-GitHub-Api-Version': '2022-11-28'
+        }
+
+
+def _gh_api(url, method='GET', json_body=None):
+    r = requests.request(method, url, headers=_gh_headers(), json=json_body, timeout=20)
+    return r
+
+
+def _lock_ref_for(xlsx_basename):
+    base = os.path.basename(xlsx_basename)
+    stem = Path(base).stem
+
+    slug = re.sub(r"[^A-Za-z0-9]+", "_", stem).strip("_")[:24]
+    digest = hashlib.sha1(base.encode("utf-8")).hexdigest()[:12]
+
+    return f'{LOCK_REF_PREFIX}{slug}_{digest}'
+
+
+def _acquire_write_lock(lock_ref):
+    base = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/git"
+    url_create = f"{base}/refs"
+
+    start = time.time()
+    while True:
+        r_main = _gh_api(f"{base}/ref/heads/{REPO_BRANCH}")
+        if r_main.status_code != 200:
+            raise RuntimeError(f'Failed to read branch ref: {r_main.status_code} {r_main.text}')
+        
+        main = r_main.json()
+        sha = main['object']['sha']
+
+        resp = _gh_api(url_create, method='POST', json_body={'ref': lock_ref, 'sha': sha})
+        if resp.status_code in (201,):
+            return
+        
+        if resp.status_code == 422:
+            if time.time() - start > LOCK_MAX_WAIT_SEC:
+                raise TimeoutError('Timed out waiting for write lock')
+            
+            time.sleep(LOCK_POLL_SEC)
+            continue
+
+        raise RuntimeError(f'Lock acquire failed: {resp.status_code} {resp.text}')
+
+
+def _release_write_lock(lock_ref):
+    base = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/git"
+    url_delete = f"{base}/ref/{lock_ref.replace('refs/', '')}"
+
+    resp = _gh_api(url_delete, method='DELETE')
+    if resp.status_code in (204, 404):
+        return
+    
+    raise RuntimeError(f'Lock release failed: {resp.status_code} {resp.text}')
+
+
+def _git_run(args, cwd, *, capture=False):
+    env = os.environ.copy()
+    env["GIT_TERMINAL_PROMPT"] = "0"
+
+    return subprocess.run(
+        ["git", *args],
+        cwd=str(cwd),
+        check=True,
+        text=True,
+        capture_output=capture,
+        env=env
+        )
+
+
+def _clone_repo_temp(parent_dir):
+    tmp = Path(tempfile.mkdtemp(prefix="repo_tmp_", dir=parent_dir))
+
+    try:
+        _git_run(["clone", "--depth", "1", "--branch", REPO_BRANCH, REPO_URL, str(tmp)],
+                 cwd=parent_dir)
+    except Exception:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise
+
+    return tmp
+
+
+def _find_file_in_clone(clone_root, xlsx_basename):
+    if REPO_XLSX_SUBDIR:
+        candidate = clone_root / REPO_XLSX_SUBDIR / xlsx_basename
+        if candidate.exists():
+            return candidate
+    
+    matches = list(clone_root.rglob(xlsx_basename))
+    matches = [p for p in matches if p.is_file()]
+
+    if not matches:
+        raise FileNotFoundError(f'{xlsx_basename} not found in repo clone')
+    
+    if len(matches) > 1:
+        rels = [str(p.relative_to(clone_root)) for p in matches]
+        raise RuntimeError(f'Multiple matches for {xlsx_basename} in repo clone: {rels}')
+    
+    return matches[0]
+
+
+def _pull_from_repo(xlsx_basename):
+    if not xlsx_basename.lower().endswith('.xlsx'):
+        raise ValueError('Expected an .xlsx filename')
+    
+    clone_dir = _clone_repo_temp(SCRIPT_DIR)
+
+    try:
+        src = _find_file_in_clone(clone_dir, xlsx_basename)
+        dst = Path(SCRIPT_DIR) / xlsx_basename
+        shutil.copy2(src, dst)
+        print(f'[git] Pulled {xlsx_basename} -> {dst}', flush=True)
+    except FileNotFoundError:
+        print(f'[git] {xlsx_basename} not found in repo, skipping pull', flush=True)
+    finally:
+        shutil.rmtree(clone_dir, ignore_errors=True)
+
+
+def _push_to_repo(xlsx_basename):
+    if not xlsx_basename.lower().endswith('.xlsx'):
+        raise ValueError('Expected an .xlsx filename')
+    
+    local_file = Path(SCRIPT_DIR) / xlsx_basename
+    if not local_file.exists():
+        raise FileNotFoundError(f'Local file not found: {local_file}')
+    
+    token = os.environ.get('GITHUB_TOKEN')
+    if not token:
+        raise RuntimeError('Missing GITHUB_TOKEN env var')
+    
+    push_url = f'https://x-access-token:{token}@github.com/{REPO_OWNER}/{REPO_NAME}.git'
+    clone_dir = _clone_repo_temp(SCRIPT_DIR)
+
+    try:
+        try:
+            repo_target = _find_file_in_clone(clone_dir, xlsx_basename)
+        except FileNotFoundError:
+            if not REPO_XLSX_SUBDIR:
+                raise
+
+            repo_target = Path(clone_dir) / REPO_XLSX_SUBDIR / xlsx_basename
+            repo_target.parent.mkdir(parents=True, exist_ok=True)
+
+        shutil.copy2(local_file, repo_target)
+
+        rel = repo_target.relative_to(clone_dir)
+
+        _git_run(["add", str(rel)], cwd=clone_dir)
+
+        st = _git_run(["status", "--porcelain", "--", str(rel)], cwd=clone_dir, capture=True)
+        if not st.stdout.strip():
+            print(f'[git] No changes to push for {xlsx_basename}', flush=True)
+            return
+        
+        msg = f"Update {xlsx_basename} ({datetime.now().strftime('%Y-%m-%d %H:%M:%S')})"
+        
+        _git_run(["config", "user.email", "bci-bot@users.noreply.github.com"], cwd=clone_dir)
+        _git_run(["config", "user.name", "BCI bot"], cwd=clone_dir)
+        _git_run(["commit", "-m", msg], cwd=clone_dir)
+        _git_run(["pull", "--rebase", "origin", REPO_BRANCH], cwd=clone_dir)
+        _git_run(["push", push_url, f'HEAD:{REPO_BRANCH}'], cwd=clone_dir)
+
+        print(f'[git] Committed {xlsx_basename} to {REPO_BRANCH}', flush=True)
+    finally:
+        shutil.rmtree(clone_dir, ignore_errors=True)
 
 
 # ----- HELPERS -----
@@ -122,21 +324,84 @@ def _update_cohorts(animal_id):
         return True
 
 
-def _open_or_create_workbook(path):
+def _write_tmp(session_data):
+    with SESSION_LOCK:
+        evt = list(session_data.get('EVT', []))
+        enc = list(session_data.get('ENC', []))
+    
+    payload = {
+        'meta': dict(TMP_META),
+        'event': {
+            'timestamps': [x[0] for x in evt],
+            'values': [x[1] for x in evt]
+            },
+        'encoder': {
+            'timestamps': [x[0] for x in enc],
+            'values': [x[1] for x in enc]
+            }
+        }
+    
+    tmp_path = TMP_PATH + ".tmp"
+    with open(tmp_path, 'w', encoding='utf-8') as f:
+        json.dump(payload, f, indent=4)
+    
+    os.replace(tmp_path, TMP_PATH)
+
+
+def _delete_tmp():
+    try:
+        if os.path.exists(TMP_PATH):
+            os.remove(TMP_PATH)
+    except Exception:
+        pass
+
+
+def _tmp_flush_loop(session_data):
+    try:
+        _write_tmp(session_data)
+    except Exception:
+        pass
+
+    while not TMP_STOP.wait(TMP_FLUSH_SEC):
+        try:
+            _write_tmp(session_data)
+        except Exception:
+            pass
+
+
+def _open_or_create_workbook(path, backup_path=None):
     folder = os.path.dirname(path)
     if folder and not os.path.exists(folder):
         os.makedirs(folder, exist_ok=True)
     
-    if os.path.exists(path):
+    def _load_or_new(p):
+        if os.path.exists(p):
+            return load_workbook(p)
+        
+        return Workbook()
+    
+    try:
+        wb = _load_or_new(path)
+        _validate_sheets(wb)
+        
+        return wb, False
+    except Exception as e:
+        if backup_path is None:
+            wb = Workbook()
+            _validate_sheets(wb)
+
+            return wb, True
+        
+        print(f'\n[WARNING] Workbook load failed ({e}). Falling back to backup_data.xlsx\n', flush=True)
+
         try:
-            wb = load_workbook(path)
+            wb = _load_or_new(backup_path)
         except Exception:
             wb = Workbook()
-    else:
-        wb = Workbook()
-    
-    _validate_sheets(wb)
-    return wb
+        
+        _validate_sheets(wb)
+
+        return wb, True
 
 
 def _is_sheet_empty(ws):
@@ -237,94 +502,190 @@ def _write_to_sheet(ws, date_str, animal_str, phase_str, data):
         ws.cell(row=r, column=col+1, value=val)
 
 
-def _save_data(data, animal_id, phase_id):
-    if animal_id not in ANIMAL_TO_COHORT:
-        raise ValueError(f'Unknown animal ID: {animal_id}\n')
+def _save_to_local(path, session_data, animal_id, phase_id, *, max_wait_sec=180, poll_sec=5):
+    def _format_meta():
+        session_date = datetime.now().date()
+        date_str = f'{session_date.month}/{session_date.day}/{session_date.year}'
+        animal_str = f'Animal {animal_id}' if animal_id is not None else 'Animal [unknown]'
+        phase_str = f'Phase {phase_id}' if phase_id is not None else 'Phase [unknown]'
+
+        return date_str, animal_str, phase_str
     
-    save_path = _find_workbook_for_animal(animal_id)
+    target_path = path
+    backup_path = os.path.join(SCRIPT_DIR, 'backup_data.xlsx')
 
-    session_date = datetime.now().date()
-    session_date_str = f'{session_date.month}/{session_date.day}/{session_date.year}'
-
-    animal_str = f'Animal {animal_id}' if animal_id is not None else 'Animal [unknown]'
-    phase_str = f'Phase {phase_id}' if phase_id is not None else 'Phase [unknown]'
-
-    event_data = data['EVT']
-    encoder_data = data['ENC']
-
-    wb = _open_or_create_workbook(save_path)
-
-    if event_data:
-        if 'Event' in wb.sheetnames:
-            ws = wb['Event']
-        else:
-            ws = wb.create_sheet('Event')
-        
-        _write_to_sheet(ws, session_date_str, animal_str, phase_str, event_data)
+    wb, backup_used = _open_or_create_workbook(target_path, backup_path=backup_path)
+    if backup_used:
+        target_path = backup_path
     
-    if encoder_data:
-        if 'Encoder' in wb.sheetnames:
-            ws = wb['Encoder']
-        else:
-            ws = wb.create_sheet('Encoder')
-        
-        _write_to_sheet(ws, session_date_str, animal_str, phase_str, encoder_data)
+    date_str, animal_str, phase_str = _format_meta()
+
+    try:
+        with SESSION_LOCK:
+            evt = list(session_data.get('EVT', []))
+            enc = list(session_data.get('ENC', []))
+    except Exception:
+        evt = list(session_data.get('EVT', [])) if isinstance(session_data, dict) else []
+        enc = list(session_data.get('ENC', [])) if isinstance(session_data, dict) else []
     
     try:
-        wb.save(save_path)
-        print(f'\nSaved data to {save_path}\n', flush=True)
-    except PermissionError:
-        base, ext = os.path.splitext(os.path.basename(save_path))
-        alt = os.path.join(SCRIPT_DIR, f'{base}_{int(time.time())}{ext}')
+        if evt:
+            ws = wb['Event'] if 'Event' in wb.sheetnames else wb.create_sheet('Event')
+            _write_to_sheet(ws, date_str, animal_str, phase_str, evt)
+        
+        if enc:
+            ws = wb['Encoder'] if 'Encoder' in wb.sheetnames else wb.create_sheet('Encoder')
+            _write_to_sheet(ws, date_str, animal_str, phase_str, enc)
+    except Exception as e:
+        print(f"\n[ERROR] Failed while writing into workbook in memory: {e}\n", flush=True)
+        return False, target_path, "write_failed"
+    
+    deadline = time.time() + max_wait_sec
 
-        wb.save(alt)
-        print(f'\nWorkbook was locked; saved data to {alt}', flush=True)
+    while True:
+        try:
+            wb.save(target_path)
+            print(f"\nSaved data locally to: {target_path}\n", flush=True)
+            return True, target_path, None
+
+        except PermissionError:
+            # Likely open in Excel
+            remaining = int(max(0, deadline - time.time()))
+            print(
+                f"\n[WARNING] Cannot save because the workbook is locked (likely open in Excel).\n"
+                f"Close Excel or disable protected view for this file, then save will retry.\n"
+                f"Target: {target_path}\n"
+                f"Raw backup retained: {TMP_PATH}\n"
+                f"Retrying every {poll_sec}s for up to {remaining}s...\n",
+                flush=True
+            )
+            if time.time() >= deadline:
+                return False, target_path, "locked_by_excel"
+            time.sleep(poll_sec)
+
+        except Exception as e:
+            print(f"\n[ERROR] wb.save failed for {target_path}: {e}\n"
+                  f"Raw backup retained: {TMP_PATH}\n", flush=True)
+            return False, target_path, "save_failed"
+
+
+def _save_data(session_data, animal_id, phase_id):
+    if animal_id not in ANIMAL_TO_COHORT:
+        raise ValueError(f"Unknown animal ID: {animal_id}\n")
+
+    save_path = _find_workbook_for_animal(animal_id)
+    xlsx_base = os.path.basename(save_path)
+    lock_ref = _lock_ref_for(xlsx_base)
+
+    try:
+        _acquire_write_lock(lock_ref)
+    except TimeoutError:
+        print(f"\n[WARNING] GitHub lock timed out for {xlsx_base}. Will save locally only.\n"
+              f"Raw backup retained: {TMP_PATH}\n", flush=True)
+        ok, saved_path, reason = _save_to_local(save_path, session_data, animal_id, phase_id)
+        if ok:
+            _delete_tmp()
+        else:
+            print(f"\n[WARNING] Local save issue ({reason}). Raw backup kept: {TMP_PATH}\n", flush=True)
+        return
+    except Exception as e:
+        print(f"\n[WARNING] Lock acquisition failed for {xlsx_base} ({e}). Will save locally only.\n"
+              f"Raw backup retained: {TMP_PATH}\n", flush=True)
+        ok, saved_path, reason = _save_to_local(save_path, session_data, animal_id, phase_id)
+        if ok:
+            _delete_tmp()
+        else:
+            print(f"\n[WARNING] Local save issue ({reason}). Raw backup kept: {TMP_PATH}\n", flush=True)
+        return
+
+    try:
+        _pull_from_repo(xlsx_base)
+
+        ok, saved_path, reason = _save_to_local(save_path, session_data, animal_id, phase_id)
+        if ok:
+            _delete_tmp()
+        else:
+            print(f"\n[WARNING] Local save failed ({reason}). Not pushing.\n"
+                  f"Raw backup retained: {TMP_PATH}\n", flush=True)
+            return
+
+        try:
+            _push_to_repo(os.path.basename(saved_path))
+            print(f"\n[git] Committed {os.path.basename(saved_path)} to {REPO_BRANCH}\n", flush=True)
+        except Exception as e:
+            print(f"\n[WARNING] Push failed ({e}).\n"
+                  f"Data is saved locally to: {saved_path}\n"
+                  f"Raw backup retained: {TMP_PATH}\n", flush=True)
+    finally:
+        try:
+            _release_write_lock(lock_ref)
+        except Exception as e:
+            print(f"\n[WARNING] Lock release failed ({e}).\n", flush=True)
 
 
 def _save_on_error(session_data, animal_id=None, phase_id=None):
     if not isinstance(session_data, dict):
         return
-    
+
     try:
+        with SESSION_LOCK:
+            evt = list(session_data.get("EVT", []))
+            enc = list(session_data.get("ENC", []))
+    except Exception:
         evt = list(session_data.get("EVT", []))
         enc = list(session_data.get("ENC", []))
-    except Exception:
-        return
-    
+
     if not evt and not enc:
-        print('\nNo data collected\n')
+        print("\nNo data collected\n", flush=True)
         return
-    
-    backup_path = os.path.join(SCRIPT_DIR, 'backup_data.xlsx')
-    wb = _open_or_create_workbook(backup_path)
 
-    session_date = datetime.now().date()
-    session_date_str = f'{session_date.month}/{session_date.day}/{session_date.year}'
+    if animal_id is not None and animal_id in ANIMAL_TO_COHORT:
+        save_path = _find_workbook_for_animal(animal_id)
+    else:
+        save_path = os.path.join(SCRIPT_DIR, "backup_data.xlsx")
 
-    animal_str = f'Animal {animal_id}' if animal_id is not None else 'Animal [unknown]'
-    phase_str = f'Phase {phase_id}' if phase_id is not None else 'Phase [unknown]'
-
-    if evt:
-        if 'Event' in wb.sheetnames:
-            ws = wb['Event']
-        else:
-            ws = wb.create_sheet('Event')
-        
-        _write_to_sheet(ws, session_date_str, animal_str, phase_str, evt)
-    
-    if enc:
-        if 'Encoder' in wb.sheetnames:
-            ws = wb['Encoder']
-        else:
-            ws = wb.create_sheet('Encoder')
-        
-        _write_to_sheet(ws, session_date_str, animal_str, phase_str, enc)
+    xlsx_base = os.path.basename(save_path)
+    lock_ref = _lock_ref_for(xlsx_base)
 
     try:
-        wb.save(backup_path)
-        print(f'\n[ERROR] Saved session data to {backup_path}\n', flush=True)
+        _acquire_write_lock(lock_ref)
+        locked = True
+    except TimeoutError:
+        locked = False
+        print(f"\n[WARNING] GitHub lock timed out during error-save for {xlsx_base}.\n"
+              f"Will save locally only.\n"
+              f"Raw backup retained: {TMP_PATH}\n", flush=True)
     except Exception as e:
-        print(f'\n[ERROR] Failed to save session data: {e}\n', flush=True)
+        locked = False
+        print(f"\n[WARNING] Lock acquisition failed during error-save for {xlsx_base} ({e}).\n"
+              f"Will save locally only.\n"
+              f"Raw backup retained: {TMP_PATH}\n", flush=True)
+
+    try:
+        if locked:
+            _pull_from_repo(xlsx_base)
+
+        ok, saved_path, reason = _save_to_local(save_path, session_data, animal_id, phase_id)
+        if ok:
+            _delete_tmp()
+        else:
+            print(f"\n[WARNING] Local save issue ({reason}). Raw backup kept: {TMP_PATH}\n", flush=True)
+            return
+
+        if locked:
+            try:
+                _push_to_repo(os.path.basename(saved_path))
+                print(f"\n[git] Pushed {os.path.basename(saved_path)} successfully\n", flush=True)
+            except Exception as e:
+                print(f"\n[WARNING] Push failed ({e}).\n"
+                      f"Data is saved locally to: {saved_path}\n"
+                      f"Raw backup retained: {TMP_PATH}\n", flush=True)
+    finally:
+        if locked:
+            try:
+                _release_write_lock(lock_ref)
+            except Exception as e:
+                print(f"\n[WARNING] Lock release failed ({e}).\n", flush=True)
 
 
 def _now_ts():
@@ -353,14 +714,17 @@ def _handle_line(line, session_data, N=None, trial_stack=None):
         payload = parts[1].strip() if len(parts) > 1 else ""
         ts = _now_ts()
 
-        session_data["EVT"].append([ts, payload])
+        with SESSION_LOCK:
+            session_data["EVT"].append([ts, payload])
+
         EVT_QUEUE.put((ts, payload))
 
         if payload in {"hit", "miss"}:
-            if len(session_data['EVT']) >= 2:
-                prev_payload = session_data['EVT'][-2][1]
-                if prev_payload in {"hit", "miss"}:
-                    return None
+            with SESSION_LOCK:
+                if len(session_data['EVT']) >= 2:
+                    prev_payload = session_data['EVT'][-2][1]
+                    if prev_payload in {"hit", "miss"}:
+                        return None
             
             if trial_stack is not None:
                 if len(trial_stack) >= N:
@@ -374,7 +738,9 @@ def _handle_line(line, session_data, N=None, trial_stack=None):
         payload = parts[1].strip() if len(parts) > 1 else ""
         ts = _now_ts()
         
-        session_data["ENC"].append([ts, payload])
+        with SESSION_LOCK:
+            session_data["ENC"].append([ts, payload])
+
         ENC_QUEUE.put((ts, payload))
 
         return None
@@ -426,8 +792,13 @@ def _set_easy_rate(ser, session_data, trial_stack):
         _send_to_serial(ser, session_data, str(K))
     except Exception as e:
         print(f"Failed to send calibrated easy-trial rate to Arduino: {e}\n")
-        ser.close()
-        sys.exit(1)
+        
+        try:
+            ser.close()
+        except Exception:
+            pass
+
+        raise RuntimeError
     
     EVT_QUEUE.put((_now_ts(), f'setK {K}'))
 
@@ -653,11 +1024,22 @@ if __name__ == "__main__":
     animal_id = None
     phase_id = None
     dev_mode = True
-    cursor_thread = None
     ser = None
+    cursor_thread = None
+    tmp_thread = None
 
     try:
         ser, animal_id, phase_id, session_data, cursor_thread, dev_mode = setup(session_data)
+
+        TMP_META = {
+            'date': datetime.now().strftime('%m/%d/%Y'),
+            'animal': animal_id,
+            'phase': phase_id
+            }
+        
+        tmp_thread = Thread(target=_tmp_flush_loop, args=(session_data,), daemon=True)
+        tmp_thread.start()
+
         session_data = main(ser, session_data, phase_id)
 
         try:
@@ -679,5 +1061,21 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         _save_on_error(session_data, animal_id, phase_id)
 
+    except SystemExit:
+        try:
+            with SESSION_LOCK:
+                has_any = bool(session_data.get('EVT')) or bool (session_data.get('ENC'))
+            
+            if has_any:
+                _save_on_error(session_data, animal_id, phase_id)
+        finally:
+            raise
+
     except Exception as e:
         _save_on_error(session_data, animal_id, phase_id)
+    
+    finally:
+        TMP_STOP.set()
+
+        if tmp_thread is not None:
+            tmp_thread.join(timeout=2.0)
