@@ -1,22 +1,26 @@
 import os
 import sys
 import warnings
+import traceback
+
+import random
 import time
+import socket
+import uuid
 import json
-import re
-import shutil
-import tempfile
-import subprocess
-import smtplib
-import ssl
-from email.message import EmailMessage
-from pathlib import Path
+import functools
 from datetime import datetime
-from contextlib import contextmanager
+from pathlib import Path
 from queue import Queue, Empty
 from threading import Thread, Event
 
-import requests
+import gspread
+from gspread.utils import rowcol_to_a1
+from google.oauth2.service_account import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+from dotenv import load_dotenv
+
 import serial
 import serial.tools.list_ports
 
@@ -26,107 +30,43 @@ from cursor_utils import cursor_fcn
 # ---------------------------
 # BASIC CONFIG
 # ---------------------------
-os.environ['PYGAME_HIDE_SUPPORT_PROMPT'] = '1'
+os.environ["PYGAME_HIDE_SUPPORT_PROMPT"] = "1"
 try:
-    os.system('cls' if os.name == 'nt' else 'clear')
+    os.system("cls" if os.name == "nt" else "clear")
 except Exception:
     pass
 
-warnings.filterwarnings('ignore',
-                        category=UserWarning,
-                        message='pkg_resources is deprecated as an API.*')
+warnings.filterwarnings(
+    "ignore",
+    category=UserWarning,
+    message="pkg_resources is deprecated as an API.*",
+)
 
 BAUDRATE = 1_000_000
-SESSION_END_STRING = 'S'
+SESSION_END_STRING = "S"
 
-SCRIPT_DIR = Path(__file__).resolve().parent
-LOCAL_MAP_PATH = SCRIPT_DIR / 'animal_map.json'
-
-EVT_QUEUE: 'Queue[tuple[str, str]]' = Queue()
-ENC_QUEUE: 'Queue[tuple[str, str]]' = Queue()
-
-
-# ---------------------------
-# REPOSITORY CONFIG
-# ---------------------------
-REPO_URL = 'https://github.com/GonzalesLabVU/Behavior-BCI.git'
-REPO_OWNER = 'GonzalesLabVU'
-REPO_NAME = 'Behavior-BCI'
-REPO_BRANCH = 'main'
-
-REPO_DATA_DIR = Path('pc/data')
-REPO_MAP_PATH = Path('pc/config/animal_map.json')
-
-MAP_LOCK_REF = 'refs/heads/animal_map_write_flag'
-LOCK_POLL_SEC = 30
-LOCK_MAX_WAIT_SEC = 600
-
-
-# ---------------------------
-# EMAIL-TO-SMS
-# ---------------------------
-GATEWAYS = {
-    'AT&T': 'txt.att.net',
-    'Verizon': 'vtext.com'
+PHASE_CONFIG = {
+    "3": {"bidirectional": True, "threshold": 30.0},
+    "4": {"bidirectional": True, "threshold": 60.0},
+    "5": {"bidirectional": True, "threshold": 90.0},
+    "6": {"bidirectional": False, "threshold": 30.0},
+    "7": {"bidirectional": False, "threshold": 60.0},
+    "8": {"bidirectional": False, "threshold": 90.0}
     }
 
-RECIPIENTS = [
-    {'number': '2033213509', 'carrier': 'Verizon'},
-    {'number': '5167849929', 'carrier': 'AT&T'}
-    ]
+SCRIPT_DIR = Path(__file__).resolve().parent
+ANIMAL_MAP_PATH = SCRIPT_DIR / "animal_map.json"
+ERROR_LOG_PATH = SCRIPT_DIR / "errors.log"
 
-
-def _phone_to_email(number, carrier):
-    digits = ''.join(ch for ch in str(number) if ch.isdigit())
-
-    if carrier not in GATEWAYS:
-        raise ValueError(f'Unsupported carrier: {carrier}')
-    
-    return f'{digits}@{GATEWAYS[carrier]}'
-
-
-def _format_sms(animal_id, phase_id, t_start, t_stop):
-    today = datetime.now().date()
-    m, _ = divmod(round(t_stop - t_start), 60)
-    dt = datetime.fromtimestamp(t_stop)
-
-    time_str = dt.strftime('%I:%M %p').lstrip('0')
-    head_str = f'Session finished at {time_str}'
-    animal_str = f'Animal:  {animal_id}'
-    phase_str = f'Phase:  {phase_id}'
-    date_str = f'Date:  {today.month}-{today.day}-{today.year}'
-    runtime_str = f'Runtime:  {m} min'
-
-    return f'{head_str}\n\n{animal_str}\n{phase_str}\n{date_str}\n{runtime_str}'
-
-
-def send_sms(animal_id, phase_id, t_start, t_stop):
-    smtp_user = os.environ['SMTP_USER']
-    smtp_pass = os.environ['SMTP_APP_PASSWORD']
-
-    text = _format_sms(animal_id, phase_id, t_start, t_stop)
-    context = ssl.create_default_context()
-
-    with smtplib.SMTP_SSL('smtp.gmail.com', 465, context=context) as server:
-        server.login(smtp_user, smtp_pass)
-
-        for r in RECIPIENTS:
-            to_addr = _phone_to_email(r['number'], r['carrier'])
-
-            msg = EmailMessage()
-            msg['From'] = smtp_user
-            msg['To'] = to_addr
-            msg['Subject'] = ''
-            msg.set_content(text)
-
-            server.send_message(msg)
+EVT_QUEUE: "Queue[tuple[str, str]]" = Queue()
+ENC_QUEUE: "Queue[tuple[str, str]]" = Queue()
 
 
 # ---------------------------
 # FORMAT HELPERS
 # ---------------------------
 def _get_date():
-    return datetime.now().strftime('%m/%d/%Y')
+    return datetime.now().strftime("%m/%d/%Y")
 
 
 def _get_ts():
@@ -137,286 +77,746 @@ def _get_ts():
     return f"{base}.{ms:03d}"
 
 
-def _safe_slug(s):
-    s = s.strip()
-    s = re.sub(r'[^A-Za-z0-9._-]+', '_', s)
-
-    return s or 'UNKNOWN'
-
-
-def json_filename(animal_id, phase_id, date_str):
-    a = _safe_slug(str(animal_id))
-    p = _safe_slug(str(phase_id))
-    d = str(date_str).replace('/', '-')
-
-    return f'{a}{p}_{d}.json'
+def _now():
+    return int(time.time())
 
 
 # ---------------------------
-# GITHUB
+# PRINTING HELPERS
 # ---------------------------
-def _gh_headers():
-    token = os.environ.get('GITHUB_TOKEN')
-    if not token:
-        raise RuntimeError('Missing GITHUB_TOKEN env var')
-    
-    header = {
-        'Authorization': f'Bearer {token}',
-        'Accept': 'application/vnd.github+json',
-        'X-GitHub-Api-Version': '2022-11-28'
-        }
-    return header
+def _p_line(msg):
+    global LAST_STATUS
+    LAST_STATUS = msg
+
+    sys.stdout.write("\r" + msg)
+    sys.stdout.flush()
 
 
-def _gh_api(url, method='GET', json_body=None):
-    return requests.request(method, url, 
-                            headers=_gh_headers(),
-                            json=json_body,
-                            timeout=20)
+def _p_done(msg):
+    global LAST_STATUS
+    if LAST_STATUS:
+        sys.stdout.write("\n")
+        LAST_STATUS = None
+
+    print(msg, flush=True)
 
 
-def _acquire_write_lock(lock_ref):
-    base = f'https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/git'
-    url_create = f'{base}/refs'
+def _p_exit():
+    global LAST_STATUS
 
-    start = time.time()
-    while True:
-        r_main = _gh_api(f'{base}/ref/heads/{REPO_BRANCH}')
-        if r_main.status_code != 200:
-            raise RuntimeError(f'Failed to read branch ref: {r_main.status_code} {r_main.text}')
-        
-        sha = r_main.json()['object']['sha']
-        resp = _gh_api(url_create,
-                       method='POST',
-                       json_body={'ref': lock_ref, 'sha': sha})
-        
-        if resp.status_code == 201:
-            return
-        
-        if resp.status_code == 422:
-            if time.time() - start > LOCK_MAX_WAIT_SEC:
-                raise TimeoutError('Timed out waiting for write lock')
-            
-            time.sleep(LOCK_POLL_SEC)
-            continue
+    if LAST_STATUS:
+        sys.stdout.write("\r\033[2K")
+        sys.stdout.flush()
 
-        raise RuntimeError(f'Lock acquire failed: {resp.status_code} {resp.text}')
+        print(LAST_STATUS + '\n', flush=True)
+        LAST_STATUS = None
 
 
-def _release_write_lock(lock_ref):
-    base = f'https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/git'
-    url_delete = f'{base}/ref/{lock_ref.replace("refs/", "")}'
-
-    resp = _gh_api(url_delete, method='DELETE')
-
-    if resp.status_code in {204, 404}:
-        return
-    
-    raise RuntimeError(f'Lock release failed: {resp.status_code} {resp.text}')
-
-
-@contextmanager
-def github_write_lock(lock_ref):
-    _acquire_write_lock(lock_ref)
+# ---------------------------
+# DEBUG / LOG
+# ---------------------------
+def _http_details(e):
+    status = getattr(e, 'status_code', None) or getattr(getattr(e, 'resp', None), 'status', None)
+    content = getattr(e, 'content', b"")
 
     try:
-        yield
-    finally:
+        content_s = content.decode('utf-8', 'ignore') if isinstance(content, (bytes, bytearray)) else str(content)
+    except Exception:
+        content_s = str(content)
+    
+    return f'status={status} content={content_s[:500]}'
+
+
+def time_this(fcn):
+    @functools.wraps(fcn)
+
+    def wrapper(*args, **kwargs):
+        start = time.perf_counter()
+        result = fcn(*args, **kwargs)
+        elapsed = time.perf_counter() - start
+        units = 's'
+
+        if elapsed < 0.001:
+            elapsed = elapsed * 1000
+            units = 'ms'
+
+        print(f'{fcn.__name__} executed in {elapsed:.3f} {units}\n')
+        return result
+    
+    return wrapper
+
+
+def log_error(animal_id, phase_id, exc):
+    try:
+        now = datetime.now()
+        date_str = now.strftime('%Y-%m-%d')
+        time_str = now.strftime('%H:%M:%S')
+
+        client = os.getenv('USER_ID', 'UNKNOWN_USER')
+        script_name = Path(__file__).name
+
+        animal = str(animal_id)
+        phase = str(phase_id)
+
+        header = [
+            f'TIME = {date_str} {time_str}',
+            f'USER = {client}',
+            f'ANIMAL = {animal}',
+            f'PHASE = {phase}',
+            f'SOURCE = {script_name}'
+            ]
+        hline = ['-' * 40]
+        body = []
+
+        if isinstance(exc, BaseException):
+            tb_lines = traceback.format_exception(type(exc), exc, exc.__traceback__)
+
+            for line in "".join(tb_lines).rstrip('\n').splitlines():
+                body.append(f'  {line}')
+        else:
+            body.append(f'  {type(exc).__name__}: {exc!r}')
+        
+        with open(ERROR_LOG_PATH, 'a', encoding='utf-8') as f:
+            for line in header + hline + body:
+                f.write(line + '\n')
+            
+            f.write('\n')
+    except Exception:
+        pass
+
+
+# ---------------------------
+# RESOURCE LOADING / VALIDATION
+# ---------------------------
+def load_animal_map(path=ANIMAL_MAP_PATH):
+    with open(path, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    
+    if not isinstance(data, dict):
+        raise ValueError('animal_map.json must be a dict')
+    
+    for k, v in data.items():
+        if not isinstance(k, str) or not isinstance(v, str):
+            raise ValueError('animal_map.json keys and values must be strings')
+    
+    return data
+
+
+def validate_animal(animal_id, animal_map):
+    if not any(animal_id in key for key in animal_map.keys()):
+        raise ValueError('Animal not found in animal_map.json')
+
+
+def validate_resources():
+    map_file = SCRIPT_DIR / 'animal_map.json'
+    if not map_file.exists():
+        raise FileNotFoundError('animal_map.json not found in the script directory')
+
+    creds_file = SCRIPT_DIR / 'credentials.json'
+    if not creds_file.exists():
+        raise FileNotFoundError('credentials.json not found in the script directory')
+
+    load_dotenv(SCRIPT_DIR / ".env")
+
+
+def _require_env(name):
+    v = os.getenv(name)
+    if not v:
+        raise RuntimeError(f'{name} not found in .env')
+    
+    return v
+
+
+# ---------------------------
+# DATA SAVING
+# ---------------------------
+API_SCOPES = ["https://www.googleapis.com/auth/spreadsheets",
+              "https://www.googleapis.com/auth/drive"]
+API_CREDS = Credentials.from_service_account_file(str(SCRIPT_DIR / 'credentials.json'),
+                                                  scopes=API_SCOPES)
+API_CLIENT = gspread.authorize(API_CREDS)
+API_DRIVE = build('drive', 'v3', credentials=API_CREDS, cache_discovery=False)
+
+LOCK_POLL_S = 5.0
+LOCK_RETRY_S = 5.0
+LOCK_LEASE_S = 180
+LOCK_RESET_S = 60
+LOCK_TIMEOUT_S = 300
+
+LOCK_TAG = "------ LOCK ------"
+LOCK_TAG_RANGE = "A1"
+LOCK_META_RANGE = "A2:D2"
+
+LAST_STATUS = None
+
+
+def get_workbook_id(animal_id, animal_map):
+    try:
+        map_key = next(key for key in animal_map.keys() if animal_id in key)
+    except StopIteration:
+        raise ValueError(f'No cohort mapping found for Animal {animal_id!r}')
+    
+    cohort_name = animal_map[map_key]
+    env_var = f'{cohort_name}_ID'
+
+    return _require_env(env_var)
+
+
+def get_client_id():
+    return f'{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}'
+
+
+class FileLock:
+    def __init__(self, workbook_id, owner):
+        self.poll_s = float(LOCK_POLL_S)
+        self.retry_s = float(LOCK_RETRY_S)
+        self.lease_s = int(LOCK_LEASE_S)
+        self.reset_s = int(LOCK_RESET_S)
+        self.timeout_s = int(LOCK_TIMEOUT_S)
+
+        self.client = API_CLIENT
+        self.workbook_id = workbook_id
+        self.owner = owner
+        self.token = uuid.uuid4().hex
+
+        self.sheet_name = None
+        self.created = 0
+        self.expires = 0
+
+        self.wb = None
+        self.ws = None
+
+
+    def _open_wb(self):
+        self.wb = self.client.open_by_key(self.workbook_id)
+        return self.wb
+    
+
+    def _get_ws(self):
+        if self.sheet_name is None:
+            raise RuntimeError('Lock not acquired (sheet_name is None)')
+        
+        if self.wb is None:
+            self._open_wb()
+        
         try:
-            _release_write_lock(lock_ref)
+            self.ws = self.wb.worksheet(self.sheet_name)
+        except Exception:
+            self._open_wb()
+            self.ws = self.wb.worksheet(self.sheet_name)
+        
+        return self.ws
+
+
+    def _confirm_ws(self, ws, err_msg='Lock lost'):
+        meta = self._get_meta(ws, err_msg=err_msg)
+        self._ensure_control(meta['owner'], meta['token'], err_msg=err_msg)
+
+
+    def _is_lock(self, ws):
+        try:
+            return (ws.acell(LOCK_TAG_RANGE).value or "") == LOCK_TAG
+        except Exception:
+            return False
+
+
+    def _get_meta(self, ws, err_msg='Lock tag missing (lock lost)'):
+        try:
+            vals = ws.get('A1:D2')
         except Exception as e:
-            print(f'[WARNING] Lock release failed: {e}', flush=True)
-
-
-def _git_run(args, cwd, *, capture=False):
-    env = os.environ.copy()
-    env['GIT_TERMINAL_PROMPT'] = '0'
-
-    return subprocess.run(['git', *args],
-                          cwd=str(cwd),
-                          check=True,
-                          text=True,
-                          capture_output=capture,
-                          env=env)
-
-
-@contextmanager
-def _repo_clone(parent_dir):
-    tmp = Path(tempfile.mkdtemp(prefix='repo_tmp_', dir=str(parent_dir)))
-
-    token = os.environ.get('GITHUB_TOKEN')
-    url = REPO_URL
-
-    if token and url.startswith('https://github.com/'):
-        url = url.replace('https://github.com/', f'https://x-access-token:{token}@github.com/', 1)
-    
-    try:
-        _git_run(['clone', '--depth', '1', '--branch', REPO_BRANCH, url, str(tmp)], cwd=parent_dir)
-        yield tmp
-    finally:
-        shutil.rmtree(tmp, ignore_errors=True)
-
-
-def repo_pull_file(repo_rel_path, local_abs_path):
-    with _repo_clone(SCRIPT_DIR) as clone_dir:
-        src = clone_dir / repo_rel_path
-        if not src.exists():
-            return False
+            raise RuntimeError(err_msg) from e
         
-        local_abs_path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src, local_abs_path)
-
-        return True
-
-
-def repo_push_file(local_abs_path, repo_rel_path, *, commit_msg, retries=3):
-    token = os.environ.get('GITHUB_TOKEN')
-    if not token:
-        raise RuntimeError('Missing GITHUB_TOKEN env var')
-    
-    if not local_abs_path.exists():
-        raise FileNotFoundError(f'Local file not found: {local_abs_path}')
-    
-    push_url = f"https://x-access-token:{token}@github.com/{REPO_OWNER}/{REPO_NAME}.git"
-
-    with _repo_clone(SCRIPT_DIR) as clone_dir:
-        target = clone_dir / repo_rel_path
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(local_abs_path, target)
-
-        rel = str(target.relative_to(clone_dir))
-        _git_run(['add', rel], cwd=clone_dir)
-
-        st = _git_run(['status', '--porcelain', '--', rel], cwd=clone_dir, capture=True)
-        if not st.stdout.strip():
-            return False
+        tag = (vals[0][0] if vals and vals[0] else "") if vals else ""
+        if (tag or "") != LOCK_TAG:
+            raise RuntimeError(err_msg)
         
-        _git_run(['config', 'user.email', 'bci-bot@users.noreply.github.com'], cwd=clone_dir)
-        _git_run(['config', 'user.name', 'Behavior-BCI bot'], cwd=clone_dir)
-        _git_run(['commit', '-m', commit_msg], cwd=clone_dir)
+        row = vals[1] if len(vals) > 1 and vals[1] else ["", "", "0", "0"]
+        owner = str(row[0] or "")
+        token = str(row[1] or "")
 
-        for attempt in range(1, retries + 1):
+        try:
+            created_ts = int(str(row[2] or "0"))
+        except Exception:
+            created_ts = 0
+        
+        try:
+            expires_ts = int(str(row[3] or "0"))
+        except Exception:
+            expires_ts = 0
+
+        meta = {
+            'tag': tag,
+            'owner': owner,
+            'token': token,
+            'created': created_ts,
+            'expires': expires_ts,
+            'info': row
+            }
+        
+        return meta
+
+
+    def _ensure_control(self, owner, token, err_msg='Lock lost'):
+        if owner != self.owner or token != self.token:
+            raise RuntimeError(err_msg)
+        
+
+    def sleep(self, dur_s, jitter_ms=1000):
+        if dur_s < 0:
+            dur_s = 0.0
+        
+        if jitter_ms and jitter_ms > 0:
+            dur_s += random.random() * (jitter_ms / 1000.0)
+        
+        time.sleep(dur_s)
+
+
+    def acquire(self):
+        wb = self._open_wb()
+
+        deadline = time.monotonic() + self.timeout_s
+        attempt = 0
+        created_ts = _now()
+
+        _p_line(f'Acquiring lock...[TRIES={attempt}]')
+
+        def q_sheet(title):
+            return "'" + title.replace("'", "''") + "'"
+        
+        def to_int(x, default=0):
             try:
-                _git_run(['pull', '--rebase', 'origin', REPO_BRANCH], cwd=clone_dir)
-                _git_run(['push', push_url, f'HEAD:{REPO_BRANCH}'], cwd=clone_dir)
-
-                return True
-            except subprocess.CalledProcessError:
-                if attempt >= retries:
-                    raise
-
-                time.sleep(2.0)
-    
-    return False
-
-
-# ---------------------------
-# ANIMAL MAP
-# ---------------------------
-def load_animal_map(path=LOCAL_MAP_PATH):
-    try:
-        with open(path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-        
-        if not isinstance(data, dict):
-            raise ValueError('animal_map.json must map cohort -> list of animals')
-    
-        cohorts = {c: set(a) for (c, a) in data.items()}
-    except FileNotFoundError:
-        cohorts = {}
-    except Exception as e:
-        print(f'[WARNING] Failed to load {path}: {e}\nUsing empty map', flush=True)
-        cohorts = {}
-    
-    animal_to_cohort = {animal: cohort for (cohort, animals) in cohorts.items() for animal in animals}
-
-    return cohorts, animal_to_cohort
-
-
-def save_animal_map(cohorts, path=LOCAL_MAP_PATH):
-    data = {cohort: sorted(list(animals)) for (cohort, animals) in cohorts.items()}
-
-    with open(path, 'w', encoding='utf-8') as f:
-        json.dump(data, f, indent=4)
-
-
-def pull_animal_map():
-    try:
-        ok = repo_pull_file(REPO_MAP_PATH, LOCAL_MAP_PATH)
-        if ok:
-            print(f'[git] Pulled {REPO_MAP_PATH} -> {LOCAL_MAP_PATH}', flush=True)
-    except Exception as e:
-        print(f'[WARNING] Failed to pull animal_map.json: {e}', flush=True)
-
-
-def assign_animal_to_cohort(animal_id):
-    animal_id = animal_id.upper().strip()
-    if not animal_id:
-        return False
-    
-    _, animal_to_cohort = load_animal_map()
-
-    if animal_id in animal_to_cohort:
-        print(f'Animal {animal_id} is already assigned to {animal_to_cohort[animal_id]}', flush=True)
-        return True
-    
-    print(f'Animal {animal_id} is not currently assigned to a cohort', flush=True)
-    choice = input('Assign it now? [y/N]:  ').strip().lower()
-    if choice not in {'y', 'yes'}:
-        return False
-    
-    cohort_id = input('Enter cohort number (leave blank to cancel):  ').strip()
-    if not cohort_id:
-        print('Cohort assignment cancelled', flush=True)
-        return False
-    
-    cohort_name = f'cohort{cohort_id}'
-
-    try:
-        with github_write_lock(MAP_LOCK_REF):
-            repo_pull_file(REPO_MAP_PATH, LOCAL_MAP_PATH)
-            cohorts, animal_to_cohort = load_animal_map()
-
-            if animal_id in animal_to_cohort:
-                print(f'Animal {animal_id} is already assigned to {animal_to_cohort[animal_id]} (no changes)', flush=True)
-                return True
+                return int(x)
+            except Exception:
+                return default
             
-            if cohort_name not in cohorts:
-                create = input(f'{cohort_name} does not exist. Create it? [y/N]:  ').strip().lower()
-                if create not in {'y', 'yes'}:
-                    print('Cohort not created (assignment cancelled)', flush=True)
-                    return False
+        def scan_locks():
+            meta = wb.fetch_sheet_metadata(params={'fields': 'sheets(properties(sheetId,title))'})
+            sheets = meta.get('sheets', [])
+            
+            if not sheets:
+                return []
+            
+            props = [s.get('properties', {}) for s in sheets]
+            titles = [p.get('title', '') for p in props]
+            ids = [p.get('sheetId', 0) for p in props]
+
+            ranges = [f'{q_sheet(t)}!A1:D2' for t in titles]
+            resp = wb.values_batch_get(ranges)
+            vrs = resp.get('valueRanges', [])
+
+            assert len(titles) == len(ids) == len(vrs)
+
+            locks = []
+
+            for title, id, vr in zip(titles, ids, vrs):
+                values = vr.get('values', [])
+                if not values or not values[0]:
+                    continue
+
+                tag = values[0][0] if values[0] else ""
+                if (tag or "") != LOCK_TAG:
+                    continue
+
+                row = values[1] if len(values) > 1 and values[1] else []
+                owner = str(row[0]) if len(row) > 0 else ""
+                token = str(row[1]) if len(row) > 1 else ""
+                created = to_int(row[2], 0) if len(row) > 2 else 0
+                expires = to_int(row[3], 0) if len(row) > 3 else 0
+
+                locks.append({
+                    'sheetId': id,
+                    'title': title,
+                    'owner': owner,
+                    'token': token,
+                    'created': created,
+                    'expires': expires
+                    })
+            
+            return locks
+
+        def batch_delete(ids):
+            if not ids:
+                return
+            
+            req = [{'deleteSheet': {'sheetId': id}} for id in ids]
+
+            try:
+                wb.batch_update({'requests': req})
+            except Exception:
+                pass
+
+        def is_mine(lock):
+            return lock.get('owner') == self.owner and lock.get('token') == self.token
+
+        while time.monotonic() < deadline:
+            attempt += 1
+            _p_line(f'Acquiring lock...[TRIES={attempt}]')
+
+            now = _now()
+
+            try:
+                locks = scan_locks()
+            except Exception:
+                self.sleep(self.retry_s, jitter_ms=750)
+                wb = self._open_wb()
+                continue
+
+            expired_ids = [lock['sheetId'] for lock in locks if lock['expires'] and now >= lock['expires']]
+            if expired_ids:
+                batch_delete(expired_ids)
+                self.sleep(0.1, jitter_ms=100)
+                continue
+
+            active = [lock for lock in locks if lock['expires'] and now < lock['expires']]
+            if active:
+                winner = min(active, key=lambda lock: (lock['created'], lock['token'], lock['sheetId']))
+
+                if is_mine(winner):
+                    self.sheet_name = winner['title']
+                    self.created = int(winner['created'] or created_ts)
+                    self.expires = int(winner['expires'] or 0)
+                    self.wb = wb
+                    self.ws = None
+
+                    _p_done('Lock acquired')
+                    return self
                 
-                cohorts[cohort_name] = set()
+                remaining = int(winner['expires'] or 0) - now
+                sleep_s = self.poll_s if remaining > self.poll_s else max(0.2, float(remaining))
+
+                self.sleep(sleep_s, jitter_ms=350)
+                continue
+
+            try:
+                my_lock = wb.add_worksheet(title=self.owner, rows=10, cols=10)
+            except Exception:
+                self.sleep(self.poll_s, jitter_ms=750)
+                wb = self._open_wb()
+                continue
+
+            try:
+                expires_ts = _now() + self.lease_s
+                my_meta = [self.owner, self.token, str(created_ts), str(expires_ts)]
+
+                my_lock.batch_update([
+                    {'range': LOCK_TAG_RANGE, 'values': [[LOCK_TAG]]},
+                    {'range': LOCK_META_RANGE, 'values': [my_meta]}
+                    ])
+            except Exception:
+                try:
+                    wb.del_worksheet(my_lock)
+                except Exception:
+                    pass
+
+                self.sleep(self.poll_s, jitter_ms=750)
+                wb = self._open_wb()
+                continue
+
+            try:
+                locks2 = scan_locks()
+            except Exception:
+                self.sleep(self.poll_s, jitter_ms=750)
+                continue
+
+            now2 = _now()
+
+            expired2 = [lock['sheetId'] for lock in locks2 if lock['expires'] and now2 >= lock['expires']]
+            if expired2:
+                batch_delete(expired2)
+                continue
+
+            active2 = [lock for lock in locks2 if lock['expires'] and now2 < lock['expires']]
+            if not active2:
+                self.sleep(0.2, jitter_ms=200)
+                continue
+
+            winner2 = min(active2, key=lambda lock: (lock['created'], lock['token'], lock['sheetId']))
+
+            if is_mine(winner2):
+                self.sheet_name = winner2['title']
+                self.created = int(winner2['created'] or created_ts)
+                self.expires = int(winner2['expires'] or 0)
+                self.wb = wb
+                self.ws = None
+
+                _p_done('Lock acquired')
+                return self
             
-            cohorts[cohort_name].add(animal_id)
-            save_animal_map(cohorts, LOCAL_MAP_PATH)
+            my_id = None
 
-            commit_msg = 'Update cohort assignments in animal_map.json'
-            pushed = repo_push_file(LOCAL_MAP_PATH, REPO_MAP_PATH, commit_msg=commit_msg)
-            if pushed:
-                print(f'[git] Updated {REPO_MAP_PATH}', flush=True)
-            else:
-                print('[git] No changes to push for animal_map.json')
+            for lock in active2:
+                if is_mine(lock):
+                    my_id = lock['sheetId']
+                    break
+            
+            if my_id:
+                batch_delete([my_id])
+            
+            self.sleep(0.5, jitter_ms=500)
+        
+        raise TimeoutError('Timed out during lock acquisition')
 
+
+    def update(self):
+        ws = self._get_ws()
+        meta = self._get_meta(ws)
+
+        owner = meta['owner']
+        token = meta['token']
+        created_ts = meta['created']
+        expires_ts = meta['expires']
+
+        self._ensure_control(owner, token, err_msg='Lock lost during update')
+
+        self.created = int(created_ts or self.created)
+        self.expires = int(expires_ts or 0)
+
+        return int(self.expires or 0) - _now()
+
+
+    def reset(self):
+        remaining = int(self.expires or 0) - _now()
+        if remaining >= self.reset_s:
+            return remaining
+        
+        ws = self._get_ws()
+        meta = self._get_meta(ws)
+
+        owner = meta['owner']
+        token = meta['token']
+        created_ts = meta['created']
+        expires_ts = meta['expires']
+
+        if not created_ts:
+            created_ts = self.created or _now()
+        
+        self._ensure_control(owner, token, err_msg='Lock lost before reset')
+
+        remaining = expires_ts - _now()
+        if remaining >= self.reset_s:
+            self.created = int(created_ts or self.created)
+            self.expires = int(expires_ts or 0)
+
+            return remaining
+        
+        new_expires = _now() + self.lease_s
+        new_meta = [self.owner, self.token, str(created_ts or _now()), str(new_expires)]
+
+        try:
+            ws.update(LOCK_META_RANGE, [new_meta])
+        except Exception as e:
+            raise RuntimeError('Failed to reset lock') from e
+        
+        self._confirm_ws(ws, err_msg='Lock lost after reset')
+
+        meta2 = self._get_meta(ws, err_msg='Lock lost after reset')
+
+        created_ts2 = meta2['created']
+        expires_ts2 = meta2['expires']
+        
+        self.created = int(created_ts2 or created_ts or self.created)
+        self.expires = int(expires_ts2 or new_expires)
+        
+        return int(self.expires or 0) - _now()
+
+
+    def release(self, retries=5):
+        last_e = RuntimeError('Lock release failed')
+
+        for attempt in range(retries):
+            _p_line(f'Releasing lock...[TRIES={attempt + 1}]')
+
+            try:
+                wb = self.client.open_by_key(self.workbook_id)
+                ws = wb.worksheet(self.sheet_name or self.owner)
+
+                try:
+                    meta = self._get_meta(ws)
+
+                    owner = meta['owner']
+                    token = meta['token']
+                except RuntimeError:
+                    _p_done('Lock released')
+                    return True
+                
+                try:
+                    self._ensure_control(owner, token, err_msg='Lock released (not owned)')
+                except RuntimeError:
+                    _p_done('Lock released')
+                    return True
+                
+                wb.del_worksheet(ws)
+                _p_done('Lock released')
+                return True
+            except Exception as e:
+                last_e = e
+                self.sleep(self.retry_s, jitter_ms=2500)
+        
+        raise last_e
+
+
+def save_data(session_data):
+    workbook_id = session_data.meta["workbook_id"]
+    client_id = get_client_id()
+
+    def _batch_write_cols(ws, start_row, start_col, data, chunk_rows=2000, group_chunks=10):
+        sheet = ws.spreadsheet
+        name = ws.title
+
+        _get_range = lambda r1, c1, r2, c2: f'{name}!{rowcol_to_a1(r1, c1)}:{rowcol_to_a1(r2, c2)}'
+
+        req = []
+        n = len(data)
+
+        for i in range(0, n, chunk_rows):
+            chunk = data[i:i+chunk_rows]
+            r1 = start_row + i
+            r2 = r1 + len(chunk) - 1
+            c1 = start_col
+            c2 = start_col + 1
+
+            req.append({'range': _get_range(r1, c1, r2, c2), 'values': chunk})
+
+            if len(req) >= group_chunks:
+                sheet.values_batch_update(body={'valueInputOption': 'RAW', 'data': req})
+                req.clear()
+        
+        if req:
+            sheet.values_batch_update(body={'valueInputOption': 'RAW', 'data': req})
+
+    lock = None
+
+    try:
+        lock = FileLock(workbook_id, owner=client_id).acquire()
+
+        wb = API_CLIENT.open_by_key(workbook_id)
+        lock.wb = wb
+
+        for dtype, sheet_name in (('evt', 'Event'), ('enc', 'Encoder')):
+            d = getattr(session_data, dtype)
+            n_rows= len(d['timestamps'])
+            label = sheet_name.lower()
+
+            _p_done(f'Writing {label} data...')
+
+            if n_rows == 0:
+                continue
+
+            lock.update()
+            lock.reset()
+
+            ws = wb.worksheet(sheet_name)
+
+            max_col = len(ws.row_values(2))
+            needed_cols = max_col + 2
+            if ws.col_count < needed_cols:
+                ws.add_cols(needed_cols - ws.col_count)
+            
+            header_rng = f'{rowcol_to_a1(1, max_col+1)}:{rowcol_to_a1(2, max_col+2)}'
+            skip_rng = f'{rowcol_to_a1(3, max_col+1)}:{rowcol_to_a1(3, max_col+2)}'
+
+            header = [
+                [session_data.meta['date'], ""],
+                [f"Animal {session_data.meta['animal']}", f"Phase {session_data.meta['phase']}"]
+                ]
+            
+            lock.update()
+            lock.reset()
+
+            ws.batch_update([
+                {'range': header_rng, 'values': header},
+                {'range': skip_rng, 'values': [["", ""]]}
+                ])
+
+            needed_rows = 3 + n_rows
+            if ws.row_count < needed_rows:
+                ws.add_rows(needed_rows - ws.row_count)
+            
+            data = [[ts, val] for ts, val in zip(d['timestamps'], d['values'])]
+            first_row = 4
+            first_col = max_col + 1
+
+            lock.update()
+            lock.reset()
+
+            _batch_write_cols(ws, first_row, first_col, data)
+            _p_exit()
+        
         return True
-    except Exception as e:
-        print(f'[WARNING] Failed to update animal_map.json: {e}', flush=True)
+    except KeyboardInterrupt as e:
+        try:
+            fallback_save(session_data, exc=e)
+        except Exception:
+            pass
+
         return False
+    except Exception as e:
+        try:
+            fallback_save(session_data, exc=e)
+        except Exception as e2:
+            log_error(session_data.meta.get('animal', 'UNKNOWN'), session_data.meta.get('phase', '0'), e2)
+        
+        log_error(session_data.meta.get('animal', 'UNKNOWN'), session_data.meta.get('phase', '0'), e)
+        return False
+    finally:
+        if lock is not None:
+            try:
+                lock.release()
+            except Exception as e:
+                try:
+                    fallback_save(session_data, exc=e)
+                except Exception as e2:
+                    log_error(session_data.meta.get('animal', 'UNKNOWN'), session_data.meta.get('phase', '0'), e2)
+                
+                log_error(session_data.meta.get('animal', 'UNKNOWN'), session_data.meta.get('phase', '0'), e)
+
+
+def fallback_save(session_data, exc=None):
+    animal = str(session_data.meta.get('animal', 'UNKNOWN'))
+    phase = str(session_data.meta.get('phase', '0'))
+    date = str(session_data.meta.get('date', '0000-00-00')).replace('/', '.')
+    rand = uuid.uuid4().hex[:6]
+
+    out_path = SCRIPT_DIR / f'{date}_animal={animal}_phase={phase}_id={rand}.json'
+    payload = session_data.to_dict()
+
+    if exc is not None:
+        payload.setdefault('meta', {})
+        payload['meta']['fallback_saved'] = True
+        payload['meta']['fallback_reason'] = f'{type(exc).__name__}: {exc}'
+    
+    with open(out_path, 'w', encoding='utf-8') as f:
+        json.dump(payload, f, indent=4)
+    
+    _p_exit()
+    print(f'[WARNING] Saved session data locally to {out_path.name}', flush=True)
+    
+    return out_path
 
 
 # ---------------------------
-# SERIAL
+# SERIAL / DATA
 # ---------------------------
+def _find_arduino_port():
+    ports = serial.tools.list_ports.comports()
+
+    for port in ports:
+        dsc = (port.description or "").lower()
+        if "arduino" in dsc or "usb serial" in dsc:
+            return port.device
+        
+    return None
+
+
 def _decode_line(raw):
     if not raw:
-        return ''
+        return ""
     
     try:
-        return raw.decode('utf-8', errors='strict').strip()
+        return raw.decode("utf-8", errors="strict").strip()
     except UnicodeDecodeError:
-        return raw.decode('latin1', errors='ignore').strip()
-    
+        return raw.decode("latin1", errors="ignore").strip()
+
 
 class ArduinoLink:
     def __init__(self, ser):
@@ -426,27 +826,34 @@ class ArduinoLink:
         self.msg_q: "Queue[tuple[str, str, object]]" = Queue()
         self._reader = Thread(target=self._reader_loop, daemon=True)
 
+
     def start(self):
         self._reader.start()
 
+
     def close(self):
         self.stop_evt.set()
+
         try:
             if self.ser and self.ser.is_open:
                 self.ser.close()
         except Exception:
             pass
 
+
     def send_and_wait(self, text, timeout=2.0):
         self.ack_evt.clear()
         self.ser.write((text.strip() + "\n").encode("utf-8"))
         self.ser.flush()
+
         if not self.ack_evt.wait(timeout=timeout):
             raise TimeoutError(f"No ACK after sending: {text!r}")
+
 
     def send(self, text):
         self.ser.write((text.strip() + "\n").encode("utf-8"))
         self.ser.flush()
+
 
     def _reader_loop(self):
         try:
@@ -488,74 +895,60 @@ class ArduinoLink:
                 pass
 
 
-def _find_arduino_port():
-    ports = serial.tools.list_ports.comports()
-    
-    for port in ports:
-        dsc = (port.description or '').lower()
-
-        if 'arduino' in dsc or 'usb serial' in dsc:
-            return port.device
-    
-    return None
-
-
-# ---------------------------
-# DATA
-# ---------------------------
 class SessionData:
     def __init__(self, animal_id, phase_id, date_str):
         self.meta = {
-            'date': date_str,
-            'animal': animal_id,
-            'phase': phase_id,
-            'start_wall': None,
-            'end_wall': None,
-            'duration_sec': None,
-            'aborted': False
+            "date": date_str,
+            "animal": animal_id,
+            "phase": phase_id,
+            "start_wall": None,
+            "end_wall": None,
+            "duration_sec": None,
+            "aborted": False,
             }
-        self.evt = {'timestamps': [], 'values': []}
-        self.enc = {'timestamps': [], 'values': []}
-    
+        self.evt = {"timestamps": [], "values": []}
+        self.enc = {"timestamps": [], "values": []}
+
 
     def add_evt(self, ts, payload):
-        self.evt['timestamps'].append(ts)
-        self.evt['values'].append(payload)
-    
+        self.evt["timestamps"].append(ts)
+        self.evt["values"].append(payload)
+
 
     def add_enc(self, ts, payload):
-        self.enc['timestamps'].append(ts)
-        self.enc['values'].append(payload)
-    
+        self.enc["timestamps"].append(ts)
+        self.enc["values"].append(payload)
+
 
     def any_data(self):
-        return bool(self.evt['timestamps']) or bool(self.enc['timestamps'])
-    
+        return bool(self.evt["timestamps"]) or bool(self.enc["timestamps"])
+
 
     def to_dict(self):
-        return {'meta': self.meta, 'event': self.evt, 'encoder': self.enc}
+        def _json_safe(x):
+            if x is None or isinstance(x, (str, int, float, bool)):
+                return x
+            
+            if isinstance(x, dict):
+                return {str(k): _json_safe(v) for k, v in x.items()}
 
-
-def write_json(session_data, path):
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-    with open(path, 'w', encoding='utf-8') as f:
-        json.dump(session_data.to_dict(), f, indent=4)
-
-
-def push_json(path, *, repo_filename):
-    commit_msg = f'Add session {repo_filename} ({datetime.now().strftime("%Y-%m-%d %H:%M:%S")})'
-    repo_path = REPO_DATA_DIR / repo_filename
-
-    repo_push_file(path, repo_path, commit_msg=commit_msg)
-    print(f'[git] Pushed {repo_path} to {REPO_BRANCH}', flush=True)
+            if isinstance(x, (list, tuple)):
+                return [_json_safe(v) for v in x]
+            
+            return str(x)
+        
+        return {
+            'meta': _json_safe(self.meta),
+            'evt': _json_safe(self.evt),
+            'enc': _json_safe(self.enc)
+            }
 
 
 # ---------------------------
 # CALIBRATION / EARLY EXIT
 # ---------------------------
 def _set_easy_rate(link, session_data, trial_stack):
-    n_hits = sum(1 for x in trial_stack if x == 'hit')
+    n_hits = sum(1 for x in trial_stack if x == "hit")
 
     if n_hits < 10:
         K = 3
@@ -563,12 +956,12 @@ def _set_easy_rate(link, session_data, trial_stack):
         K = 5
     else:
         K = 7
-    
+
     N = 4 * K
 
     trial_stack.clear()
     link.send_and_wait(str(K))
-    session_data.add_evt(_get_ts(), f'setK {K}')
+    session_data.add_evt(_get_ts(), f"setK {K}")
 
     return K, N, n_hits
 
@@ -577,21 +970,20 @@ def _is_early_exit(trial_stack, N):
     if len(trial_stack) < N:
         return False
     
-    n_hits = sum(1 for x in trial_stack[:N] if x == 'hit')
-
+    n_hits = sum(1 for x in trial_stack[:N] if x == "hit")
     return n_hits < (N / 4)
 
 
 def _terminate_session(link, msg):
     try:
-        link.send('E')
-
+        link.send("E")
         deadline = time.time() + 2.0
+
         while time.time() < deadline:
             try:
                 typ, _, _ = link.msg_q.get(timeout=0.05)
-                if typ == 'END':
-                    print(f'\n{msg}\n', flush=True)
+                if typ == "END":
+                    print(f"\n{msg}\n", flush=True)
                     return
             except Empty:
                 pass
@@ -603,95 +995,102 @@ def _terminate_session(link, msg):
 # TOP LEVEL
 # ---------------------------
 def setup():
-    pull_animal_map()
-    cohorts, animal_to_cohort = load_animal_map()
-
     port = _find_arduino_port()
     if not port:
-        print('No Arduino detected', flush=True)
-        sys.exit(1)
-    
+        raise RuntimeError("No Arduino detected")
+
+    ser = None
+    link = None
+
     try:
         ser = serial.Serial(port, BAUDRATE, timeout=0.05)
         time.sleep(2)
-        print(f'Connected to {port}', flush=True)
-    except serial.SerialException as e:
-        print(f'Serial error: {e}', flush=True)
-        sys.exit(1)
-    
-    dev_mode = False
 
-    while True:
+        if not ser.is_open:
+            raise RuntimeError(f"{port} port is not open after initialization")
+        
+        print(f"Connected to {port}", flush=True)
         try:
-            animal_raw = input('Animal ID:  ').strip().upper()
-            if animal_raw == '':
-                dev_mode = True
-                animal_id = 'DEV'
-                print('\nDEV MODE\n', flush=True)
-                break
+            animal_raw = input("Animal ID:  ").strip().upper()
+        except KeyboardInterrupt:
+            raise
 
-            animal_id = animal_raw
-            if animal_id in animal_to_cohort:
-                break
+        animal_id = animal_raw if animal_raw else "DEV"
+        dev_mode = (animal_id == "DEV")
+        workbook_id = None
 
-            if assign_animal_to_cohort(animal_id):
-                cohorts, animal_to_cohort = load_animal_map()
-                if animal_id in animal_to_cohort:
-                    break
+        if dev_mode:
+            print("\nDEV MODE\n")
+        else:
+            validate_resources()
+
+            animal_map = load_animal_map()
+            validate_animal(animal_id, animal_map)
+
+            workbook_id = get_workbook_id(animal_id, animal_map)
+
+        valid_phases = {"1", "2"} | set(PHASE_CONFIG.keys())
+
+        while True:
+            try:
+                phase_id = input("Training Phase:  ").strip()
+            except KeyboardInterrupt:
+                raise
             
-            print('Please enter a valid ID', flush=True)
-        except KeyboardInterrupt:
-            print('\nProcess terminated by user', flush=True)
-            sys.exit(0)
-    
-    while True:
-        try:
-            phase_id = input('Training Phase:  ').strip()
-            if phase_id in {'1', '2', '3', '4', '5'}:
+            if phase_id in valid_phases:
                 break
 
-            print('Please enter a valid phase', flush=True)
-        except KeyboardInterrupt:
-            print('\nProcess terminated by user', flush=True)
-            sys.exit(0)
-    
-    link = ArduinoLink(ser)
-    link.start()
+            print("Please enter a valid phase", flush=True)
 
-    try:
-        link.send_and_wait(phase_id)
-    except Exception as e:
-        print(f'Failed to send training phase to Arduino: {e}', flush=True)
-        link.close()
-        sys.exit(1)
-    
-    cursor_thread = None
+        link = ArduinoLink(ser)
+        link.start()
 
-    if str(phase_id) not in {'1', '2'}:
-        threshold = {'3': 30.0, '4': 60.0, '5': 90.0}[str(phase_id)]
+        try:
+            link.send_and_wait(phase_id)
+        except Exception as e:
+            link.close()
+            raise RuntimeError(f"Failed to send training phase to Arduino: {e}") from e
 
-        cursor_thread = Thread(
-            target=cursor_fcn,
-            args=(threshold, EVT_QUEUE, ENC_QUEUE),
-            kwargs={'display_index': 1, 'fullscreen': True},
-            daemon=True
+        cursor_thread = None
+
+        if phase_id in PHASE_CONFIG:
+            cfg = PHASE_CONFIG[phase_id]
+            threshold = cfg["threshold"]
+
+            cursor_thread = Thread(
+                target=cursor_fcn,
+                args=(threshold, EVT_QUEUE, ENC_QUEUE),
+                kwargs={"display_index": 1, "fullscreen": True},
+                daemon=True
+                )
+            cursor_thread.start()
+
+        session_data = SessionData(
+            animal_id=animal_id,
+            phase_id=phase_id,
+            date_str=_get_date()
             )
-        cursor_thread.start()
-    
-    date_str = _get_date()
-    fname = json_filename(animal_id, phase_id, date_str)
-    path = SCRIPT_DIR / fname
+        if not dev_mode:
+            session_data.meta["workbook_id"] = workbook_id
 
-    session_data = SessionData(
-        animal_id=animal_id,
-        phase_id=phase_id,
-        date_str=date_str)
-    
-    return link, session_data, dev_mode, cursor_thread, path, fname
+        return link, session_data, cursor_thread, dev_mode
+    except Exception:
+        if link is not None:
+            try:
+                link.close()
+            except Exception:
+                pass
+        elif ser is not None:
+            try:
+                ser.close()
+            except Exception:
+                pass
+        
+        raise
 
 
 def main(link, session_data):
-    do_calibration = str(session_data.meta['phase']) not in {'1', '2'}
+    do_calibration = str(session_data.meta["phase"]) not in {"1", "2"}
 
     K = 5
     N = 20
@@ -699,11 +1098,9 @@ def main(link, session_data):
     try:
         link.send_and_wait(str(K))
     except Exception as e:
-        print(f'Failed to send initial K to Arduino: {e}', flush=True)
-        link.close()
-        sys.exit(1)
-    
-    session_data.add_evt(_get_ts(), f'setK {K}')
+        raise RuntimeError(f"Failed to send initial easy rate to Arduino: {e}") from e
+
+    session_data.add_evt(_get_ts(), f"setK {K}")
 
     trial_stack = []
     calibrated = not do_calibration
@@ -722,17 +1119,19 @@ def main(link, session_data):
             if not started:
                 started = True
                 t0 = time.time()
-                session_data.meta['start_wall'] = datetime.now().isoformat(timespec='seconds')
-                print(f'Session start: {datetime.now().strftime("%I:%M %p")}', flush=True)
-                print('Running session protocol...', flush=True)
-            
-            if typ == 'ERR':
-                continue
+                session_data.meta["start_wall"] = datetime.now().isoformat(timespec="seconds")
+                print(f"Session started at {datetime.now().strftime('%I:%M %p')}", flush=True)
 
-            if typ == 'END':
+            if typ == "ERR":
+                if isinstance(payload, BaseException):
+                    raise payload
+                
+                raise RuntimeError(f"ArduinoLink reader error: {payload!r}")
+
+            if typ == "END":
                 break
 
-            if typ == 'EVT':
+            if typ == "EVT":
                 p = str(payload)
                 session_data.add_evt(ts, p)
 
@@ -741,7 +1140,7 @@ def main(link, session_data):
                 except Exception:
                     pass
 
-                if do_calibration and p in {'hit', 'miss'}:
+                if do_calibration and p in {"hit", "miss"}:
                     if last_outcome == p:
                         continue
 
@@ -753,15 +1152,18 @@ def main(link, session_data):
 
                     if calibrated:
                         if len(trial_stack) >= N and _is_early_exit(trial_stack, N):
-                            _terminate_session(link, 'Session terminated by early exit')
-                            session_data.meta['aborted'] = True
+                            _terminate_session(link, "Session terminated by early exit")
+                            session_data.meta["aborted"] = True
                             break
                     else:
                         if len(trial_stack) >= N:
                             K, N, calibration_hits = _set_easy_rate(link, session_data, trial_stack)
                             calibrated = True
-                            print(f'Calibration finished [hits={calibration_hits}/20, K={K}, N={N}]', flush=True)
-            elif typ == 'ENC':
+                            print(
+                                f"Calibration finished [hits={calibration_hits}/20, K={K}, N={N}]",
+                                flush=True,
+                                )
+            elif typ == "ENC":
                 p = str(payload)
                 session_data.add_enc(ts, p)
 
@@ -769,98 +1171,66 @@ def main(link, session_data):
                     ENC_QUEUE.put_nowait((ts, p))
                 except Exception:
                     pass
-            else:
-                pass
     except KeyboardInterrupt:
-        session_data.meta['aborted'] = True
-        _terminate_session(link, 'Session terminated by user')
-    finally:
-        try:
-            link.close()
-        except Exception:
-            pass
+        session_data.meta["aborted"] = True
+        _terminate_session(link, "Session terminated by user")
 
-        if session_data.meta['start_wall'] is None:
-            session_data.meta['start_wall'] = datetime.now().isoformat(timespec='seconds')
-        
-        session_data.meta['end_wall'] = datetime.now().isoformat(timespec='seconds')
+        raise
+    finally:
+        if session_data.meta["start_wall"] is None:
+            session_data.meta["start_wall"] = datetime.now().isoformat(timespec="seconds")
+
+        session_data.meta["end_wall"] = datetime.now().isoformat(timespec="seconds")
 
         if t0 is None:
             t0 = time.time()
-        
+
         dt = int(max(0, time.time() - t0))
-        session_data.meta['duration_sec'] = dt
+        session_data.meta["duration_sec"] = dt
         m, s = divmod(dt, 60)
-        print(f'Session duration: {m}:{s:02d}', flush=True)
-    
+        print(f"Session duration: {m}:{s:02d}", flush=True)
+
     return session_data
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     link = None
     session_data = None
     cursor_thread = None
     dev_mode = True
-
-    path = None
-    repo_filename = None
+    animal_id_for_log = "UNKNOWN"
+    phase_id_for_log = "0"
 
     try:
-        link, session_data, dev_mode, cursor_thread, path, repo_filename = setup()
-        session_data = main(link, session_data)
+        link, session_data, cursor_thread, dev_mode = setup()
 
-        if session_data and session_data.any_data():
-            write_json(session_data, path)
-            print(f'Saved session data to: {path}', flush=True)
+        if session_data is not None:
+            animal_id_for_log = session_data.meta.get("animal", "UNKNOWN")
+            phase_id_for_log = session_data.meta.get("phase", "0")
 
-            if not dev_mode:
-                push_json(path, repo_filename=repo_filename)
-    except SystemExit:
-        if session_data and session_data.any_data() and path and repo_filename:
-            try:
-                write_json(session_data, path)
-                print(f'Saved session data to: {path}', flush=True)
+        main(link, session_data)
 
-                if not dev_mode:
-                    push_json(path, repo_filename=repo_filename)
-            except Exception as e:
-                print(f'[WARNING] Failed to save/push on SystemExit: {e}', flush=True)
-        
+        if not dev_mode:
+            if not session_data.any_data():
+                raise ValueError('No data collected during session')
+
+            save_ok = save_data(session_data)
+            if not save_ok:
+                print('[WARNING] Failed to save data using Google Sheets API', flush=True)
+    except SystemExit as e:
+        if getattr(e, "code", 0) not in {0, None}:
+            log_error(animal_id_for_log, phase_id_for_log, e)
+
         raise
     except Exception as e:
-        print(f'[ERROR] Unhandled exception: {e}', flush=True)
-
-        if session_data and session_data.any_data() and path:
-            try:
-                write_json(session_data, path)
-                print(f'Saved session data to: {path}', flush=True)
-            except Exception as e2:
-                print(f'[WARNING] Failed to save after exception: {e2}', flush=True)
+        log_error(animal_id_for_log, phase_id_for_log, e)
+        raise
     finally:
         if cursor_thread is not None:
             cursor_thread.join(timeout=2.0)
-        
+
         if link is not None:
             try:
                 link.close()
             except Exception:
                 pass
-
-        try:
-            if session_data is not None:
-                if session_data.meta.get('start_wall'):
-                    t_start = datetime.fromisoformat(session_data.meta['start_wall']).timestamp()
-                else:
-                    t_start = time.time()
-                
-                if session_data.meta.get('end_wall'):
-                    t_stop = datetime.fromisoformat(session_data.meta['end_wall']).timestamp()
-                else:
-                    t_stop = time.time()
-                
-                animal_id = session_data.meta.get('animal', 'UNKNOWN')
-                phase_id = session_data.meta.get('phase', 'UNKNOWN')
-
-                send_sms(animal_id, phase_id, t_start, t_stop)
-        except Exception as sms_e:
-            print(f'[WARNING] Failed to send SMS notification: {sms_e}', flush=True)
