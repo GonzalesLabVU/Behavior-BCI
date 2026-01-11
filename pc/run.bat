@@ -2,6 +2,13 @@
 setlocal EnableExtensions EnableDelayedExpansion
 
 echo.
+echo OLD VERSION
+
+call :selfUpdate
+if "%ERRORLEVEL%"=="99" exit /b 0
+if errorlevel 1 call :kill "selfUpdate failed"
+
+echo.
 echo Getting script directory...
 set "SCRIPT_DIR=%~dp0"
 cd /d "%SCRIPT_DIR%"
@@ -41,6 +48,38 @@ goto :eof
 REM ------------------------
 REM Subroutines
 REM ------------------------
+
+:selfUpdate
+    @echo off
+    setlocal EnableExtensions EnableDelayedExpansion
+
+    set "RAW_SELF_URL=https://raw.githubusercontent.com/GonzalesLabVU/Behavior-BCI/main/pc/run.bat"
+
+    set "SELF=%~f0"
+    set "NEW=%TEMP%\%~n0_new%~x0"
+    set "UPD=%TEMP%\%~n0_upd.cmd"
+
+    powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+        "$u='%RAW_SELF_URL%'; $o='%NEW%';" ^
+        "try { Invoke-WebRequest -UseBasicParsing -Uri $u -OutFile $o; exit 0 } catch { exit 1 }" >nul 2>&1
+
+    if not exist "%NEW%" endlocal & exit /b 0
+
+    fc /b "%SELF%" "%NEW%" >nul 2>&1
+    if not errorlevel 1 (
+        del "%NEW%" >nul 2>&1
+        endlocal & exit /b 0
+    )
+
+    >"%UPD%" echo @echo off
+    >>"%UPD%" echo ping 127.0.0.1 -n 2 ^>nul
+    >>"%UPD%" echo copy /y "%NEW%" "%SELF%" ^>nul
+    >>"%UPD%" echo del "%NEW%" ^>nul 2^>^&1
+    >>"%UPD%" echo start "" "%SELF%"
+    >>"%UPD%" echo del "%%~f0"
+
+    start "" cmd /c "%UPD%"
+    endlocal & exit /b 99
 
 :pullFile
     @echo off
