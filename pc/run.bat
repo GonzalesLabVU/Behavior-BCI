@@ -1,187 +1,179 @@
 @echo off
-setlocal ENABLEDELAYEDEXPANSION
+setlocal EnableExtensions EnableDelayedExpansion
 
-set REPO_RAW=https://raw.githubusercontent.com/GonzalesLabVU/Behavior-BCI/main
-set REPO_ZIP=https://github.com/GonzalesLabVU/Behavior-BCI/archive/refs/heads/main.zip
-
-set "REPO_URL=https://github.com/GonzalesLabVU/Behavior-BCI.git"
-set "BRANCH=main"
-
-set SCRIPT_DIR=%~dp0
+echo.
+echo Getting script directory...
+set "SCRIPT_DIR=%~dp0"
 cd /d "%SCRIPT_DIR%"
 
-echo.
-echo =================================================
-echo Updating files from GitHub...
-echo =================================================
+echo Making sure pip is up to date...
+python -m pip install --upgrade pip -q
 
-REM --- Core Python files ---
-curl -fsSL "%REPO_RAW%/behavioral_master.py" -o "behavioral_master.py" || goto :download_fail
-curl -fsSL "%REPO_RAW%/cursor_utils.py" -o "cursor_utils.py" || goto :download_fail
-curl -fsSL "%REPO_RAW%/plot_utils.py" -o "plot_utils.py" || goto :download_fail
-
-REM --- Data files ---
-curl -fsSL "%REPO_RAW%/ACD_data.xlsx" -o "ACD_data.xlsx" || goto :download_fail
-curl -fsSL "%REPO_RAW%/EGI_data.xlsx" -o "EGI_data.xlsx" || goto :download_fail
-curl -fsSL "%REPO_RAW%/QVWX_data.xlsx" -o "QVWX_data.xlsx" || goto :download_fail
-curl -fsSL "%REPO_RAW%/animal_map.json" -o "animal_map.json" || goto :download_fail
-
-REM --- Arduino files ---
-echo Downloading behavioral_controller folder...
-curl -fsSL "%REPO_ZIP%" -o "repo_tmp.zip" || goto :download_fail
-
-if exist "Behavior-BCI-main" rmdir /S /Q "Behavior-BCI-main" >nul 2>&1
-if exist "behavioral_controller" rmdir /S /Q "behavioral_controller" >nul 2>&1
-
-tar -xf "repo_tmp.zip" || goto :download_fail
-del "repo_tmp.zip" >nul 2>&1
-
-if not exist "Behavior-BCI-main\behavioral_controller" goto :download_fail
-
-xcopy /E /I /Y "Behavior-BCI-main\behavioral_controller" "behavioral_controller\" >nul
-rmdir /S /Q "Behavior-BCI-main" >nul 2>&1
-
-echo Files updated successfully
-TIMEOUT /T 3 /NOBREAK > NUL
-
-echo.
-echo ================================================
-echo   Installing required Python packages...
-echo ================================================
-
-python -m pip install --upgrade pip
-python -m pip install --upgrade ^
-    pyserial==3.5 ^
-    openpyxl==3.1.5 ^
-    matplotlib==3.7.2 ^
-    numpy==1.26.4 ^
-    pygame==2.6.1 ^
-    scipy==1.15.3
-
-echo.
-echo ================================================
-echo   Running Python script...
-echo ================================================
-
-python behavioral_master.py
-set "PY_EXIT=%ERRORLEVEL%"
-
-echo.
-echo ================================================
-echo Script finished (exit code %PY_EXIT%)
-echo Preparing to push latest .xlsx data file...
-echo ================================================
-
-set "LATEST_FILE="
-for /f "usebackq delims=" %%F in (`
-  powershell -NoProfile -Command ^
-    "$f=Get-ChildItem -LiteralPath '%SCRIPT_DIR%' -Filter *_data.xlsx -File -ErrorAction SilentlyContinue ^| Sort-Object LastWriteTime -Descending ^| Select-Object -First 1; if($null -eq $f){ exit 2 } else { $f.Name }"
-`) do set "LATEST_FILE=%%F"
-
-if "%LATEST_FILE%"=="" (
-  echo No .xlsx files found in "%SCRIPT_DIR%". Skipping push.
-  goto :after_push
+echo Installing required dependencies...
+if not exist "requirements.txt" (
+    echo requirements.txt not found in %SCRIPT_DIR%
+    exit /b 1
 )
+python -m pip install -r requirements.txt -q || exit /b 1
 
-echo Latest .xlsx detected: "%LATEST_FILE%"
+<nul set /p "=Downloading latest file versions..."
+REM call :pullFile "https://github.com/GonzalesLabVU/Behavior-BCI/blob/main/pc/behavioral_master.py" || call :kill "pullFile subroutine failed for behavioral_master.py"
+REM call :pullFile "https://github.com/GonzalesLabVU/Behavior-BCI/blob/main/pc/cursor_utils.py"
+REM call :pullFile "https://github.com/GonzalesLabVU/Behavior-BCI/blob/main/pc/plot_utils.py"
+REM call :pullFile "https://github.com/GonzalesLabVU/Behavior-BCI/blob/main/pc/api_utils.py"
+REM call :pullFile "https://github.com/GonzalesLabVU/Behavior-BCI/blob/main/pc/run.bat"
+REM call :pullFile "https://github.com/GonzalesLabVU/Behavior-BCI/blob/main/pc/config/animal_map.json"
+REM call :pullFile "https://github.com/GonzalesLabVU/Behavior-BCI/blob/main/pc/config/credentials.json"
+REM call :pullFile "https://github.com/GonzalesLabVU/Behavior-BCI/blob/main/pc/config/requirements.txt"
+REM call :pullFile "https://github.com/GonzalesLabVU/Behavior-BCI/blob/main/pc/config/errors.log"
+REM call :pullFolder "https://github.com/GonzalesLabVU/Behavior-BCI/tree/main/arduino/behavioral_controller" || call :kill "pullFolder subroutine failed"
+echo done
 
-REM --- Check git ---
-git --version >nul 2>&1
-if errorlevel 1 (
-  echo WARNING: git not found. Skipping push.
-  goto :after_push
-)
+echo Running Python script...
+call :sleep 5
 
-set "REPO_DIR=%SCRIPT_DIR%Behavior-BCI_repo"
+echo.
+echo Session finished
+echo.
 
-if not exist "%REPO_DIR%\.git" (
-  echo Cloning repo into: "%REPO_DIR%"
-  git clone "%REPO_URL%" "%REPO_DIR%"
-  if errorlevel 1 (
-    echo WARNING: git clone failed. Skipping push.
-    goto :after_push
-  )
-)
+goto :eof
 
-cd /d "%REPO_DIR%"
+REM ------------------------
+REM Subroutines
+REM ------------------------
 
-git fetch origin >nul 2>&1
-git checkout "%BRANCH%" >nul 2>&1 || goto :after_push
-git pull origin "%BRANCH%" >nul 2>&1 || goto :after_push
+:pullFile
+    @echo off
+    setlocal EnableExtensions EnableDelayedExpansion
 
-set "DEST_PATH="
-set "MATCH_COUNT=0"
-
-for /f "usebackq delims=" %%P in (`git ls-files`) do (
-  for %%B in ("%%P") do (
-    if /I "%%~nxB"=="%LATEST_FILE%" (
-      set "DEST_PATH=%%P"
-      set /a MATCH_COUNT+=1
+    set "URL=%~1"
+    if not defined URL (
+        echo Missing URL argument
+        endlocal & exit /b 1
     )
-  )
-)
 
-if "%DEST_PATH%"=="" (
-  echo WARNING: "%LATEST_FILE%" is not tracked in the repo. Skipping push.
-  cd /d "%SCRIPT_DIR%"
-  goto :after_push
-)
+    set "RAW_URL=%URL:github.com=raw.githubusercontent.com%"
+    set "RAW_URL=%RAW_URL:/blob/=/%"
 
-if %MATCH_COUNT% GTR 1 (
-  echo WARNING: Multiple tracked files named "%LATEST_FILE%" found. Skipping push to avoid ambiguity.
-  cd /d "%SCRIPT_DIR%"
-  goto :after_push
-)
+    for %%F in ("%URL%") do set "FILENAME=%%~nxF"
+    if not defined FILENAME (
+        echo Could not resolve filename from URL
+        endlocal & exit /b 1
+    )
 
-echo Repo destination: "%DEST_PATH%"
+    set "DEST=%~dp0%FILENAME%"
 
-copy /Y "%SCRIPT_DIR%%LATEST_FILE%" "%DEST_PATH%" >nul
-if errorlevel 1 (
-  echo WARNING: Copy into repo failed. Skipping push.
-  cd /d "%SCRIPT_DIR%"
-  goto :after_push
-)
+    powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+        "$u='%RAW_URL%'; $o='%DEST%';" ^
+        "try { Invoke-WebRequest -Uri $u -OutFile $o -UseBasicParsing; exit 0 } catch { Write-Host $_.Exception.Message; exit 1 }"
 
-git add "%DEST_PATH%"
+    set "RC=%ERRORLEVEL%"
+    if not "%RC%"=="0" (
+        endlocal & exit /b %RC%
+    )
 
-git diff --cached --quiet
-if not errorlevel 1 (
-  echo No changes detected in "%LATEST_FILE%". Nothing to push.
-  cd /d "%SCRIPT_DIR%"
-  goto :after_push
-)
+    endlocal & exit /b 0
 
-for /f "usebackq delims=" %%T in (`
-  powershell -NoProfile -Command "Get-Date -Format 'yyyy-MM-dd HH:mm:ss'"
-`) do set "NOW_TS=%%T"
+:pullFolder
+    @echo off
+    setlocal EnableDelayedExpansion
+  
+    set "RC=1"
+    set "URL=%~1"
+    if not defined URL (
+        echo [pullFolder] Missing URL argument
+        endlocal & exit /b 1
+    )
 
-git commit -m "Update %LATEST_FILE% (%NOW_TS%)"
-if errorlevel 1 (
-  echo WARNING: Commit failed. Skipping push.
-  cd /d "%SCRIPT_DIR%"
-  goto :after_push
-)
+    :trimFolderURL
+        if "%URL:~-1%"=="/" set "URL=%URL:~0,-1%" & goto trimFolderURL
+        if "%URL:~-1%"=="\" set "URL=%URL:~0,-1%" & goto trimFolderURL
 
-git push origin "%BRANCH%"
-if errorlevel 1 (
-  echo WARNING: Push failed. Check GitHub auth.
-) else (
-  echo Push complete: "%LATEST_FILE%"
-)
+    set "U=%URL:https://=%"
+    set "U=%U:http://=%"
 
-cd /d "%SCRIPT_DIR%"
+    for /f "tokens=1-5* delims=/" %%a in ("%U%") do (
+        set "HOST=%%a"
+        set "OWNER=%%b"
+        set "REPO=%%c"
+        set "TREE=%%d"
+        set "BRANCH=%%e"
+        set "SUBPATH=%%f"
+    )
 
-:after_push
-echo.
+    if /i not "%HOST%"=="github.com" (
+        echo URL host must be github.com, but got "%HOST%"
+        endlocal & exit /b 1
+    )
+
+    if /i not "%TREE%"=="tree" (
+        echo Invalid GitHub tree URL
+        endlocal & exit /b 1
+    )
+
+    set "REPO_URL=https://github.com/%OWNER%/%REPO%.git"
+    set "TMP=_repo_tmp_%RANDOM%_%RANDOM%"
+    set "SUBPATH_WIN=%SUBPATH:/=\%"
+
+    for %%L in ("%SUBPATH_WIN%") do set "LEAF=%%~nxL"
+
+    set "PUSHED=0"
+    rmdir /s /q "%TMP%" 2>nul
+    mkdir "%TMP%" || (set "RC=1" & goto :folderCleanup)
+    pushd "%TMP%" || (set "RC=1" & goto :folderCleanup)
+    set "PUSHED=1"
+
+    git init >nul 2>&1 || (set "RC=1" & goto :folderCleanup)
+    git remote add origin "%REPO_URL%" >nul 2>&1 || (set "RC=1" & goto :folderCleanup)
+    git fetch --quiet --no-progress --depth 1 origin "%BRANCH%" >nul || (set "RC=1" & goto :folderCleanup)
+    git checkout --quiet --detach FETCH_HEAD >nul || (set "RC=1" & goto :folderCleanup)
+    git sparse-checkout init --cone >nul 2>&1 || (set "RC=1" & goto :folderCleanup)
+    git sparse-checkout set "%SUBPATH%" >nul 2>&1 || (set "RC=1" & goto :folderCleanup)
+
+    popd
+    set "PUSHED=0"
+
+    :trimSub
+        if "%SUBPATH:~-1%"=="/" set "SUBPATH=%SUBPATH:~0,-1%" & goto trimSub
+        if "%SUBPATH:~-1%"=="\" set "SUBPATH=%SUBPATH:~0,-1%" & goto trimSub
+
+    rmdir /s /q "%LEAF%" 2>nul
+    xcopy "%TMP%\%SUBPATH_WIN%" "%LEAF%\" /E /I /Y >nul || (set "RC=1" & goto :folderCleanup)
+
+    set "RC=0"
+   
+:folderCleanup
+    if "%PUSHED%"=="1" popd
+    cd /d "%~dp0" >nul 2>&1
+
+    set "DELETED=0"
+    for /l %%i in (1,1,5) do (
+        rmdir /s /q "%TMP%" 2>nul
+        if not exist "%TMP%\" (
+            set "DELETED=1"
+        ) else (
+            call :sleep 2
+        )
+    )
+
+    if "%DELETED%"=="0" (
+        powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+            "if (Test-Path '%TMP%') { Remove-Item -LiteralPath '%TMP%' -Recurse -Force -ErrorAction SilentlyContinue }" >nul 2>&1
+    )
+
+    endlocal & exit /b %RC%
+
+:sleep
+    python -c "import time; time.sleep(%1)"
+    exit /b 0
+
+:kill
+    echo.
+    echo Downloading latest file versions...failed
+    echo Fatal error: %~1
+    echo.
+    endlocal
+    pause
+    exit 1
+
 pause
-exit /b %PY_EXIT%
-
-:download_fail
-echo.
-echo =================================================
-echo ERROR: Failed to download or extract files
-echo =================================================
-echo Repo: https://github.com/GonzalesLabVU/Behavior-BCI/tree/main
-echo check your internet connection and that the listed paths exist in the repo root
-pause
-exit /b 1
