@@ -37,6 +37,7 @@ REM call :pullFolder "https://github.com/GonzalesLabVU/Behavior-BCI/tree/main/ar
 echo done
 
 echo Running Python script...
+python -m sheets_api
 call :sleep 5
 
 echo.
