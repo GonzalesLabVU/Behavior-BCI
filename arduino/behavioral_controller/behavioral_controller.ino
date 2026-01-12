@@ -82,6 +82,9 @@ int trial_num = 0;
 
 long last_disp_mark = LONG_MIN;
 
+bool next_easy_trial = false;
+bool next_easy_valid = false;
+
 // phase logic forward declarations
 
 void run_phase_1();
@@ -89,7 +92,6 @@ void run_phase_2();
 void run_phase_3_4_5();
 
 // helper functions
-
 inline bool nearMultiple(float x, float step, float tol, float* nearestOut) {
     float q = roundf(x / step);
     float m = q * step;
@@ -212,7 +214,7 @@ void setup() {
 
     spout.init();
 
-    lick.init(true);
+    lick.init();
     lick.calibrate();
 
     switch (phase_id) {
@@ -289,6 +291,10 @@ void loop() {
         if (received == "E") {
             session_state = SessionState::CLEANUP;
         }
+        else if (received.startsWith("T")) {
+            next_easy_trial = (received.substring(1).toInt() != 0);
+            next_easy_valid = true;
+        }
         else {
             K = received.toInt();
         }
@@ -353,11 +359,6 @@ void run_phase_1() {
         
         case PhaseState::TRIAL: {
             if (session_timer.isRunning()) {
-                uint16_t raw = lick.getRaw();
-                if (raw != 0) {
-                    logger.write(raw);
-                }
-
                 lick.poll();
 
                 if (lick.justTouched()) {
@@ -385,11 +386,6 @@ void run_phase_1() {
                 // active
                 else {
                     if (phase_timer.isRunning()) {
-                        uint16_t raw = lick.getRaw();
-                        if (raw != 0) {
-                            logger.write(raw);
-                        }
-
                         lick.poll();
 
                         if (lick.justTouched()) {
@@ -444,11 +440,6 @@ void run_phase_2() {
             else {
                 // running
                 if (phase_timer.isRunning()) {
-                    uint16_t raw = lick.getRaw();
-                    if (raw != 0) {
-                        logger.write(raw);
-                    }
-
                     lick.poll();
 
                     if (lick.justTouched()) {
@@ -477,11 +468,6 @@ void run_phase_2() {
             else {
                 // running
                 if (phase_timer.isRunning()) {
-                    uint16_t raw = lick.getRaw();
-                    if (raw != 0) {
-                        logger.write(raw);
-                    }
-
                     lick.poll();
 
                     if (lick.justTouched()) {
@@ -513,11 +499,6 @@ void run_phase_2() {
             else {
                 // running
                 if (phase_timer.isRunning()) {
-                    uint16_t raw = lick.getRaw();
-                    if (raw != 0) {
-                        logger.write(raw);
-                    }
-
                     lick.poll();
 
                     if (lick.justTouched()) {
@@ -547,11 +528,6 @@ void run_phase_2() {
                 else {
                     // running
                     if (phase_timer.isRunning()) {
-                        uint16_t raw = lick.getRaw();
-                        if (raw != 0) {
-                            logger.write(raw);
-                        }
-
                         lick.poll();
 
                         if (lick.justTouched()) {
@@ -610,16 +586,14 @@ void run_phase_3_4_5() {
             else {
                 // running
                 if (phase_timer.isRunning()) {
-                    uint16_t raw = lick.getRaw();
-                    if (raw != 0) {
-                        logger.write(raw);
-                    }
-
                     lick.poll();
-
                     if (lick.justTouched()) {
                         logger.write("lick");
                     }
+
+                    // if (phase_timer.timeElapsed() >= (tone_T - (tone_T  >> 2))) {
+                    //     brake.release();
+                    // }
                 }
                 // exit
                 else {
@@ -636,12 +610,8 @@ void run_phase_3_4_5() {
         case PhaseState::TRIAL: {
             // entry
             if (!phase_timer.started()) {
-                bool easy_trial;
-                if (trial_num <= 20) {
-                    easy_trial = (((trial_num - 1) % 5) == 0);
-                } else {
-                    easy_trial = (((trial_num - 21) % K) == 0);
-                }
+                bool easy_trial = next_easy_valid ? next_easy_trial : false;
+                next_easy_valid = false;
 
                 wheel.reset(easy_trial);
                 last_disp_mark = LONG_MIN;
@@ -653,13 +623,7 @@ void run_phase_3_4_5() {
             else {
                 // running
                 if (phase_timer.isRunning()) {
-                    uint16_t raw = lick.getRaw();
-                    if (raw != 0) {
-                        logger.write(raw);
-                    }
-
                     lick.poll();
-                    
                     if (lick.justTouched()) {
                         logger.write("lick");
                     }
@@ -720,13 +684,7 @@ void run_phase_3_4_5() {
             else {
                 // running
                 if (phase_timer.isRunning()) {
-                    uint16_t raw = lick.getRaw();
-                    if (raw != 0) {
-                        logger.write(raw);
-                    }
-
                     lick.poll();
-
                     if (lick.justTouched()) {
                         logger.write("lick");
                     }
@@ -766,13 +724,7 @@ void run_phase_3_4_5() {
             else {
                 // running
                 if (phase_timer.isRunning()) {
-                    uint16_t raw = lick.getRaw();
-                    if (raw != 0) {
-                        logger.write(raw);
-                    }
-
                     lick.poll();
-
                     if (lick.justTouched()) {
                         logger.write("lick");
                     }
@@ -804,13 +756,7 @@ void run_phase_3_4_5() {
                 else {
                     // running
                     if (phase_timer.isRunning()) {
-                        uint16_t raw = lick.getRaw();
-                        if (raw != 0) {
-                            logger.write(raw);
-                        }
-
                         lick.poll();
-
                         if (lick.justTouched()) {
                             logger.write("lick");
                         }
