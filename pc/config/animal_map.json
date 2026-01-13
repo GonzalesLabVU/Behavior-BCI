@@ -1,18 +1,5 @@
 {
-    "cohort1": [
-        "A",
-        "C",
-        "D"
-    ],
-    "cohort2": [
-        "E",
-        "G",
-        "I"
-    ],
-    "cohort3": [
-        "Q",
-        "V",
-        "W",
-        "X"
-    ]
+    "ACD": "COHORT1",
+    "EGI": "COHORT2",
+    "QVWX": "COHORT3"
 }
