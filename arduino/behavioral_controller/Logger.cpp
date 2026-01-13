@@ -3,30 +3,27 @@
 Logger::Logger() {}
 
 void Logger::write(const String& data) {
-    if (data.length() == 0) {
-        return;
-    }
-
-    if (data == "S") {
-        Serial.println(F("S"));
-    } else {
-        Serial.print(F("[EVT] "));
-        Serial.println(data);
+    if (data.length() > 0) {
+        if (data == "S") {
+            Serial.println(data);
+        } else {
+            Serial.println("[EVT] " + data);
+        }
     }
 
     Serial.flush();
 }
 
-void Logger::write(uint16_t data) {
-    Serial.print(F("[RAW] "));
-    Serial.println(data);
+void Logger::write(int data) {
+    String output = "[ENC] " + String(data);
+    Serial.println(output);
 
     Serial.flush();
 }
 
 void Logger::write(float data) {
-    Serial.print(F("[ENC] "));
-    Serial.println(data, 1);
+    String output = "[ENC] " + String(data, 2);
+    Serial.println(output);
 
     Serial.flush();
 }
@@ -37,7 +34,6 @@ String Logger::read() {
         line.trim();
 
         if (line.length() > 0) {
-            ack();
             return line;
         }
     }
