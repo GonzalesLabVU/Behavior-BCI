@@ -22,6 +22,45 @@ if not exist "requirements.txt" (
 )
 python -m pip install -r requirements.txt -q || exit /b 1
 
+where git >nul 2>&1
+if errorlevel 1 (
+    echo.
+    echo Git not found, attempting to install...
+
+    where winget >nul 2>&1
+    if not errorlevel 1 (
+        winget install --id Git.Git -e --source winget --accept-package-agreements --accept-source-agreements >nul 2>&1
+    )
+
+    where git >nul 2>&1
+    if errorlevel 1 (
+        where choco >nul 2>&1
+        if not errorlevel 1 (
+            choco install git -y >nul 2>&1
+        )
+    )
+
+    where git >nul 2>&1
+    if errorlevel 1 (
+        powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+            "$ErrorActionPreference='Stop';" ^
+            "$u='https://github.com/git-for-windows/git/releases/latest/download/Git-64-bit.exe';" ^
+            "$o=Join-Path $env:TEMP 'Git-64-bit.exe';" ^
+            "Invoke-WebRequest -Uri $u -OutFile $o -UseBasicParsing;" ^
+            "Start-Process -FilePath $o -ArgumentList '/VERYSILENT','/NORESTART','/SUPPRESSMSGBOXES' -Wait;"
+    )
+
+    if exist "%ProgramFiles%\Git\cmd\git.ext" set "PATH=%ProgramFiles%\Git\cmd;%PATH%"
+    if exist "%ProgramFiles(x86)%\Git\cmd\git.ext" set "PATH=%ProgramFiles(x86)%\Git\cmd;%PATH%"
+
+    where git >nul 2>&1
+    if errorlevel 1 (
+        call :kill "Git installation failed or git.exe not on PATH"
+    ) else (
+        for /f "delims=" %%v in ('git --versoin 2^>nul') do echo %%v
+    )
+)
+
 <nul set /p "=Downloading latest file versions..."
 call :pullFile "https://github.com/GonzalesLabVU/Behavior-BCI/blob/main/pc/behavioral_master.py" || call :kill "pullFile subroutine failed for behavioral_master.py"
 call :pullFile "https://github.com/GonzalesLabVU/Behavior-BCI/blob/main/pc/cursor_utils.py" || call :kill "pullFile failed for cursor_utils.py"
