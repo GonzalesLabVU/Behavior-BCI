@@ -42,4 +42,5 @@ String Logger::read() {
 
 void Logger::ack() {
     Serial.println("A");
+    Serial.flush();
 }
