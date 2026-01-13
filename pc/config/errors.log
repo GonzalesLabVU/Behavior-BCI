@@ -39,3 +39,20 @@ SOURCE = behavioral_master.py
       raise ValueError('animal_map.json keys and values must be strings')
   ValueError: animal_map.json keys and values must be strings
 
+TIME = 2026-01-12 18:53:29
+USER = MAX-LAPTOP
+ANIMAL = UNKNOWN
+PHASE = 0
+SOURCE = behavioral_master.py
+----------------------------------------
+  Traceback (most recent call last):
+    File "C:\Users\gonza\Desktop\Behavior\behavioral_master.py", line 1279, in <module>
+      link, session_data, cursor, dev_mode = setup()
+    File "C:\Users\gonza\Desktop\Behavior\behavioral_master.py", line 1127, in setup
+      _send_next_config(link, easy_1, align_1)
+    File "C:\Users\gonza\Desktop\Behavior\behavioral_master.py", line 911, in _send_next_config
+      link.send_and_wait(f'T {1 if is_easy else 0} {alignment}', timeout=timeout)
+    File "C:\Users\gonza\Desktop\Behavior\behavioral_master.py", line 940, in send_and_wait
+      raise TimeoutError(f"No ACK after sending: {text!r}")
+  TimeoutError: No ACK after sending: 'T 1 B'
+
