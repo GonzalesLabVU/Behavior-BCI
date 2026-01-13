@@ -9,14 +9,16 @@ class Wheel {
 
         Wheel();
 
-        void init(float easy_threshold, float normal_threshold, bool bidirectional);
+        void init(float easy_threshold, float normal_threshold, char alignment);
         void update();
         float getDisplacement();
         bool thresholdReached();
         bool thresholdMissed();
-        void reset(bool easy_trial);
+        // void reset(bool easy_trial);
+        void reset(bool easy_trial, char alignment);
 
-        inline void reset() { reset(false); }
+        // inline void reset() { reset(false); }
+        inline void reset() { reset(false, 'B'); }
             
     private:
         static constexpr uint8_t A_PIN = 3;

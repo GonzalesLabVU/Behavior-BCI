@@ -17,7 +17,7 @@ Wheel::Wheel():
     positive_threshold_(true)
 {}
 
-void Wheel::init(float easy_threshold, float normal_threshold, bool bidirectional) {
+void Wheel::init(float easy_threshold, float normal_threshold, char alignment) {
     pinMode(A_PIN, INPUT_PULLUP);
     pinMode(B_PIN, INPUT_PULLUP);
 
@@ -29,10 +29,21 @@ void Wheel::init(float easy_threshold, float normal_threshold, bool bidirectiona
     easy_threshold_counts_ = degToCounts_(easy_threshold);
     normal_threshold_counts_ = degToCounts_(normal_threshold);
 
-    bidirectional_ = bidirectional;
-    positive_threshold_ = (normal_threshold >= 0.0f);
+    bidirectional_ = (alignment == 'B' || alignment == 'b');
 
-    reset(true);
+    if (!bidirectional_) {
+        if (alignment == 'L' || alignment == 'l') {
+            positive_threshold_ = false;
+        } else if (alignment == 'R' || alignment == 'r') {
+            positive_threshold_ = true;
+        } else {
+            positive_threshold_ = true;
+        }
+    } else {
+        positive_threshold_ = true;
+    }
+
+    reset(true, alignment);
 }
 
 void Wheel::update() {
@@ -90,7 +101,15 @@ bool Wheel::thresholdMissed() {
     return false;
 }
 
-void Wheel::reset(bool easy_trial) {
+void Wheel::reset(bool easy_trial, char alignment) {
+    if (!bidirectional_) {
+        if (alignment == 'L' || alignment == 'l') {
+            positive_threshold_ = false;
+        } else if (alignment == 'R' || alignment == 'r') {
+            positive_threshold_ = true;
+        }
+    }
+
     active_threshold_counts_ = easy_trial ? easy_threshold_counts_ : normal_threshold_counts_;
 
     noInterrupts();
@@ -108,8 +127,5 @@ static long Wheel::degToCounts_(float deg) {
 }
 
 void Wheel::isr_() {
-    // bool b_state = digitalRead(B_PIN);
-    // int8_t dir = b_state ? -1 : 1;
-    // current_pos_ += dir;
     current_pos_ += (*s_b_in_reg_ & s_b_mask_) ? -1 : +1;
 }
