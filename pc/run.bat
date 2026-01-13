@@ -2,7 +2,6 @@
 setlocal EnableExtensions EnableDelayedExpansion
 
 echo.
-echo CURRENT VERSION
 
 call :selfUpdate
 if "%ERRORLEVEL%"=="99" exit /b 0
@@ -16,25 +15,23 @@ cd /d "%SCRIPT_DIR%"
 echo Making sure pip is up to date...
 python -m pip install --upgrade pip -q
 
+<nul set /p "=Downloading latest file versions..."
+call :pullFile "https://github.com/GonzalesLabVU/Behavior-BCI/blob/main/pc/behavioral_master.py" || call :kill "pullFile subroutine failed for behavioral_master.py"
+call :pullFile "https://github.com/GonzalesLabVU/Behavior-BCI/blob/main/pc/cursor_utils.py"
+call :pullFile "https://github.com/GonzalesLabVU/Behavior-BCI/blob/main/pc/plot_utils.py"
+call :pullFile "https://github.com/GonzalesLabVU/Behavior-BCI/blob/main/pc/run.bat"
+call :pullFile "https://github.com/GonzalesLabVU/Behavior-BCI/blob/main/pc/config/animal_map.json"
+call :pullFile "https://github.com/GonzalesLabVU/Behavior-BCI/blob/main/pc/config/requirements.txt"
+call :pullFile "https://github.com/GonzalesLabVU/Behavior-BCI/blob/main/pc/config/errors.log"
+call :pullFolder "https://github.com/GonzalesLabVU/Behavior-BCI/tree/main/arduino/behavioral_controller" || call :kill "pullFolder subroutine failed"
+echo done
+
 echo Installing required dependencies...
 if not exist "requirements.txt" (
     echo requirements.txt not found in %SCRIPT_DIR%
     exit /b 1
 )
 python -m pip install -r requirements.txt -q || exit /b 1
-
-<nul set /p "=Downloading latest file versions..."
-REM call :pullFile "https://github.com/GonzalesLabVU/Behavior-BCI/blob/main/pc/behavioral_master.py" || call :kill "pullFile subroutine failed for behavioral_master.py"
-REM call :pullFile "https://github.com/GonzalesLabVU/Behavior-BCI/blob/main/pc/cursor_utils.py"
-REM call :pullFile "https://github.com/GonzalesLabVU/Behavior-BCI/blob/main/pc/plot_utils.py"
-REM call :pullFile "https://github.com/GonzalesLabVU/Behavior-BCI/blob/main/pc/api_utils.py"
-REM call :pullFile "https://github.com/GonzalesLabVU/Behavior-BCI/blob/main/pc/run.bat"
-REM call :pullFile "https://github.com/GonzalesLabVU/Behavior-BCI/blob/main/pc/config/animal_map.json"
-REM call :pullFile "https://github.com/GonzalesLabVU/Behavior-BCI/blob/main/pc/config/credentials.json"
-REM call :pullFile "https://github.com/GonzalesLabVU/Behavior-BCI/blob/main/pc/config/requirements.txt"
-REM call :pullFile "https://github.com/GonzalesLabVU/Behavior-BCI/blob/main/pc/config/errors.log"
-REM call :pullFolder "https://github.com/GonzalesLabVU/Behavior-BCI/tree/main/arduino/behavioral_controller" || call :kill "pullFolder subroutine failed"
-echo done
 
 echo Running Python script...
 python -m sheets_api
