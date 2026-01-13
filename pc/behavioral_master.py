@@ -14,17 +14,19 @@ from pathlib import Path
 from queue import Queue, Empty
 from threading import Thread, Event
 
+import serial
+import serial.tools.list_ports
+from cursor_utils import BCI
+
 import gspread
 from gspread.utils import rowcol_to_a1
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
-from googleapiclient.errors import HttpError
 from dotenv import load_dotenv
 
-import serial
-import serial.tools.list_ports
-
-from cursor_utils import cursor_fcn
+import subprocess
+import shutil
+import tempfile
 
 
 # ---------------------------
@@ -43,6 +45,7 @@ warnings.filterwarnings(
 )
 
 BAUDRATE = 1_000_000
+EARLY_END_STRING = "E"
 SESSION_END_STRING = "S"
 
 PHASE_CONFIG = {
@@ -115,16 +118,11 @@ def _p_exit():
 # ---------------------------
 # DEBUG / LOG
 # ---------------------------
-def _http_details(e):
-    status = getattr(e, 'status_code', None) or getattr(getattr(e, 'resp', None), 'status', None)
-    content = getattr(e, 'content', b"")
+REPO_SLUG = "GonzalesLabVU/Behavior-BCI"
+REPO_BRANCH = "main"
+REPO_REL_PATH = Path("pc") / "config" / "errors.log"
 
-    try:
-        content_s = content.decode('utf-8', 'ignore') if isinstance(content, (bytes, bytearray)) else str(content)
-    except Exception:
-        content_s = str(content)
-    
-    return f'status={status} content={content_s[:500]}'
+ERROR_LOGGED = False
 
 
 def time_this(fcn):
@@ -147,6 +145,9 @@ def time_this(fcn):
 
 
 def log_error(animal_id, phase_id, exc):
+    global ERROR_LOGGED
+    ERROR_LOGGED = True
+
     try:
         now = datetime.now()
         date_str = now.strftime('%Y-%m-%d')
@@ -183,6 +184,68 @@ def log_error(animal_id, phase_id, exc):
             f.write('\n')
     except Exception:
         pass
+
+
+def commit_error_log(animal_id='UNKNOWN', phase_id='0'):
+    global ERROR_LOGGED
+
+    if not ERROR_LOGGED:
+        return False
+    
+    token = os.getenv('GITHUB_TOKEN')
+    if not token:
+        print('[WARNING] GITHUB_TOKEN not set, skipping errors.log push', flush=True)
+        return False
+    
+    if not ERROR_LOG_PATH.exists():
+        return False
+    
+    remote_url = f'https://x-access-token:{token}@github.com/{REPO_SLUG}.git'
+
+    def git_run(cmd, cwd=None, check=True):
+        return subprocess.run(cmd,
+                              cwd=cwd,
+                              check=check,
+                              stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE,
+                              text=True)
+    
+    try:
+        with tempfile.TemporaryDirectory(prefix='behavior_bci_repo_') as td:
+            repo_dir = Path(td) / "repo"
+
+            git_run(['git', 'clone', '--depth', '1', '--branch', REPO_BRANCH, remote_url, str(repo_dir)])
+
+            dest_path = repo_dir / REPO_REL_PATH
+            dest_path.parent.mkdir(parents=True, exist_ok=True)
+
+            shutil.copy2(ERROR_LOG_PATH, dest_path)
+
+            st = git_run(['git', 'status', '--porcelain', str(REPO_REL_PATH)], cwd=repo_dir).stdout.strip()
+            if not st:
+                return False
+            
+            git_run(['git', 'config', 'user.name', 'behavior-bci-bot'], cwd=repo_dir)
+            git_run(['git', 'config', 'user.email', 'behavior-bci-bot@users.noreply.github.com'], cwd=repo_dir)
+
+            git_run(['git', 'add', str(REPO_REL_PATH)], cwd=repo_dir)
+
+            msg = f'Update errors.log (animal={animal_id}, phase={phase_id})'
+            c = subprocess.run(['git', 'commit', '-m', msg],
+                               cwd=repo_dir,
+                               stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE,
+                               text=True)
+            
+            if c.returncode != 0:
+                return False
+            
+            git_run(['git', 'push', 'origin', REPO_BRANCH], cwd=repo_dir, check=True)
+
+            return True
+    except Exception as e:
+        print(f'[WARNING] Failed to commit errors.log: {type(e).__name__}', flush=True)
+        return False
 
 
 # ---------------------------
@@ -286,12 +349,10 @@ class FileLock:
         self.wb = None
         self.ws = None
 
-
     def _open_wb(self):
         self.wb = self.client.open_by_key(self.workbook_id)
         return self.wb
     
-
     def _get_ws(self):
         if self.sheet_name is None:
             raise RuntimeError('Lock not acquired (sheet_name is None)')
@@ -307,18 +368,15 @@ class FileLock:
         
         return self.ws
 
-
     def _confirm_ws(self, ws, err_msg='Lock lost'):
         meta = self._get_meta(ws, err_msg=err_msg)
         self._ensure_control(meta['owner'], meta['token'], err_msg=err_msg)
-
 
     def _is_lock(self, ws):
         try:
             return (ws.acell(LOCK_TAG_RANGE).value or "") == LOCK_TAG
         except Exception:
             return False
-
 
     def _get_meta(self, ws, err_msg='Lock tag missing (lock lost)'):
         try:
@@ -355,12 +413,10 @@ class FileLock:
         
         return meta
 
-
     def _ensure_control(self, owner, token, err_msg='Lock lost'):
         if owner != self.owner or token != self.token:
             raise RuntimeError(err_msg)
         
-
     def sleep(self, dur_s, jitter_ms=1000):
         if dur_s < 0:
             dur_s = 0.0
@@ -369,7 +425,6 @@ class FileLock:
             dur_s += random.random() * (jitter_ms / 1000.0)
         
         time.sleep(dur_s)
-
 
     def acquire(self):
         wb = self._open_wb()
@@ -556,7 +611,6 @@ class FileLock:
         
         raise TimeoutError('Timed out during lock acquisition')
 
-
     def update(self):
         ws = self._get_ws()
         meta = self._get_meta(ws)
@@ -572,7 +626,6 @@ class FileLock:
         self.expires = int(expires_ts or 0)
 
         return int(self.expires or 0) - _now()
-
 
     def reset(self):
         remaining = int(self.expires or 0) - _now()
@@ -618,7 +671,6 @@ class FileLock:
         self.expires = int(expires_ts2 or new_expires)
         
         return int(self.expires or 0) - _now()
-
 
     def release(self, retries=5):
         last_e = RuntimeError('Lock release failed')
@@ -818,6 +870,47 @@ def _decode_line(raw):
         return raw.decode("latin1", errors="ignore").strip()
 
 
+def _set_easy_rate(session_data, trial_stack):
+    n_hits = sum(1 for x in trial_stack if x == "hit")
+
+    if n_hits < 10:
+        K = 3
+    elif n_hits == 10:
+        K = 5
+    else:
+        K = 7
+
+    N = 4 * K
+
+    trial_stack.clear()
+    session_data.add_evt(_get_ts(), f"setK {K}")
+
+    return K, N, n_hits
+
+
+def _compute_easy_trial(trial_n, K):
+    if trial_n <= 20:
+        return ((trial_n - 1) % 5) == 0
+
+    K = max(1, int(K))
+    return ((trial_n - 21) % K) == 0
+
+
+def _choose_alignment(phase_id):
+    cfg = PHASE_CONFIG.get(str(phase_id))
+    if not cfg:
+        return "B"
+    
+    if cfg.get('bidirectional', False):
+        return "B"
+    
+    return random.choice(["L", "R"])
+
+
+def _send_next_config(link, is_easy, alignment, timeout=3.0):
+    link.send_and_wait(f'T {1 if is_easy else 0} {alignment}', timeout=timeout)
+
+
 class ArduinoLink:
     def __init__(self, ser):
         self.ser = ser
@@ -826,10 +919,8 @@ class ArduinoLink:
         self.msg_q: "Queue[tuple[str, str, object]]" = Queue()
         self._reader = Thread(target=self._reader_loop, daemon=True)
 
-
     def start(self):
         self._reader.start()
-
 
     def close(self):
         self.stop_evt.set()
@@ -840,7 +931,6 @@ class ArduinoLink:
         except Exception:
             pass
 
-
     def send_and_wait(self, text, timeout=2.0):
         self.ack_evt.clear()
         self.ser.write((text.strip() + "\n").encode("utf-8"))
@@ -849,11 +939,9 @@ class ArduinoLink:
         if not self.ack_evt.wait(timeout=timeout):
             raise TimeoutError(f"No ACK after sending: {text!r}")
 
-
     def send(self, text):
         self.ser.write((text.strip() + "\n").encode("utf-8"))
         self.ser.flush()
-
 
     def _reader_loop(self):
         try:
@@ -909,20 +997,16 @@ class SessionData:
         self.evt = {"timestamps": [], "values": []}
         self.enc = {"timestamps": [], "values": []}
 
-
     def add_evt(self, ts, payload):
         self.evt["timestamps"].append(ts)
         self.evt["values"].append(payload)
-
 
     def add_enc(self, ts, payload):
         self.enc["timestamps"].append(ts)
         self.enc["values"].append(payload)
 
-
     def any_data(self):
         return bool(self.evt["timestamps"]) or bool(self.enc["timestamps"])
-
 
     def to_dict(self):
         def _json_safe(x):
@@ -945,27 +1029,8 @@ class SessionData:
 
 
 # ---------------------------
-# CALIBRATION / EARLY EXIT
+# TERMINATION / CLEANUP
 # ---------------------------
-def _set_easy_rate(link, session_data, trial_stack):
-    n_hits = sum(1 for x in trial_stack if x == "hit")
-
-    if n_hits < 10:
-        K = 3
-    elif n_hits == 10:
-        K = 5
-    else:
-        K = 7
-
-    N = 4 * K
-
-    trial_stack.clear()
-    link.send_and_wait(str(K))
-    session_data.add_evt(_get_ts(), f"setK {K}")
-
-    return K, N, n_hits
-
-
 def _is_early_exit(trial_stack, N):
     if len(trial_stack) < N:
         return False
@@ -976,7 +1041,7 @@ def _is_early_exit(trial_stack, N):
 
 def _terminate_session(link, msg):
     try:
-        link.send("E")
+        link.send_and_wait(EARLY_END_STRING, timeout=2.0)
         deadline = time.time() + 2.0
 
         while time.time() < deadline:
@@ -1051,19 +1116,25 @@ def setup():
             link.close()
             raise RuntimeError(f"Failed to send training phase to Arduino: {e}") from e
 
-        cursor_thread = None
+        cursor = None
 
         if phase_id in PHASE_CONFIG:
-            cfg = PHASE_CONFIG[phase_id]
-            threshold = cfg["threshold"]
+            trial_1 = 1
+            K0 = 5
+            easy_1 = _compute_easy_trial(trial_1, K0)
+            align_1 = _choose_alignment(phase_id)
 
-            cursor_thread = Thread(
-                target=cursor_fcn,
-                args=(threshold, EVT_QUEUE, ENC_QUEUE),
-                kwargs={"display_index": 1, "fullscreen": True},
-                daemon=True
-                )
-            cursor_thread.start()
+            _send_next_config(link, easy_1, align_1)
+
+            cursor = BCI(phase_id=phase_id,
+                         evt_queue=EVT_QUEUE,
+                         enc_queue=ENC_QUEUE,
+                         display_idx=1,
+                         fullscreen=True,
+                         easy_threshold=15.0)
+            
+            cursor.update_config(easy_1, align_1)
+            cursor.start()
 
         session_data = SessionData(
             animal_id=animal_id,
@@ -1073,7 +1144,7 @@ def setup():
         if not dev_mode:
             session_data.meta["workbook_id"] = workbook_id
 
-        return link, session_data, cursor_thread, dev_mode
+        return link, session_data, cursor, dev_mode
     except Exception:
         if link is not None:
             try:
@@ -1089,18 +1160,12 @@ def setup():
         raise
 
 
-def main(link, session_data):
+def main(link, session_data, cursor):
     do_calibration = str(session_data.meta["phase"]) not in {"1", "2"}
 
     K = 5
     N = 20
-
-    try:
-        link.send_and_wait(str(K))
-    except Exception as e:
-        raise RuntimeError(f"Failed to send initial easy rate to Arduino: {e}") from e
-
-    session_data.add_evt(_get_ts(), f"setK {K}")
+    trial_n = 0
 
     trial_stack = []
     calibrated = not do_calibration
@@ -1140,7 +1205,10 @@ def main(link, session_data):
                 except Exception:
                     pass
 
-                if do_calibration and p in {"hit", "miss"}:
+                if do_calibration and p == 'cue':
+                    trial_n += 1
+                
+                if do_calibration and p in {'hit', 'miss'}:
                     if last_outcome == p:
                         continue
 
@@ -1149,20 +1217,26 @@ def main(link, session_data):
                     trial_stack.insert(0, p)
                     if len(trial_stack) > N:
                         trial_stack.pop()
-
+                    
                     if calibrated:
                         if len(trial_stack) >= N and _is_early_exit(trial_stack, N):
-                            _terminate_session(link, "Session terminated by early exit")
-                            session_data.meta["aborted"] = True
+                            _terminate_session(link, 'Session terminated by early exit')
+                            session_data.meta['aborted'] = True
                             break
                     else:
                         if len(trial_stack) >= N:
-                            K, N, calibration_hits = _set_easy_rate(link, session_data, trial_stack)
+                            K, N, calibration_hits = _set_easy_rate(session_data, trial_stack)
                             calibrated = True
-                            print(
-                                f"Calibration finished [hits={calibration_hits}/20, K={K}, N={N}]",
-                                flush=True,
-                                )
+                            print(f'Calibration finished [hits={calibration_hits}/20, K={K}, N={N}]', flush=True)
+                    
+                    next_trial_n = trial_n + 1
+                    easy_next = _compute_easy_trial(next_trial_n, K)
+                    align_next = _choose_alignment(session_data.meta['phase'])
+
+                    _send_next_config(link, easy_next, align_next)
+
+                    if cursor is not None:
+                        cursor.update_config(easy_next, align_next)
             elif typ == "ENC":
                 p = str(payload)
                 session_data.add_enc(ts, p)
@@ -1196,19 +1270,19 @@ def main(link, session_data):
 if __name__ == "__main__":
     link = None
     session_data = None
-    cursor_thread = None
+    cursor = None
     dev_mode = True
     animal_id_for_log = "UNKNOWN"
     phase_id_for_log = "0"
 
     try:
-        link, session_data, cursor_thread, dev_mode = setup()
+        link, session_data, cursor, dev_mode = setup()
 
         if session_data is not None:
             animal_id_for_log = session_data.meta.get("animal", "UNKNOWN")
             phase_id_for_log = session_data.meta.get("phase", "0")
 
-        main(link, session_data)
+        main(link, session_data, cursor)
 
         if not dev_mode:
             if not session_data.any_data():
@@ -1226,11 +1300,19 @@ if __name__ == "__main__":
         log_error(animal_id_for_log, phase_id_for_log, e)
         raise
     finally:
-        if cursor_thread is not None:
-            cursor_thread.join(timeout=2.0)
+        if cursor is not None:
+            try:
+                cursor.stop(timeout=2.0)
+            except Exception:
+                pass
 
         if link is not None:
             try:
                 link.close()
             except Exception:
                 pass
+        
+        try:
+            commit_error_log(animal_id_for_log, phase_id_for_log)
+        except Exception:
+            pass
