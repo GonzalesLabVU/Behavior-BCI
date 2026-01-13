@@ -24,3 +24,18 @@ SOURCE = behavioral_master_FINAL.py
       raise RuntimeError("No Arduino detected")
   RuntimeError: No Arduino detected
 
+TIME = 2026-01-12 18:44:13
+USER = MAX-LAPTOP
+ANIMAL = UNKNOWN
+PHASE = 0
+SOURCE = behavioral_master.py
+----------------------------------------
+  Traceback (most recent call last):
+    File "C:\Users\gonza\Desktop\Behavior\behavioral_master.py", line 1279, in <module>
+      link, session_data, cursor, dev_mode = setup()
+    File "C:\Users\gonza\Desktop\Behavior\behavioral_master.py", line 1092, in setup
+      animal_map = load_animal_map()
+    File "C:\Users\gonza\Desktop\Behavior\behavioral_master.py", line 263, in load_animal_map
+      raise ValueError('animal_map.json keys and values must be strings')
+  ValueError: animal_map.json keys and values must be strings
+
