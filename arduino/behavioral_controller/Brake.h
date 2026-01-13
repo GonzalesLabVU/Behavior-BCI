@@ -6,8 +6,8 @@
 
 
 #define BRAKE_PIN 44
-#define RELEASE_US 1200
-#define ENGAGE_US 900
+#define RELEASE_US 800
+#define ENGAGE_US 500
 
 
 class Brake {
