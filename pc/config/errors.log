@@ -46,3 +46,31 @@ SOURCE = behavioral_master.py
       raise RuntimeError(f"Failed to send training phase to Arduino: {e}") from e
   RuntimeError: Failed to send training phase to Arduino: No ACK after sending: '5'
 
+TIME = 2026-01-13 11:17:05
+USER = MAX-LAPTOP
+ANIMAL = X
+PHASE = 5
+SOURCE = behavioral_master.py
+----------------------------------------
+  Traceback (most recent call last):
+    File "c:\Users\Max\Documents\Classes\Gonzales Lab\Behavioral\Local\behavioral_master.py", line 1185, in main
+      typ, ts, payload = link.msg_q.get(timeout=0.05)
+    File "C:\Users\Max\AppData\Local\Programs\Python\Python310\lib\queue.py", line 180, in get
+      self.not_empty.wait(remaining)
+    File "C:\Users\Max\AppData\Local\Programs\Python\Python310\lib\threading.py", line 324, in wait
+      gotit = waiter.acquire(True, timeout)
+  KeyboardInterrupt
+  
+  During handling of the above exception, another exception occurred:
+  
+  Traceback (most recent call last):
+    File "c:\Users\Max\Documents\Classes\Gonzales Lab\Behavioral\Local\behavioral_master.py", line 1290, in <module>
+      main(link, session_data, cursor)
+    File "c:\Users\Max\Documents\Classes\Gonzales Lab\Behavioral\Local\behavioral_master.py", line 1255, in main
+      _terminate_session(link, "Session terminated by user")
+    File "c:\Users\Max\Documents\Classes\Gonzales Lab\Behavioral\Local\behavioral_master.py", line 1044, in _terminate_session
+      link.send_and_wait(EARLY_END_STRING, timeout=2.0)
+    File "c:\Users\Max\Documents\Classes\Gonzales Lab\Behavioral\Local\behavioral_master.py", line 940, in send_and_wait
+      raise TimeoutError(f"No ACK after sending: {text!r}")
+  TimeoutError: No ACK after sending: 'E'
+
