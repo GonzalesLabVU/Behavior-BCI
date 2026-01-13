@@ -118,3 +118,22 @@ SOURCE = behavioral_master.py
       raise e
   ValueError
 
+----------------------------------------------------------------------------------------------------
+TIME = 2026-01-13 16:15:58
+USER = UNKNOWN_USER
+ANIMAL = UNKNOWN
+PHASE = 0
+SOURCE = behavioral_master.py
+
+  type: <class 'ValueError'>
+----------------------------------------------------------------------------------------------------
+TIME = 2026-01-13 16:15:58
+USER = UNKNOWN_USER
+ANIMAL = UNKNOWN
+PHASE = 0
+SOURCE = behavioral_master.py
+
+  Traceback (most recent call last):
+    File "c:\Users\Max\Documents\Classes\Gonzales Lab\Behavioral\Local\behavioral_master.py", line 1435, in <module>
+      raise e
+  ValueError
