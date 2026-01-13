@@ -71,27 +71,24 @@ unsigned long tone_T = SECONDS(1);
 
 float easy_threshold = DEGREES(15);
 float threshold;
-bool bidirectional;
 
 bool session_initialized = false;
 bool trial_hit;
 bool reward_given = false;
 
-int K;
-int trial_num = 0;
-
 long last_disp_mark = LONG_MIN;
 
 bool next_easy_trial = false;
-bool next_easy_valid = false;
+char next_alignment = 'B';
 
 // phase logic forward declarations
 
 void run_phase_1();
 void run_phase_2();
-void run_phase_3_4_5();
+void run_phase_3_plus();
 
 // helper functions
+
 inline bool nearMultiple(float x, float step, float tol, float* nearestOut) {
     float q = roundf(x / step);
     float m = q * step;
@@ -167,6 +164,95 @@ void checkInactivity(float current_disp) {
     }
 }
 
+static bool parseConfig(const String& line, bool* easy_out, char* align_out) {
+    if (!line.startsWith("T")) return false;
+
+    int first_space = line.indexOf(' ');
+    if (first_space < 0) return false;
+
+    int second_space = line.indexOf(' ', first_space + 1);
+    if (second_space < 0) return false;
+
+    String easy_str = line.substring(first_space + 1, second_space);
+    String align_str = line.substring(second_space + 1);
+    align_str.trim();
+
+    if (align_str.length() < 1) return false;
+
+    int e = easy_str.toInt();
+    char a = align_str.charAt(0);
+
+    if (!(a == 'L' || a == 'l' || a == 'R' || a == 'r' || a == 'B' || a == 'b')) return false;
+
+    if (easy_out) *easy_out = (e != 0);
+    if (align_out) *align_out = a;
+
+    return true;
+}
+
+static void drainSerial() {
+    while (true) {
+        String msg = logger.read();
+        if (!msg.length()) break;
+
+        if (msg == "E") {
+            session_state = SessionState::CLEANUP;
+            logger.ack();
+            continue;
+        }
+
+        if (phase_id >= 3 && phase_state == PhaseState::DELAY) {
+            bool e;
+            char a;
+
+            if (parseConfig(msg, &e, &a)) {
+                next_easy_trial = e;
+                next_alignment = a;
+
+                logger.ack();
+            }
+        }
+    }
+}
+
+static void waitForPhase() {
+    while (true) {
+        String msg = logger.read();
+        if (!msg.length()) continue;
+
+        int p = msg.toInt();
+        if (p > 0) {
+            phase_id = p;
+            logger.ack();
+            return;
+        }
+    }
+}
+
+static void waitForInitConfig() {
+    while (true) {
+        String msg = logger.read();
+        if (!msg.length()) continue;
+
+        if (msg == "E") {
+            session_state = SessionState::CLEANUP;
+            logger.ack();
+            return;
+        }
+
+        bool e;
+        char a;
+
+        if (parseConfig(msg, &e, &a)) {
+            next_easy_trial = e;
+            next_alignment = a;
+            
+            logger.ack();
+            return;
+        }
+    }
+}
+
 // main
 
 void setup() {
@@ -177,37 +263,14 @@ void setup() {
     Serial.begin(BAUDRATE);
     randomSeed(analogRead(SEED_PIN));
 
-    // block until host sends phase ID and initial K via serial
-    // enable power sources on exit
-    String phase_line;
-    while (true) {
-        if (Serial.available()) {
-            phase_line = Serial.readStringUntil('\n');
-            phase_line.trim();
-
-            if (phase_line.length() > 0) break;
-        }
-    }
-    phase_id = phase_line.toInt();
-    logger.ack();
-
-    String K_line;
-    while (true) {
-        if (Serial.available()) {
-            K_line = Serial.readStringUntil('\n');
-            K_line.trim();
-
-            if (K_line.length() > 0) break;
-        }
-    }
-    K = K_line.toInt();
-    logger.ack();
+    // block until host sends phase ID
+    waitForPhase();
 
     digitalWrite(POWER_EN, HIGH);
     delay(200);
 
     // initialize external components
-    // set session parameters based on the chosen phase ID
+    // set session parameters based on phase ID
     brake.engage();
 
     speaker.init();
@@ -222,62 +285,70 @@ void setup() {
             session_T = MINUTES(10);
             trial_T = SECONDS(0);
             delay_T = SECONDS(5);
-
             threshold = DEGREES(0);
-            bidirectional = true;
-
             break;
         }
-        
         case 2: {
             session_T = MINUTES(22.5);
             trial_T = SECONDS(30);
             delay_T = SECONDS(3);
-
             threshold = DEGREES(0);
-            bidirectional = true;
-
             break;
         }
-        
         case 3: {
             session_T = MINUTES(45);
             trial_T = SECONDS(30);
             delay_T = SECONDS(3);
-
             threshold = DEGREES(30);
-            bidirectional = true;
-
             break;
         }
-        
         case 4: {
             session_T = MINUTES(45);
             trial_T = SECONDS(30);
             delay_T = SECONDS(3);
-
             threshold = DEGREES(60);
-            bidirectional = true;
-            
             break;
         }
-        
         case 5: {
             session_T = MINUTES(45);
             trial_T = SECONDS(30);
             delay_T = SECONDS(3);
-
             threshold = DEGREES(90);
-            bidirectional = true;
-            
+            break;
+        }
+        case 6: {
+            session_T = MINUTES(45);
+            trial_T = SECONDS(30);
+            delay_T = SECONDS(3);
+            threshold = DEGREES(30);
+            break;
+        }
+        case 7: {
+            session_T = MINUTES(45);
+            trial_T = SECONDS(30);
+            delay_T = SECONDS(3);
+            threshold = DEGREES(60);
+            break;
+        }
+        case 8: {
+            session_T = MINUTES(45);
+            trial_T = SECONDS(30);
+            delay_T = SECONDS(3);
+            threshold = DEGREES(90);
             break;
         }
     }
 
-    wheel.init(easy_threshold, threshold, bidirectional);
+    if (phase_id >= 3) {
+        waitForInitConfig();
+    } else {
+        next_easy_trial = false;
+        next_alignment = 'B';
+    }
 
-    // initial phase_state -> IDLE
-    // initial session_state -> STARTUP
+    wheel.init(easy_threshold, threshold, next_alignment);
+
+    // set initial states
     phase_state = PhaseState::IDLE;
     session_state = SessionState::MAIN;
 
@@ -286,28 +357,14 @@ void setup() {
 }
 
 void loop() {
-    String received = logger.read();
-    if (received.length()) {
-        if (received == "E") {
-            session_state = SessionState::CLEANUP;
-        }
-        else if (received.startsWith("T")) {
-            next_easy_trial = (received.substring(1).toInt() != 0);
-            next_easy_valid = true;
-        }
-        else {
-            K = received.toInt();
-        }
-    }
+    drainSerial();
 
     switch (session_state) {
         case SessionState::MAIN: {
             switch (phase_id) {
                 case 1: run_phase_1(); break;
                 case 2: run_phase_2(); break;
-                case 3: run_phase_3_4_5(); break;
-                case 4: run_phase_3_4_5(); break;
-                case 5: run_phase_3_4_5(); break;
+                default: run_phase_3_plus(); break;
             }
 
             break;
@@ -315,7 +372,6 @@ void loop() {
 
         case SessionState::CLEANUP: {
             logger.write("S");
-            Serial.flush();
 
             brake.engage();
 
@@ -326,13 +382,13 @@ void loop() {
             digitalWrite(POWER_EN, LOW);
 
             for (;;) { delay(1000); }
-
             break;
         }
     }
 }
 
 // phase logic functions
+
 void run_phase_1() {
     switch (phase_state) {
         case PhaseState::IDLE: {
@@ -553,7 +609,7 @@ void run_phase_2() {
     }
 }
 
-void run_phase_3_4_5() {
+void run_phase_3_plus() {
     switch (phase_state) {        
         case PhaseState::IDLE: {
             if (!session_initialized) {
@@ -574,8 +630,6 @@ void run_phase_3_4_5() {
         case PhaseState::CUE: {
             // entry
             if (!phase_timer.started()) {
-                trial_num += 1;
-
                 logger.write("cue");
                 speaker.cue();
 
@@ -610,10 +664,7 @@ void run_phase_3_4_5() {
         case PhaseState::TRIAL: {
             // entry
             if (!phase_timer.started()) {
-                bool easy_trial = next_easy_valid ? next_easy_trial : false;
-                next_easy_valid = false;
-
-                wheel.reset(easy_trial);
+                wheel.reset(next_easy_trial, next_alignment);
                 last_disp_mark = LONG_MIN;
 
                 phase_timer.init(trial_T);
