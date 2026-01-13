@@ -33,11 +33,6 @@ import tempfile
 # BASIC CONFIG
 # ---------------------------
 os.environ["PYGAME_HIDE_SUPPORT_PROMPT"] = "1"
-try:
-    os.system("cls" if os.name == "nt" else "clear")
-except Exception:
-    pass
-
 warnings.filterwarnings(
     "ignore",
     category=UserWarning,
@@ -1408,6 +1403,8 @@ if __name__ == "__main__":
     dev_mode = True
     animal_id_for_log = "UNKNOWN"
     phase_id_for_log = "0"
+
+    print()
 
     try:
         link, session_data, cursor, dev_mode = setup()
