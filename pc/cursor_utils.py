@@ -89,8 +89,8 @@ def cursor_fcn(threshold, evt_queue, enc_queue, *, display_idx=None, fullscreen=
     
     clock = pg.time.Clock()
 
-    cursor_w = int(HEIGHT * 0.07)
-    target_sz = cursor_w
+    cursor_w = int(HEIGHT * 0.0825)
+    target_sz = int(round(cursor_w * 1.25))
     y_center = HEIGHT // 2
 
     s = 180.0 / max(1.0, (WIDTH - (2.0 * cursor_w)))
@@ -192,14 +192,18 @@ def cursor_fcn(threshold, evt_queue, enc_queue, *, display_idx=None, fullscreen=
         rx = _deg_to_x(+target_deg)
         lx = _deg_to_x(-target_deg)
 
+        half_t = target_sz // 2
+        half_c = cursor_w // 2
+        top = (y_center - half_t) * 0.85
+
         if alignment in {"B", "L"}:
-            left_target = pg.Rect(lx - target_sz, y_center - (target_sz // 2), target_sz, target_sz)
+            left_target = pg.Rect(lx - half_c - half_t, top, target_sz, target_sz)
 
             pg.draw.rect(screen, BLUE, left_target)
             pg.draw.rect(screen, BLACK, left_target, width=5)
         
         if alignment in {"B", "R"}:
-            right_target = pg.Rect(rx, y_center - (target_sz // 2), target_sz, target_sz)
+            right_target = pg.Rect(rx + half_c - half_t, top, target_sz, target_sz)
 
             pg.draw.rect(screen, BLUE, right_target)
             pg.draw.rect(screen, BLACK, right_target, width=5)
@@ -280,7 +284,7 @@ class BCI:
 # ---------------------------
 # TOP LEVEL (TESTING)
 # ---------------------------
-KEY_SPEED = 30.0
+KEY_SPEED = 50.0
 TRIAL_MS = 30_000
 
 
