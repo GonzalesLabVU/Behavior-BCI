@@ -2,7 +2,6 @@
 setlocal EnableExtensions EnableDelayedExpansion
 
 echo.
-echo CURRENT VERSION
 
 call :selfUpdate
 if "%ERRORLEVEL%"=="99" exit /b 0
