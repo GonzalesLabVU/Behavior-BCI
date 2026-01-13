@@ -74,3 +74,31 @@ SOURCE = behavioral_master.py
       raise TimeoutError(f"No ACK after sending: {text!r}")
   TimeoutError: No ACK after sending: 'E'
 
+TIME = 2026-01-13 13:51:07
+USER = MAX-LAPTOP
+ANIMAL = X
+PHASE = 6
+SOURCE = behavioral_master.py
+----------------------------------------
+  Traceback (most recent call last):
+    File "C:\Users\gonza\Desktop\Behavior\behavioral_master.py", line 1306, in main
+      typ, ts, payload = link.msg_q.get(timeout=0.05)
+    File "C:\Users\gonza\AppData\Local\Python\pythoncore-3.10-64\lib\queue.py", line 180, in get
+      self.not_empty.wait(remaining)
+    File "C:\Users\gonza\AppData\Local\Python\pythoncore-3.10-64\lib\threading.py", line 324, in wait
+      gotit = waiter.acquire(True, timeout)
+  KeyboardInterrupt
+  
+  During handling of the above exception, another exception occurred:
+  
+  Traceback (most recent call last):
+    File "C:\Users\gonza\Desktop\Behavior\behavioral_master.py", line 1416, in <module>
+      main(link, session_data, cursor)
+    File "C:\Users\gonza\Desktop\Behavior\behavioral_master.py", line 1379, in main
+      _terminate_session(link, "Terminated by KeyboardInterrupt")
+    File "C:\Users\gonza\Desktop\Behavior\behavioral_master.py", line 1156, in _terminate_session
+      link.send_and_wait(EARLY_END_STRING, timeout=2.0)
+    File "C:\Users\gonza\Desktop\Behavior\behavioral_master.py", line 1025, in send_and_wait
+      raise TimeoutError(f"No ACK after sending: {text!r}")
+  TimeoutError: No ACK after sending: 'E'
+
