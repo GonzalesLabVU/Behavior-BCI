@@ -201,7 +201,7 @@ static void drainSerial() {
             continue;
         }
 
-        if (phase_id >= 3 && phase_state == PhaseState::DELAY) {
+        if (phase_id >= 3) {
             bool e;
             char a;
 
@@ -263,8 +263,15 @@ void setup() {
     Serial.begin(BAUDRATE);
     randomSeed(analogRead(SEED_PIN));
 
-    // block until host sends phase ID
+    // block until host sends phase ID and initial trial config
     waitForPhase();
+
+    if (phase_id >= 3) {
+        waitForInitConfig();
+    } else {
+        next_easy_trial = false;
+        next_alignment = 'B';
+    }
 
     digitalWrite(POWER_EN, HIGH);
     delay(200);
@@ -337,13 +344,6 @@ void setup() {
             threshold = DEGREES(90);
             break;
         }
-    }
-
-    if (phase_id >= 3) {
-        waitForInitConfig();
-    } else {
-        next_easy_trial = false;
-        next_alignment = 'B';
     }
 
     wheel.init(easy_threshold, threshold, next_alignment);
