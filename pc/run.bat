@@ -34,7 +34,7 @@ if not exist "requirements.txt" (
 python -m pip install -r requirements.txt -q || exit /b 1
 
 echo Running Python script...
-python -m sheets_api
+python -m behavioral_master
 call :sleep 5
 
 echo.
