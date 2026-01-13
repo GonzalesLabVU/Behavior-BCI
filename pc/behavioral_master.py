@@ -44,6 +44,10 @@ warnings.filterwarnings(
     message="pkg_resources is deprecated as an API.*",
 )
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+ANIMAL_MAP_PATH = SCRIPT_DIR / "animal_map.json"
+ERROR_LOG_PATH = SCRIPT_DIR / "errors.log"
+
 BAUDRATE = 1_000_000
 EARLY_END_STRING = "E"
 SESSION_END_STRING = "S"
@@ -57,9 +61,9 @@ PHASE_CONFIG = {
     "8": {"bidirectional": False, "threshold": 90.0}
     }
 
-SCRIPT_DIR = Path(__file__).resolve().parent
-ANIMAL_MAP_PATH = SCRIPT_DIR / "animal_map.json"
-ERROR_LOG_PATH = SCRIPT_DIR / "errors.log"
+MAX_STREAK = 4
+LAST_SIDE = None
+SIDE_STREAK = 0
 
 EVT_QUEUE: "Queue[tuple[str, str]]" = Queue()
 ENC_QUEUE: "Queue[tuple[str, str]]" = Queue()
@@ -116,13 +120,29 @@ def _p_exit():
 
 
 # ---------------------------
-# DEBUG / LOG
+# LOGGING
 # ---------------------------
 REPO_SLUG = "GonzalesLabVU/Behavior-BCI"
 REPO_BRANCH = "main"
 REPO_REL_PATH = Path("pc") / "config" / "errors.log"
 
 ERROR_LOGGED = False
+
+
+def _ensure_session_tracking(session_data):
+    session_data.meta.setdefault('trial_config', [])
+    session_data.meta.setdefault('K1', 5)
+    session_data.meta.setdefault('K2', None)
+
+
+def _log_trial_config(session_data, trial_n, type, side):
+    _ensure_session_tracking(session_data)
+
+    session_data.meta['trial_config'].append({
+        'trial': int(trial_n),
+        'is_easy': bool(type),
+        'side': str(side)
+        })
 
 
 def time_this(fcn):
@@ -249,7 +269,7 @@ def commit_error_log(animal_id='UNKNOWN', phase_id='0'):
 
 
 # ---------------------------
-# RESOURCE LOADING / VALIDATION
+# RESOURCE LOADING
 # ---------------------------
 def load_animal_map(path=ANIMAL_MAP_PATH):
     with open(path, 'r', encoding='utf-8') as f:
@@ -311,6 +331,43 @@ LOCK_TAG_RANGE = "A1"
 LOCK_META_RANGE = "A2:D2"
 
 LAST_STATUS = None
+
+
+def _build_meta_rows(session_data):
+    _ensure_session_tracking(session_data)
+
+    cfg = session_data.meta.get('trial_config', []) or []
+    easy_trials = [c['trial'] for c in cfg if c.get('is_easy') is True]
+    normal_trials = [c['trial'] for c in cfg if c.get('is_easy') is False]
+
+    left_targets = [c['trial'] for c in cfg if c.get('side') == "L"]
+    right_targets = [c['trial'] for c in cfg if c.get('side') == "R"]
+    both_targets = [c['trial'] for c in cfg if c.get('side') == "B"]
+
+    meta_pairs = [
+        ('K1', session_data.meta.get('K1', 5)),
+        ('K2', session_data.meta.get('K2', None)),
+        ('easy_trials', easy_trials),
+        ('normal_trials', normal_trials),
+        ('left_targets', left_targets),
+        ('right_targets', right_targets),
+        ('both_targets', both_targets)
+        ]
+    
+    out = []
+    for key, value in meta_pairs:
+        if isinstance(value, (list, tuple)):
+            if len(value) == 0:
+                out.append([key, "None"])
+            else:
+                out.append([key, value[0]])
+
+                for val in value[1:]:
+                    out.append(["", val])
+        else:
+            out.append([key, "" if value is None else value])
+    
+    return out
 
 
 def get_workbook_id(animal_id, animal_map):
@@ -744,12 +801,20 @@ def save_data(session_data):
         wb = API_CLIENT.open_by_key(workbook_id)
         lock.wb = wb
 
-        for dtype, sheet_name in (('evt', 'Event'), ('enc', 'Encoder')):
-            d = getattr(session_data, dtype)
-            n_rows= len(d['timestamps'])
-            label = sheet_name.lower()
+        for dtype, sheet_name in (('evt', 'Event'), ('enc', 'Encoder'), ('meta', 'Metadata')):
+            if dtype == 'meta':
+                data_rows = _build_meta_rows(session_data)
+                n_rows = len(data_rows)
+                label = 'metadata'
+            else:
+                d = getattr(session_data, dtype)
+                n_rows= len(d['timestamps'])
+                label = sheet_name.lower()
 
-            _p_done(f'Writing {label} data...')
+            if dtype != 'meta':
+                _p_done(f'Writing {label} data...')
+            else:
+                _p_done('Writing metadata...')
 
             if n_rows == 0:
                 continue
@@ -757,7 +822,10 @@ def save_data(session_data):
             lock.update()
             lock.reset()
 
-            ws = wb.worksheet(sheet_name)
+            try:
+                ws = wb.worksheet(sheet_name)
+            except Exception:
+                ws = wb.add_worksheet(title=sheet_name, rows=200, cols=26)
 
             max_col = len(ws.row_values(2))
             needed_cols = max_col + 2
@@ -784,7 +852,11 @@ def save_data(session_data):
             if ws.row_count < needed_rows:
                 ws.add_rows(needed_rows - ws.row_count)
             
-            data = [[ts, val] for ts, val in zip(d['timestamps'], d['values'])]
+            if dtype == 'meta':
+                data = data_rows
+            else:
+                data = [[ts, val] for ts, val in zip(d['timestamps'], d['values'])]
+            
             first_row = 4
             first_col = max_col + 1
 
@@ -839,15 +911,20 @@ def fallback_save(session_data, exc=None):
     
     with open(out_path, 'w', encoding='utf-8') as f:
         json.dump(payload, f, indent=4)
+
+    try:
+        commit_error_log(animal, phase)
+    except Exception:
+        pass
     
     _p_exit()
     print(f'[WARNING] Saved session data locally to {out_path.name}', flush=True)
-    
+
     return out_path
 
 
 # ---------------------------
-# SERIAL / DATA
+# SERIAL COMMUNICATION
 # ---------------------------
 def _find_arduino_port():
     ports = serial.tools.list_ports.comports()
@@ -888,7 +965,7 @@ def _set_easy_rate(session_data, trial_stack):
     return K, N, n_hits
 
 
-def _compute_easy_trial(trial_n, K):
+def _choose_trial_type(trial_n, K):
     if trial_n <= 20:
         return ((trial_n - 1) % 5) == 0
 
@@ -896,7 +973,9 @@ def _compute_easy_trial(trial_n, K):
     return ((trial_n - 21) % K) == 0
 
 
-def _choose_alignment(phase_id):
+def _choose_target_side(phase_id):
+    global LAST_SIDE, SIDE_STREAK
+
     cfg = PHASE_CONFIG.get(str(phase_id))
     if not cfg:
         return "B"
@@ -904,11 +983,22 @@ def _choose_alignment(phase_id):
     if cfg.get('bidirectional', False):
         return "B"
     
-    return random.choice(["L", "R"])
+    if LAST_SIDE in {"L", "R"} and SIDE_STREAK >= MAX_STREAK:
+        side = "R" if LAST_SIDE == "L" else "L"
+    else:
+        side = random.choice(["L", "R"])
+    
+    if side == LAST_SIDE:
+        SIDE_STREAK += 1
+    else:
+        LAST_SIDE = side
+        SIDE_STREAK = 1
+    
+    return side
 
 
-def _send_next_config(link, is_easy, alignment, timeout=3.0):
-    link.send_and_wait(f'T {1 if is_easy else 0} {alignment}', timeout=timeout)
+def _send_next_config(link, next_type, next_side, timeout=3.0):
+    link.send_and_wait(f'T {1 if next_type else 0} {next_side}', timeout=timeout)
 
 
 class ArduinoLink:
@@ -931,7 +1021,7 @@ class ArduinoLink:
         except Exception:
             pass
 
-    def send_and_wait(self, text, timeout=2.0):
+    def send_and_wait(self, text, timeout=5.0):
         self.ack_evt.clear()
         self.ser.write((text.strip() + "\n").encode("utf-8"))
         self.ser.flush()
@@ -1021,8 +1111,35 @@ class SessionData:
             
             return str(x)
         
+        meta_out = dict(self.meta)
+        cfg = meta_out.get('trial_config', []) or []
+
+        try:
+            easy_trials = [c['trial'] for c in cfg if c.get('is_easy') is True]
+            normal_trials = [c['trial'] for c in cfg if c.get('is_easy') is False]
+
+            left_targets = [c['trial'] for c in cfg if c.get('side') == "L"]
+            right_targets = [c['trial'] for c in cfg if c.get('side') == "R"]
+            both_targets = [c['trial'] for c in cfg if c.get('side') == "B"]
+        except Exception:
+            easy_trials = []
+            normal_trials = []
+
+            left_targets = []
+            right_targets = []
+            both_targets = []
+        
+        meta_out.setdefault('K1', 5)
+        meta_out.setdefault('K2', None)
+
+        meta_out['easy_trials'] = list(easy_trials)
+        meta_out['normal_trials'] = list(normal_trials)
+        meta_out['left_targets'] = list(left_targets)
+        meta_out['right_targets'] = list(right_targets)
+        meta_out['both_targets'] = list(both_targets)
+
         return {
-            'meta': _json_safe(self.meta),
+            'meta': _json_safe(meta_out),
             'evt': _json_safe(self.evt),
             'enc': _json_safe(self.enc)
             }
@@ -1048,7 +1165,7 @@ def _terminate_session(link, msg):
             try:
                 typ, _, _ = link.msg_q.get(timeout=0.05)
                 if typ == "END":
-                    print(f"\n{msg}\n", flush=True)
+                    print(f"{msg}", flush=True)
                     return
             except Empty:
                 pass
@@ -1074,10 +1191,11 @@ def setup():
         if not ser.is_open:
             raise RuntimeError(f"{port} port is not open after initialization")
         
-        print(f"Connected to {port}", flush=True)
+        print(f"Connected to {port} port\n", flush=True)
         try:
             animal_raw = input("Animal ID:  ").strip().upper()
         except KeyboardInterrupt:
+            print('\n\nTerminated by KeyboardInterrupt')
             raise
 
         animal_id = animal_raw if animal_raw else "DEV"
@@ -1100,12 +1218,17 @@ def setup():
             try:
                 phase_id = input("Training Phase:  ").strip()
             except KeyboardInterrupt:
+                print('\n\nTerminated by KeyboardInterrupt')
                 raise
             
             if phase_id in valid_phases:
                 break
 
             print("Please enter a valid phase", flush=True)
+        
+        global LAST_SIDE, SIDE_STREAK
+        LAST_SIDE = None
+        SIDE_STREAK = 0
 
         link = ArduinoLink(ser)
         link.start()
@@ -1117,14 +1240,17 @@ def setup():
             raise RuntimeError(f"Failed to send training phase to Arduino: {e}") from e
 
         cursor = None
+        type_1 = None
+        side_1 = None
 
         if phase_id in PHASE_CONFIG:
-            trial_1 = 1
-            K0 = 5
-            easy_1 = _compute_easy_trial(trial_1, K0)
-            align_1 = _choose_alignment(phase_id)
+            type_1 = _choose_trial_type(trial_n=1, K=5)
+            side_1 = _choose_target_side(phase_id=phase_id)
 
-            _send_next_config(link, easy_1, align_1)
+            try:
+                _send_next_config(link, type_1, side_1)
+            except Exception as e:
+                print(f'[ERROR] Unhandled exception during initial phase hand-off: {e}')
 
             cursor = BCI(phase_id=phase_id,
                          evt_queue=EVT_QUEUE,
@@ -1133,7 +1259,7 @@ def setup():
                          fullscreen=True,
                          easy_threshold=15.0)
             
-            cursor.update_config(easy_1, align_1)
+            cursor.update_config(type_1, side_1)
             cursor.start()
 
         session_data = SessionData(
@@ -1141,8 +1267,13 @@ def setup():
             phase_id=phase_id,
             date_str=_get_date()
             )
+        
         if not dev_mode:
             session_data.meta["workbook_id"] = workbook_id
+        
+        _ensure_session_tracking(session_data)
+        if type_1 is not None and side_1 is not None:
+            _log_trial_config(session_data, trial_n=1, type=type_1, side=side_1)
 
         return link, session_data, cursor, dev_mode
     except Exception:
@@ -1185,7 +1316,7 @@ def main(link, session_data, cursor):
                 started = True
                 t0 = time.time()
                 session_data.meta["start_wall"] = datetime.now().isoformat(timespec="seconds")
-                print(f"Session started at {datetime.now().strftime('%I:%M %p')}", flush=True)
+                print(f"\nSession started at {datetime.now().strftime('%I:%M %p')}", flush=True)
 
             if typ == "ERR":
                 if isinstance(payload, BaseException):
@@ -1205,7 +1336,7 @@ def main(link, session_data, cursor):
                 except Exception:
                     pass
 
-                if do_calibration and p == 'cue':
+                if p == 'cue':
                     trial_n += 1
                 
                 if do_calibration and p in {'hit', 'miss'}:
@@ -1220,23 +1351,26 @@ def main(link, session_data, cursor):
                     
                     if calibrated:
                         if len(trial_stack) >= N and _is_early_exit(trial_stack, N):
-                            _terminate_session(link, 'Session terminated by early exit')
+                            _terminate_session(link, 'Terminated by early exit')
                             session_data.meta['aborted'] = True
                             break
                     else:
                         if len(trial_stack) >= N:
                             K, N, calibration_hits = _set_easy_rate(session_data, trial_stack)
+                            
+                            session_data.meta['K2'] = K
                             calibrated = True
                             print(f'Calibration finished [hits={calibration_hits}/20, K={K}, N={N}]', flush=True)
                     
                     next_trial_n = trial_n + 1
-                    easy_next = _compute_easy_trial(next_trial_n, K)
-                    align_next = _choose_alignment(session_data.meta['phase'])
+                    next_type = _choose_trial_type(next_trial_n, K)
+                    next_side = _choose_target_side(session_data.meta['phase'])
 
-                    _send_next_config(link, easy_next, align_next)
+                    _send_next_config(link, next_type, next_side)
+                    _log_trial_config(session_data, trial_n=next_trial_n, type=next_type, side=next_side)
 
                     if cursor is not None:
-                        cursor.update_config(easy_next, align_next)
+                        cursor.update_config(next_type, next_side)
             elif typ == "ENC":
                 p = str(payload)
                 session_data.add_enc(ts, p)
@@ -1247,7 +1381,7 @@ def main(link, session_data, cursor):
                     pass
     except KeyboardInterrupt:
         session_data.meta["aborted"] = True
-        _terminate_session(link, "Session terminated by user")
+        _terminate_session(link, "Terminated by KeyboardInterrupt")
 
         raise
     finally:
@@ -1291,6 +1425,8 @@ if __name__ == "__main__":
             save_ok = save_data(session_data)
             if not save_ok:
                 print('[WARNING] Failed to save data using Google Sheets API', flush=True)
+    except KeyboardInterrupt:
+        print()
     except SystemExit as e:
         if getattr(e, "code", 0) not in {0, None}:
             log_error(animal_id_for_log, phase_id_for_log, e)
