@@ -141,7 +141,6 @@ def log_trial_config(session_data, trial_n, type, side):
         'is_easy': bool(type),
         'side': str(side)
         })
-    print(f'[Trial {trial_n}] {type} {side}')
 
 
 def time_this(fcn):
