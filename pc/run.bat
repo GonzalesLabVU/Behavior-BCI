@@ -2,9 +2,9 @@
 echo.
 setlocal EnableExtensions EnableDelayedExpansion
 
-rem call :selfUpdate
-rem if "%ERRORLEVEL%"=="99" exit /b 0
-rem if errorlevel 1 call :kill "selfUpdate failed"
+call :selfUpdate
+if "%ERRORLEVEL%"=="99" exit /b 0
+if errorlevel 1 call :kill "selfUpdate failed"
 
 echo Getting script directory...
 set "SCRIPT_DIR=%~dp0"
