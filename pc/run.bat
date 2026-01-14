@@ -58,7 +58,6 @@ call :pullFile "https://github.com/GonzalesLabVU/Behavior-BCI/blob/main/pc/confi
 call :pullFile "https://github.com/GonzalesLabVU/Behavior-BCI/blob/main/pc/config/requirements.txt" || call :kill "pullFile failed for requirements.txt"
 call :pullFile "https://github.com/GonzalesLabVU/Behavior-BCI/blob/main/pc/config/errors.log" || call :kill "pullFile failed for errors.log"
 call :pullFolder "https://github.com/GonzalesLabVU/Behavior-BCI/tree/main/arduino/behavioral_controller" || call :kill "pullFolder subroutine failed for behavioral_controller\"
-echo done
 
 echo Making sure pip is up to date...
 python -m pip install --upgrade pip -q
