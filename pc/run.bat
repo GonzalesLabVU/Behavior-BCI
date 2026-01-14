@@ -2,15 +2,18 @@
 echo.
 setlocal EnableExtensions EnableDelayedExpansion
 
-call :selfUpdate
-if "%ERRORLEVEL%"=="99" exit /b 0
-if errorlevel 1 call :kill "selfUpdate failed"
+rem call :selfUpdate
+rem if "%ERRORLEVEL%"=="99" exit /b 0
+rem if errorlevel 1 call :kill "selfUpdate failed"
 
 echo Getting script directory...
 set "SCRIPT_DIR=%~dp0"
 cd /d "%SCRIPT_DIR%"
 
-echo Verifying Git installation...
+echo Making sure pip is up to date...
+python -m pip install --upgrade pip -q
+
+echo Verifying git installation...
 where git >nul 2>&1
 if errorlevel 1 (
     echo.
@@ -50,27 +53,6 @@ if errorlevel 1 (
     )
 )
 
-echo Downloading latest file versions...
-call :pullFile "https://github.com/GonzalesLabVU/Behavior-BCI/blob/main/pc/behavioral_master.py" || call :kill "pullFile subroutine failed for behavioral_master.py"
-call :pullFile "https://github.com/GonzalesLabVU/Behavior-BCI/blob/main/pc/cursor_utils.py" || call :kill "pullFile failed for cursor_utils.py"
-call :pullFile "https://github.com/GonzalesLabVU/Behavior-BCI/blob/main/pc/plot_utils.py" || call :kill "pullFile failed for plot_utils.py"
-call :pullFile "https://github.com/GonzalesLabVU/Behavior-BCI/blob/main/pc/config/animal_map.json" || call :kill "pullFile failed for animal_map.json"
-call :pullFile "https://github.com/GonzalesLabVU/Behavior-BCI/blob/main/pc/config/requirements.txt" || call :kill "pullFile failed for requirements.txt"
-call :pullFile "https://github.com/GonzalesLabVU/Behavior-BCI/blob/main/pc/config/errors.log" || call :kill "pullFile failed for errors.log"
-call :pullFolder "https://github.com/GonzalesLabVU/Behavior-BCI/tree/main/arduino/behavioral_controller" || call :kill "pullFolder subroutine failed for behavioral_controller\"
-
-call :sleep 2
-
-echo Making sure pip is up to date...
-python -m pip install --upgrade pip -q
-
-echo Installing required dependencies...
-if not exist "requirements.txt" (
-    echo requirements.txt not found in %SCRIPT_DIR%
-    exit /b 1
-)
-python -m pip install -r requirements.txt -q || exit /b 1
-
 echo Verifying arduino-cli installation...
 where arduino-cli >nul 2>&1
 if errorlevel 1 (
@@ -93,6 +75,24 @@ arduino-cli core list | findstr /i "arduino:avr" >nul 2>&1 || arduino-cli core i
 
 arduino-cli version >nul 2>&1
 if errorlevel 1 call :kill "arduino-cli is present but not runnable"
+
+echo Downloading latest file versions...
+call :pullFile "https://github.com/GonzalesLabVU/Behavior-BCI/blob/main/pc/behavioral_master.py" || call :kill "pullFile subroutine failed for behavioral_master.py"
+call :pullFile "https://github.com/GonzalesLabVU/Behavior-BCI/blob/main/pc/cursor_utils.py" || call :kill "pullFile failed for cursor_utils.py"
+call :pullFile "https://github.com/GonzalesLabVU/Behavior-BCI/blob/main/pc/plot_utils.py" || call :kill "pullFile failed for plot_utils.py"
+call :pullFile "https://github.com/GonzalesLabVU/Behavior-BCI/blob/main/pc/config/animal_map.json" || call :kill "pullFile failed for animal_map.json"
+call :pullFile "https://github.com/GonzalesLabVU/Behavior-BCI/blob/main/pc/config/requirements.txt" || call :kill "pullFile failed for requirements.txt"
+call :pullFile "https://github.com/GonzalesLabVU/Behavior-BCI/blob/main/pc/config/errors.log" || call :kill "pullFile failed for errors.log"
+call :pullFolder "https://github.com/GonzalesLabVU/Behavior-BCI/tree/main/arduino/behavioral_controller" || call :kill "pullFolder subroutine failed for behavioral_controller\"
+
+call :sleep 2
+
+echo Installing required dependencies...
+if not exist "requirements.txt" (
+    echo requirements.txt not found in %SCRIPT_DIR%
+    exit /b 1
+)
+python -m pip install -r requirements.txt -q || exit /b 1
 
 echo Searching for Arduino...
 set "ARDUINO_CLI=arduino-cli"
@@ -279,7 +279,7 @@ REM -----------------------------------
         endlocal & set "PORT=%PORT%" & exit /b 0
     )
 
-    for /f "skip=1 tokens=1,*" %%A in ('arduino-cli board list 2^>nul ^| findstr /i "arduino:avr:mega"') do (
+    for /f "tokens=1" %%A in ('arduino-cli board list 2^>nul ^| findstr /i "arduino:avr:mega"') do (
         set "PORT=%%A"
         goto :portFound
     )
@@ -328,14 +328,14 @@ REM -----------------------------------
     )
 
     echo Compiling sketch folder...
-    "%ARDUINO_CLI%" compile --fqbn "%FQBN%" "%ABS_SKETCH_DIR%"
+    "%ARDUINO_CLI%" compile --fqbn "%FQBN%" "%ABS_SKETCH_DIR%" >nul 2>&1
     if errorlevel 1 (
         echo [ERROR] Sketch compilation failed
         endlocal & exit /b 1
     )
 
     echo Uploading sketch...
-    "%ARDUINO_CLI%" upload -p "%PORT%" --fqbn "%FQBN%" "%ABS_SKETCH_DIR%"
+    "%ARDUINO_CLI%" upload -p "%PORT%" --fqbn "%FQBN%" "%ABS_SKETCH_DIR%" >nul 2>&1
     if errorlevel 1 (
         echo [ERROR] Sketch upload failed
         endlocal & exit /b 1
