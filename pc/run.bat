@@ -58,6 +58,7 @@ call :pullFile "https://github.com/GonzalesLabVU/Behavior-BCI/blob/main/pc/confi
 call :pullFile "https://github.com/GonzalesLabVU/Behavior-BCI/blob/main/pc/config/requirements.txt" || call :kill "pullFile failed for requirements.txt"
 call :pullFile "https://github.com/GonzalesLabVU/Behavior-BCI/blob/main/pc/config/errors.log" || call :kill "pullFile failed for errors.log"
 call :pullFolder "https://github.com/GonzalesLabVU/Behavior-BCI/tree/main/arduino/behavioral_controller" || call :kill "pullFolder subroutine failed for behavioral_controller\"
+echo done
 
 echo Making sure pip is up to date...
 python -m pip install --upgrade pip -q
@@ -92,6 +93,7 @@ arduino-cli core list | findstr /i "arduino:avr" >nul 2>&1 || arduino-cli core i
 arduino-cli version >nul 2>&1
 if errorlevel 1 call :kill "arduino-cli is present but not runnable"
 
+echo Searching for Arduino...
 set "ARDUINO_CLI=arduino-cli"
 set "FQBN=arduino:avr:mega"
 call :detectPort || call :kill "No Arduino Mega 2560 port detected"
@@ -269,19 +271,19 @@ REM -----------------------------------
     @echo off
     setlocal EnableExtensions EnableDelayedExpansion
 
-    echo Searching for Arduino port...
-
     set "PORT="
-    for /f "usebackq delims=" %%P in (`powershell -NoProfile -Command "$ErrorActionPreference='SilentlyContinue'; $out = arduino-cli board list --format json 2>$null; if($LASTEXITCODE -ne 0 -or -not $out){ exit 0 }; $j = $out | ConvertFrom-Json; $p = $j.ports | Where-Object { $_.matching_boards.fqbn -contains 'arduino:avr:mega' } | Select-Object -First 1; if($p){ $p.address }"`) do set "PORT=%%P"
 
+    for /f "usebackq delims=" %%P in (`powershell -NoProfile -Command "$ErrorActionPreference='SilentlyContinue'; $out = arduino-cli board list --format json 2>$null; if($LASTEXITCODE -ne 0 -or -not $out){ exit 0 }; $j = $out | ConvertFrom-Json; $p = $j.ports | Where-Object { $_.matching_boards.fqbn -contains 'arduino:avr:mega' } | Select-Object -First 1; if($p){ $p.address }"`) do set "PORT=%%P"
     if defined PORT (
         endlocal & set "PORT=%PORT%" & exit /b 0
     )
 
-    for /f "skip=1 tokens=1,*" %%A in ('arduino-cli board list 2^>nul') do (
-        echo %%A %%B | findstr /i "arduino:avr:mega" >nul && set "PORT=%%A"
+    for /f "skip=1 tokens=1,*" %%A in ('arduino-cli board list 2^>nul ^| findstr /i "arduino:avr:mega"') do (
+        set "PORT=%%A"
+        goto :portFound
     )
 
+:portFound
     endlocal & set "PORT=%PORT%"
     if not defined PORT exit /b 1
     exit /b 0
