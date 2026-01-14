@@ -58,7 +58,6 @@ call :pullFile "https://github.com/GonzalesLabVU/Behavior-BCI/blob/main/pc/confi
 call :pullFile "https://github.com/GonzalesLabVU/Behavior-BCI/blob/main/pc/config/requirements.txt" || call :kill "pullFile failed for requirements.txt"
 call :pullFile "https://github.com/GonzalesLabVU/Behavior-BCI/blob/main/pc/config/errors.log" || call :kill "pullFile failed for errors.log"
 call :pullFolder "https://github.com/GonzalesLabVU/Behavior-BCI/tree/main/arduino/behavioral_controller" || call :kill "pullFolder subroutine failed for behavioral_controller\"
-echo done
 
 echo Making sure pip is up to date...
 python -m pip install --upgrade pip -q
@@ -271,8 +270,6 @@ REM -----------------------------------
     setlocal EnableExtensions EnableDelayedExpansion
 
     echo Searching for Arduino port...
-    arduino-cli version
-    arduino-cli board list
 
     set "PORT="
     for /f "usebackq delims=" %%P in (`powershell -NoProfile -Command "$ErrorActionPreference='SilentlyContinue'; $out = arduino-cli board list --format json 2>$null; if($LASTEXITCODE -ne 0 -or -not $out){ exit 0 }; $j = $out | ConvertFrom-Json; $p = $j.ports | Where-Object { $_.matching_boards.fqbn -contains 'arduino:avr:mega' } | Select-Object -First 1; if($p){ $p.address }"`) do set "PORT=%%P"
