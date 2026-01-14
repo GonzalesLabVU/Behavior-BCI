@@ -268,13 +268,23 @@ REM -----------------------------------
 
 :detectPort
     @echo off
-    setlocal
+    setlocal EnableExtensions EnableDelayedExpansion
 
     echo Searching for Arduino port...
+    arduino-cli version
+    arduino-cli board list
 
     set "PORT="
-    for /f "usebackq delims=" %%P in (`powershell -NoProfile -Command "$j = arduino-cli board list --format json | ConvertFrom-Json; $p = $j.ports | Where-Object { $_.matching_boards.fqbn -contains 'arduino:avr:mega' } | Select-Object -First 1; if($p){ $p.address }"`) do set "PORT=%%P"
-    
+    for /f "usebackq delims=" %%P in (`powershell -NoProfile -Command "$ErrorActionPreference='SilentlyContinue'; $out = arduino-cli board list --format json 2>$null; if($LASTEXITCODE -ne 0 -or -not $out){ exit 0 }; $j = $out | ConvertFrom-Json; $p = $j.ports | Where-Object { $_.matching_boards.fqbn -contains 'arduino:avr:mega' } | Select-Object -First 1; if($p){ $p.address }"`) do set "PORT=%%P"
+
+    if defined PORT (
+        endlocal & set "PORT=%PORT%" & exit /b 0
+    )
+
+    for /f "skip=1 tokens=1,*" %%A in ('arduino-cli board list 2^>nul') do (
+        echo %%A %%B | findstr /i "arduino:avr:mega" >nul && set "PORT=%%A"
+    )
+
     endlocal & set "PORT=%PORT%"
     if not defined PORT exit /b 1
     exit /b 0
