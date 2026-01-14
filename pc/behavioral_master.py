@@ -12,6 +12,7 @@ import functools
 from datetime import datetime
 from pathlib import Path
 from queue import Queue, Empty
+from collections import deque
 from threading import Thread, Event
 
 import serial
@@ -115,6 +116,56 @@ def _p_exit():
 
         print(LAST_STATUS + '\n', flush=True)
         LAST_STATUS = None
+
+
+# ---------------------------
+# STATUS OUTPUT
+# ---------------------------
+STATUS_HEADER = "   TRIAL   |   AVG_DT   |   N_HIT   |   N_MISS   |    RATE"
+STATUS_HLINE  = "--------------------------------------------------------------"
+
+STATUS_COL_WIDTH = (11, 12, 11, 12, 12)
+STATUS_HEADER_FLAG = False
+
+STATUS_N = 20
+
+
+def _status_cell(value, width):
+    entry = "   " + str(value)
+
+    if len(entry) < width:
+        entry = entry + (" " * (width - len(entry)))
+    else:
+        entry = entry[:width]
+    
+    return entry
+
+
+def show_trial_status(trial_n, avg_dt, n_hit, n_miss):
+    global STATUS_HEADER_FLAG
+
+    if not STATUS_HEADER_FLAG:
+        print(STATUS_HEADER, flush=True)
+        print(STATUS_HLINE, flush=True)
+
+        STATUS_HEADER_FLAG = True
+    
+    n_total = n_hit + n_miss
+    rate = ((n_hit / n_total) * 100.0) if n_total else 0.0
+
+    trial_str = f'{trial_n}'
+    dt_str = f'{avg_dt:.2f}s'
+    hit_str = f'{n_hit}'
+    miss_str = f'{n_miss}'
+    rate_str = f'{rate:.1f}%'
+
+    row = ""
+
+    for i, s in enumerate([trial_str, dt_str, hit_str, miss_str, rate_str]):
+        row += _status_cell(s, STATUS_COL_WIDTH[i]) + "|"
+    
+    row = row[:-1]
+    print(row, flush=True)
 
 
 # ---------------------------
@@ -309,6 +360,222 @@ def _require_env(name):
 
 
 # ---------------------------
+# SERIAL COMMUNICATION
+# ---------------------------
+def find_arduino_port():
+    ports = serial.tools.list_ports.comports()
+
+    for port in ports:
+        dsc = (port.description or "").lower()
+        if "arduino" in dsc or "usb serial" in dsc:
+            return port.device
+        
+    return None
+
+
+def update_easy_rate(session_data, trial_stack):
+    n_hits = sum(1 for x in trial_stack if x == "hit")
+
+    if n_hits < 10:
+        K = 3
+    elif n_hits == 10:
+        K = 5
+    else:
+        K = 7
+
+    N = 4 * K
+
+    trial_stack.clear()
+    session_data.add_evt(_get_ts(), f"setK {K}")
+
+    return K, N, n_hits
+
+
+class ArduinoLink:
+    def __init__(self, ser):
+        self.ser = ser
+        self.stop_evt = Event()
+        self.ack_evt = Event()
+        self.msg_q: "Queue[tuple[str, str, object]]" = Queue()
+        self._reader = Thread(target=self._reader_loop, daemon=True)
+
+    def _reader_loop(self):
+        try:
+            while not self.stop_evt.is_set() and self.ser and self.ser.is_open:
+                raw = self.ser.readline()
+                if not raw:
+                    continue
+
+                try:
+                    line = raw.decode('utf-8', errors='strict').strip()
+                except UnicodeDecodeError:
+                    line = raw.decode('latin1', errors='ignore').strip()
+
+                if not line:
+                    continue
+
+                if line == "A":
+                    self.ack_evt.set()
+                    continue
+
+                ts = _get_ts()
+
+                if line == SESSION_END_STRING:
+                    self.msg_q.put(("END", ts, None))
+                    continue
+
+                if line.startswith("[EVT]"):
+                    payload = line.split("]", 1)[1].strip()
+                    self.msg_q.put(("EVT", ts, payload))
+                    continue
+
+                if line.startswith("[ENC]"):
+                    payload = line.split("]", 1)[1].strip()
+                    self.msg_q.put(("ENC", ts, payload))
+                    continue
+
+                self.msg_q.put(("RAW", ts, line))
+
+        except Exception as e:
+            try:
+                self.msg_q.put(("ERR", _get_ts(), e))
+            except Exception:
+                pass
+
+    def start(self):
+        self._reader.start()
+
+    def close(self):
+        self.stop_evt.set()
+
+        try:
+            if self.ser and self.ser.is_open:
+                self.ser.close()
+        except Exception:
+            pass
+
+    def send_and_wait(self, text, timeout=5.0):
+        self.ack_evt.clear()
+        self.ser.write((text.strip() + "\n").encode("utf-8"))
+        self.ser.flush()
+
+        if not self.ack_evt.wait(timeout=timeout):
+            raise TimeoutError(f"No ACK after sending: {text!r}")
+
+    def send(self, text):
+        self.ser.write((text.strip() + "\n").encode("utf-8"))
+        self.ser.flush()
+
+
+class SessionData:
+    def __init__(self, animal_id, phase_id, date_str):
+        self.meta = {
+            "date": date_str,
+            "animal": animal_id,
+            "phase": phase_id,
+            "start_wall": None,
+            "end_wall": None,
+            "duration_sec": None,
+            "aborted": False,
+            }
+        self.evt = {"timestamps": [], "values": []}
+        self.enc = {"timestamps": [], "values": []}
+
+    def add_evt(self, ts, payload):
+        self.evt["timestamps"].append(ts)
+        self.evt["values"].append(payload)
+
+    def add_enc(self, ts, payload):
+        self.enc["timestamps"].append(ts)
+        self.enc["values"].append(payload)
+
+    def any_data(self):
+        return bool(self.evt["timestamps"]) or bool(self.enc["timestamps"])
+
+    def to_dict(self):
+        def _json_safe(x):
+            if x is None or isinstance(x, (str, int, float, bool)):
+                return x
+            
+            if isinstance(x, dict):
+                return {str(k): _json_safe(v) for k, v in x.items()}
+
+            if isinstance(x, (list, tuple)):
+                return [_json_safe(v) for v in x]
+            
+            return str(x)
+        
+        meta_out = dict(self.meta)
+        cfg = meta_out.get('trial_config', []) or []
+
+        try:
+            easy_trials = [c['trial'] for c in cfg if c.get('is_easy') is True]
+            normal_trials = [c['trial'] for c in cfg if c.get('is_easy') is False]
+
+            left_targets = [c['trial'] for c in cfg if c.get('side') == "L"]
+            right_targets = [c['trial'] for c in cfg if c.get('side') == "R"]
+            both_targets = [c['trial'] for c in cfg if c.get('side') == "B"]
+        except Exception:
+            easy_trials = []
+            normal_trials = []
+
+            left_targets = []
+            right_targets = []
+            both_targets = []
+        
+        meta_out.setdefault('K1', 5)
+        meta_out.setdefault('K2', None)
+
+        meta_out['easy_trials'] = list(easy_trials)
+        meta_out['normal_trials'] = list(normal_trials)
+        meta_out['left_targets'] = list(left_targets)
+        meta_out['right_targets'] = list(right_targets)
+        meta_out['both_targets'] = list(both_targets)
+
+        return {
+            'meta': _json_safe(meta_out),
+            'evt': _json_safe(self.evt),
+            'enc': _json_safe(self.enc)
+            }
+
+
+def choose_trial_type(trial_n, K):
+    if trial_n <= 20:
+        return ((trial_n - 1) % 5) == 0
+
+    K = max(1, int(K))
+    return ((trial_n - 21) % K) == 0
+
+
+def choose_target_side(phase_id):
+    global LAST_SIDE, SIDE_STREAK
+
+    cfg = PHASE_CONFIG.get(str(phase_id))
+    if not cfg:
+        return "B"
+    
+    if cfg.get('bidirectional', False):
+        return "B"
+    
+    if LAST_SIDE in {"L", "R"} and SIDE_STREAK >= MAX_STREAK:
+        side = "R" if LAST_SIDE == "L" else "L"
+    else:
+        side = random.choice(["L", "R"])
+    
+    if side == LAST_SIDE:
+        SIDE_STREAK += 1
+    else:
+        LAST_SIDE = side
+        SIDE_STREAK = 1
+    
+    return side
+
+
+def send_next_config(link, next_type, next_side, timeout=3.0):
+    link.send_and_wait(f'T {1 if next_type else 0} {next_side}', timeout=timeout)
+
+
+# ---------------------------
 # DATA SAVING
 # ---------------------------
 API_SCOPES = ["https://www.googleapis.com/auth/spreadsheets",
@@ -368,7 +635,7 @@ def _build_meta_rows(session_data):
     return out
 
 
-def get_workbook_id(animal_id, animal_map):
+def _get_workbook_id(animal_id, animal_map):
     try:
         map_key = next(key for key in animal_map.keys() if animal_id in key)
     except StopIteration:
@@ -380,7 +647,7 @@ def get_workbook_id(animal_id, animal_map):
     return _require_env(env_var)
 
 
-def get_client_id():
+def _get_client_id():
     return f'{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}'
 
 
@@ -764,7 +1031,7 @@ class FileLock:
 
 def save_data(session_data):
     workbook_id = session_data.meta["workbook_id"]
-    client_id = get_client_id()
+    client_id = _get_client_id()
 
     def _batch_write_cols(ws, start_row, start_col, data, chunk_rows=2000, group_chunks=10):
         sheet = ws.spreadsheet
@@ -922,228 +1189,6 @@ def fallback_save(session_data, exc=None):
 
 
 # ---------------------------
-# SERIAL COMMUNICATION
-# ---------------------------
-def _find_arduino_port():
-    ports = serial.tools.list_ports.comports()
-
-    for port in ports:
-        dsc = (port.description or "").lower()
-        if "arduino" in dsc or "usb serial" in dsc:
-            return port.device
-        
-    return None
-
-
-def _decode_line(raw):
-    if not raw:
-        return ""
-    
-    try:
-        return raw.decode("utf-8", errors="strict").strip()
-    except UnicodeDecodeError:
-        return raw.decode("latin1", errors="ignore").strip()
-
-
-def _set_easy_rate(session_data, trial_stack):
-    n_hits = sum(1 for x in trial_stack if x == "hit")
-
-    if n_hits < 10:
-        K = 3
-    elif n_hits == 10:
-        K = 5
-    else:
-        K = 7
-
-    N = 4 * K
-
-    trial_stack.clear()
-    session_data.add_evt(_get_ts(), f"setK {K}")
-
-    return K, N, n_hits
-
-
-def _choose_trial_type(trial_n, K):
-    if trial_n <= 20:
-        return ((trial_n - 1) % 5) == 0
-
-    K = max(1, int(K))
-    return ((trial_n - 21) % K) == 0
-
-
-def _choose_target_side(phase_id):
-    global LAST_SIDE, SIDE_STREAK
-
-    cfg = PHASE_CONFIG.get(str(phase_id))
-    if not cfg:
-        return "B"
-    
-    if cfg.get('bidirectional', False):
-        return "B"
-    
-    if LAST_SIDE in {"L", "R"} and SIDE_STREAK >= MAX_STREAK:
-        side = "R" if LAST_SIDE == "L" else "L"
-    else:
-        side = random.choice(["L", "R"])
-    
-    if side == LAST_SIDE:
-        SIDE_STREAK += 1
-    else:
-        LAST_SIDE = side
-        SIDE_STREAK = 1
-    
-    return side
-
-
-def _send_next_config(link, next_type, next_side, timeout=3.0):
-    link.send_and_wait(f'T {1 if next_type else 0} {next_side}', timeout=timeout)
-
-
-class ArduinoLink:
-    def __init__(self, ser):
-        self.ser = ser
-        self.stop_evt = Event()
-        self.ack_evt = Event()
-        self.msg_q: "Queue[tuple[str, str, object]]" = Queue()
-        self._reader = Thread(target=self._reader_loop, daemon=True)
-
-    def start(self):
-        self._reader.start()
-
-    def close(self):
-        self.stop_evt.set()
-
-        try:
-            if self.ser and self.ser.is_open:
-                self.ser.close()
-        except Exception:
-            pass
-
-    def send_and_wait(self, text, timeout=5.0):
-        self.ack_evt.clear()
-        self.ser.write((text.strip() + "\n").encode("utf-8"))
-        self.ser.flush()
-
-        if not self.ack_evt.wait(timeout=timeout):
-            raise TimeoutError(f"No ACK after sending: {text!r}")
-
-    def send(self, text):
-        self.ser.write((text.strip() + "\n").encode("utf-8"))
-        self.ser.flush()
-
-    def _reader_loop(self):
-        try:
-            while not self.stop_evt.is_set() and self.ser and self.ser.is_open:
-                raw = self.ser.readline()
-                if not raw:
-                    continue
-
-                line = _decode_line(raw)
-                if not line:
-                    continue
-
-                if line == "A":
-                    self.ack_evt.set()
-                    continue
-
-                ts = _get_ts()
-
-                if line == SESSION_END_STRING:
-                    self.msg_q.put(("END", ts, None))
-                    continue
-
-                if line.startswith("[EVT]"):
-                    payload = line.split("]", 1)[1].strip()
-                    self.msg_q.put(("EVT", ts, payload))
-                    continue
-
-                if line.startswith("[ENC]"):
-                    payload = line.split("]", 1)[1].strip()
-                    self.msg_q.put(("ENC", ts, payload))
-                    continue
-
-                self.msg_q.put(("RAW", ts, line))
-
-        except Exception as e:
-            try:
-                self.msg_q.put(("ERR", _get_ts(), e))
-            except Exception:
-                pass
-
-
-class SessionData:
-    def __init__(self, animal_id, phase_id, date_str):
-        self.meta = {
-            "date": date_str,
-            "animal": animal_id,
-            "phase": phase_id,
-            "start_wall": None,
-            "end_wall": None,
-            "duration_sec": None,
-            "aborted": False,
-            }
-        self.evt = {"timestamps": [], "values": []}
-        self.enc = {"timestamps": [], "values": []}
-
-    def add_evt(self, ts, payload):
-        self.evt["timestamps"].append(ts)
-        self.evt["values"].append(payload)
-
-    def add_enc(self, ts, payload):
-        self.enc["timestamps"].append(ts)
-        self.enc["values"].append(payload)
-
-    def any_data(self):
-        return bool(self.evt["timestamps"]) or bool(self.enc["timestamps"])
-
-    def to_dict(self):
-        def _json_safe(x):
-            if x is None or isinstance(x, (str, int, float, bool)):
-                return x
-            
-            if isinstance(x, dict):
-                return {str(k): _json_safe(v) for k, v in x.items()}
-
-            if isinstance(x, (list, tuple)):
-                return [_json_safe(v) for v in x]
-            
-            return str(x)
-        
-        meta_out = dict(self.meta)
-        cfg = meta_out.get('trial_config', []) or []
-
-        try:
-            easy_trials = [c['trial'] for c in cfg if c.get('is_easy') is True]
-            normal_trials = [c['trial'] for c in cfg if c.get('is_easy') is False]
-
-            left_targets = [c['trial'] for c in cfg if c.get('side') == "L"]
-            right_targets = [c['trial'] for c in cfg if c.get('side') == "R"]
-            both_targets = [c['trial'] for c in cfg if c.get('side') == "B"]
-        except Exception:
-            easy_trials = []
-            normal_trials = []
-
-            left_targets = []
-            right_targets = []
-            both_targets = []
-        
-        meta_out.setdefault('K1', 5)
-        meta_out.setdefault('K2', None)
-
-        meta_out['easy_trials'] = list(easy_trials)
-        meta_out['normal_trials'] = list(normal_trials)
-        meta_out['left_targets'] = list(left_targets)
-        meta_out['right_targets'] = list(right_targets)
-        meta_out['both_targets'] = list(both_targets)
-
-        return {
-            'meta': _json_safe(meta_out),
-            'evt': _json_safe(self.evt),
-            'enc': _json_safe(self.enc)
-            }
-
-
-# ---------------------------
 # EMAIL SMTP
 # ---------------------------
 SMTP_SERVER = "smtp.gmail.com"
@@ -1239,7 +1284,7 @@ def send_email(session_data):
 # ---------------------------
 # TERMINATION / CLEANUP
 # ---------------------------
-def _is_early_exit(trial_stack, N):
+def is_early_exit(trial_stack, N):
     if len(trial_stack) < N:
         return False
     
@@ -1247,7 +1292,7 @@ def _is_early_exit(trial_stack, N):
     return n_hits < (N / 4)
 
 
-def _terminate_session(link, msg):
+def end_session(link, msg):
     try:
         link.send_and_wait(EARLY_END_STRING, timeout=2.0)
         deadline = time.time() + 2.0
@@ -1268,7 +1313,7 @@ def _terminate_session(link, msg):
 # TOP LEVEL
 # ---------------------------
 def setup():
-    port = _find_arduino_port()
+    port = find_arduino_port()
     if not port:
         raise RuntimeError("No Arduino detected")
 
@@ -1300,7 +1345,7 @@ def setup():
             animal_map = load_animal_map()
             validate_animal(animal_id, animal_map)
 
-            workbook_id = get_workbook_id(animal_id, animal_map)
+            workbook_id = _get_workbook_id(animal_id, animal_map)
 
         valid_phases = {"1", "2"} | set(PHASE_CONFIG.keys())
 
@@ -1334,11 +1379,11 @@ def setup():
         side_1 = None
 
         if phase_id in PHASE_CONFIG:
-            type_1 = _choose_trial_type(trial_n=1, K=5)
-            side_1 = _choose_target_side(phase_id=phase_id)
+            type_1 = choose_trial_type(trial_n=1, K=5)
+            side_1 = choose_target_side(phase_id=phase_id)
 
             try:
-                _send_next_config(link, type_1, side_1)
+                send_next_config(link, type_1, side_1)
             except Exception as e:
                 print(f'[ERROR] Unhandled exception during initial phase hand-off: {e}')
 
@@ -1392,6 +1437,10 @@ def main(link, session_data, cursor, dev_mode):
     calibrated = not do_calibration
     last_outcome = None
 
+    trial_start_t = None
+    recent_dt = deque(maxlen=STATUS_N)
+    recent_outcomes = deque(maxlen=STATUS_N)
+
     started = False
     t0 = None
 
@@ -1429,38 +1478,49 @@ def main(link, session_data, cursor, dev_mode):
                 if p == 'cue':
                     trial_n += 1
                     last_outcome = None
+                    trial_start_t = time.time()
                 
-                if do_calibration and p in {'hit', 'miss'}:
+                if p in {'hit', 'miss'}:
                     if last_outcome == p:
                         continue
-
                     last_outcome = p
 
-                    trial_stack.insert(0, p)
-                    if len(trial_stack) > N:
-                        trial_stack.pop()
-                    
-                    if calibrated:
-                        if len(trial_stack) >= N and _is_early_exit(trial_stack, N):
-                            _terminate_session(link, 'Terminated by early exit')
-                            session_data.meta['aborted'] = True
-                            break
-                    else:
-                        if len(trial_stack) >= N:
-                            K, N, calibration_hits = _set_easy_rate(session_data, trial_stack)
-                            
-                            session_data.meta['K2'] = K
-                            calibrated = True
-                            print(f'Calibration finished [hits={calibration_hits}/20, K={K}, N={N}]', flush=True)
-                    
-                    next_trial_n = trial_n + 1
-                    next_type = _choose_trial_type(next_trial_n, K)
-                    next_side = _choose_target_side(session_data.meta['phase'])
+                    dt = 0.0 if trial_start_t is None else max(0.0, time.time() - trial_start_t)                    
+                    recent_dt.append(dt)
+                    avg_dt = (sum(recent_dt) / len(recent_dt)) if recent_dt else 0.0
 
-                    _send_next_config(link, next_type, next_side)
-                    log_trial_config(session_data, trial_n=next_trial_n, type=next_type, side=next_side)
+                    recent_outcomes.append(p)
 
+                    n_hit = sum(1 for o in recent_outcomes if o == 'hit')
+                    n_miss = sum(1 for o in recent_outcomes if o == 'miss')
+
+                    if do_calibration:
+                        trial_stack.insert(0, p)
+                        if len(trial_stack) > N:
+                            trial_stack.pop()
+                        
+                        if calibrated:
+                            if len(trial_stack) >= N and is_early_exit(trial_stack, N):
+                                end_session(link, 'Terminated by early exit')
+                                session_data.meta['aborted'] = True
+                                break
+                        else:
+                            if len(trial_stack) >= N:
+                                K, N, calibration_hits = update_easy_rate(session_data, trial_stack)
+                                
+                                session_data.meta['K2'] = K
+                                calibrated = True
+                                print(f'\nCalibration finished [hits={calibration_hits}/20, K={K}, N={N}]\n', flush=True)
+                    
+                    show_trial_status(trial_n=trial_n, avg_dt=avg_dt, n_hit=n_hit, n_miss=n_miss)
+                    
                     if cursor is not None:
+                        next_trial_n = trial_n + 1
+                        next_type = choose_trial_type(next_trial_n, K)
+                        next_side = choose_target_side(session_data.meta['phase'])
+
+                        send_next_config(link, next_type, next_side)
+                        log_trial_config(session_data, trial_n=next_trial_n, type=next_type, side=next_side)
                         cursor.update_config(next_type, next_side)
             elif typ == "ENC":
                 p = str(payload)
@@ -1472,7 +1532,7 @@ def main(link, session_data, cursor, dev_mode):
                     pass
     except KeyboardInterrupt:
         session_data.meta["aborted"] = True
-        _terminate_session(link, "Terminated by KeyboardInterrupt")
+        end_session(link, "Terminated by KeyboardInterrupt")
 
         raise
     finally:
@@ -1521,11 +1581,13 @@ if __name__ == "__main__":
             if not session_data.any_data():
                 raise ValueError('No data collected during session')
 
+            print()
+
             save_ok = save_data(session_data)
             if not save_ok:
                 print('[WARNING] Failed to save data using Google Sheets API', flush=True)
     except KeyboardInterrupt:
-        print()
+        pass
     except SystemExit as e:
         if getattr(e, "code", 0) not in {0, None}:
             log_error(animal_id_for_log, phase_id_for_log, e)
@@ -1551,3 +1613,5 @@ if __name__ == "__main__":
             commit_error_log(animal_id_for_log, phase_id_for_log)
         except Exception:
             pass
+
+        print()
