@@ -1,27 +1,16 @@
 @echo off
-setlocal EnableExtensions EnableDelayedExpansion
-
 echo.
+setlocal EnableExtensions EnableDelayedExpansion
 
 call :selfUpdate
 if "%ERRORLEVEL%"=="99" exit /b 0
 if errorlevel 1 call :kill "selfUpdate failed"
 
-echo.
 echo Getting script directory...
 set "SCRIPT_DIR=%~dp0"
 cd /d "%SCRIPT_DIR%"
 
-echo Making sure pip is up to date...
-python -m pip install --upgrade pip -q
-
-echo Installing required dependencies...
-if not exist "requirements.txt" (
-    echo requirements.txt not found in %SCRIPT_DIR%
-    exit /b 1
-)
-python -m pip install -r requirements.txt -q || exit /b 1
-
+echo Verifying Git installation...
 where git >nul 2>&1
 if errorlevel 1 (
     echo.
@@ -50,14 +39,14 @@ if errorlevel 1 (
             "Start-Process -FilePath $o -ArgumentList '/VERYSILENT','/NORESTART','/SUPPRESSMSGBOXES' -Wait;"
     )
 
-    if exist "%ProgramFiles%\Git\cmd\git.ext" set "PATH=%ProgramFiles%\Git\cmd;%PATH%"
-    if exist "%ProgramFiles(x86)%\Git\cmd\git.ext" set "PATH=%ProgramFiles(x86)%\Git\cmd;%PATH%"
+    if exist "%ProgramFiles%\Git\cmd\git.exe" set "PATH=%ProgramFiles%\Git\cmd;%PATH%"
+    if exist "%ProgramFiles(x86)%\Git\cmd\git.exe" set "PATH=%ProgramFiles(x86)%\Git\cmd;%PATH%"
 
     where git >nul 2>&1
     if errorlevel 1 (
         call :kill "Git installation failed or git.exe not on PATH"
     ) else (
-        for /f "delims=" %%v in ('git --versoin 2^>nul') do echo %%v
+        for /f "delims=" %%v in ('git --version 2^>nul') do echo %%v
     )
 )
 
@@ -70,6 +59,45 @@ call :pullFile "https://github.com/GonzalesLabVU/Behavior-BCI/blob/main/pc/confi
 call :pullFile "https://github.com/GonzalesLabVU/Behavior-BCI/blob/main/pc/config/errors.log" || call :kill "pullFile failed for errors.log"
 call :pullFolder "https://github.com/GonzalesLabVU/Behavior-BCI/tree/main/arduino/behavioral_controller" || call :kill "pullFolder subroutine failed for behavioral_controller\"
 echo done
+
+echo Making sure pip is up to date...
+python -m pip install --upgrade pip -q
+
+echo Installing required dependencies...
+if not exist "requirements.txt" (
+    echo requirements.txt not found in %SCRIPT_DIR%
+    exit /b 1
+)
+python -m pip install -r requirements.txt -q || exit /b 1
+
+echo Verifying arduino-cli installation...
+where arduino-cli >nul 2>&1
+if errorlevel 1 (
+    echo [WARNING] arduino-cli not found on path
+    echo Installing arduino-cli...
+    where winget >nul 2>&1 || call :kill "winget not found; install arduino-cli manually"
+    winget install --id ArduinoSA.CLI -e --source winget --accept-package-agreements --accept-source-agreements >nul 2>&1
+)
+
+where arduino-cli >nul 2>&1
+if errorlevel 1 (
+    if exist "%LocalAppData%\Programs\Arduino CLI\arduino-cli.exe" set "PATH=%LocalAppData%\Programs\Arduino CLI;%PATH%"
+    if exist "%ProgramFiles%\Arduino CLI\arduino-cli.exe" set "PATH=%ProgramFiles%\Arduino CLI;%PATH%"
+)
+where arduino-cli >nul 2>&1 || call :kill "arduino-cli install successful but arduino-cli.exe not found on PATH"
+
+arduino-cli config init >nul 2>&1
+arduino-cli core update-index >nul 2>&1
+arduino-cli core list | findstr /i "arduino:avr" >nul 2>&1 || arduino-cli core install arduino:avr >nul 2>&1
+
+arduino-cli version >nul 2>&1
+if errorlevel 1 call :kill "arduino-cli is present but not runnable"
+
+set "ARDUINO_CLI=arduino-cli"
+set "FQBN=arduino:avr:mega"
+call :detectPort || call :kill "No Arduino Mega 2560 port detected"
+
+call :uploadToArduino "behavioral_controller" || call :kill "Arduino upload failed"
 
 echo Running Python script...
 python -m behavioral_master
@@ -237,6 +265,73 @@ REM -----------------------------------
     )
 
     endlocal & exit /b %RC%
+
+:detectPort
+    @echo off
+    setlocal
+
+    echo Searching for Arduino port...
+
+    set "PORT="
+    for /f "usebackq delims=" %%P in (`powershell -NoProfile -Command "$j = arduino-cli board list --format json | ConvertFrom-Json; $p = $j.ports | Where-Object { $_.matching_boards.fqbn -contains 'arduino:avr:mega' } | Select-Object -First 1; if($p){ $p.address }"`) do set "PORT=%%P"
+    
+    endlocal & set "PORT=%PORT%"
+    if not defined PORT exit /b 1
+    exit /b 0
+
+:uploadToArduino
+    @echo off
+    setlocal EnableExtensions EnableDelayedExpansion
+
+    set "SKETCH_DIR=%~1"
+    if not defined SKETCH_DIR (
+        echo [ERROR] Missing folder argument for :uploadToArduino subroutine
+        endlocal & exit /b 1
+    )
+
+    set "ABS_SKETCH_DIR=%~dp0%SKETCH_DIR%"
+    if not exist "%ABS_SKETCH_DIR%\" (
+        echo [ERROR] Folder not found: "%ABS_SKETCH_DIR%"
+        endlocal & exit /b 1
+    )
+
+    set "INO="
+    for %%I in ("%ABS_SKETCH_DIR%\*.ino") do (
+        set "INO=%%~fI"
+        goto :gotINO
+    )
+
+:gotINO
+    if not defined INO (
+        echo [ERROR] No .ino files found in "%ABS_SKETCH_DIR%"
+        endlocal & exit /b 1
+    )
+
+    if not defined FQBN (
+        echo [ERROR] FQBN not set
+        endlocal & exit /b 1
+    )
+
+    if not defined PORT (
+        echo [ERROR] PORT not set
+        endlocal & exit /b 1
+    )
+
+    echo Compiling sketch folder...
+    "%ARDUINO_CLI%" compile --fqbn "%FQBN%" "%ABS_SKETCH_DIR%"
+    if errorlevel 1 (
+        echo [ERROR] Sketch compilation failed
+        endlocal & exit /b 1
+    )
+
+    echo Uploading sketch...
+    "%ARDUINO_CLI%" upload -p "%PORT%" --fqbn "%FQBN%" "%ABS_SKETCH_DIR%"
+    if errorlevel 1 (
+        echo [ERROR] Sketch upload failed
+        endlocal & exit /b 1
+    )
+
+    endlocal & exit /b 0
 
 :sleep
     python -c "import time; time.sleep(%1)"
