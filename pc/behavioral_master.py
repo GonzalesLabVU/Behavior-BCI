@@ -133,7 +133,7 @@ def _ensure_session_tracking(session_data):
     session_data.meta.setdefault('K2', None)
 
 
-def _log_trial_config(session_data, trial_n, type, side):
+def log_trial_config(session_data, trial_n, type, side):
     _ensure_session_tracking(session_data)
 
     session_data.meta['trial_config'].append({
@@ -141,6 +141,7 @@ def _log_trial_config(session_data, trial_n, type, side):
         'is_easy': bool(type),
         'side': str(side)
         })
+    print(f'[Trial {trial_n}] {type} {side}')
 
 
 def time_this(fcn):
@@ -1271,7 +1272,7 @@ def setup():
         
         _ensure_session_tracking(session_data)
         if type_1 is not None and side_1 is not None:
-            _log_trial_config(session_data, trial_n=1, type=type_1, side=side_1)
+            log_trial_config(session_data, trial_n=1, type=type_1, side=side_1)
 
         return link, session_data, cursor, dev_mode
     except Exception:
@@ -1366,7 +1367,7 @@ def main(link, session_data, cursor):
                     next_side = _choose_target_side(session_data.meta['phase'])
 
                     _send_next_config(link, next_type, next_side)
-                    _log_trial_config(session_data, trial_n=next_trial_n, type=next_type, side=next_side)
+                    log_trial_config(session_data, trial_n=next_trial_n, type=next_type, side=next_side)
 
                     if cursor is not None:
                         cursor.update_config(next_type, next_side)
