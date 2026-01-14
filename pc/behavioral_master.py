@@ -1144,6 +1144,99 @@ class SessionData:
 
 
 # ---------------------------
+# EMAIL SMTP
+# ---------------------------
+SMTP_SERVER = "smtp.gmail.com"
+SMTP_PORT = 587
+
+
+def _format_subject(date, animal, phase):
+    date_str = datetime.strptime(date, '%m/%d/%Y').strftime('%b-%d')
+    animal_str = f'Animal {animal}'
+    phase_str = f'Phase {phase}'
+
+    return f'{date_str}  |  {animal_str}  |  {phase_str}'
+
+
+def _format_body(t_start, t_stop, dur_s, evt):
+    m, s = divmod(int(dur_s or 0), 60)
+    t_elapsed = f'{m}:{s:02d}'
+
+    n_hits = sum(1 for e in evt['values'] if e == 'hit')
+    n_total = sum(1 for e in evt['values'] if e == 'cue')
+    hit_rate = ((n_hits / n_total) * 100) if n_total else 0.0
+
+    lines = [
+        ("Started", str(t_start)),
+        ("Finished", str(t_stop)),
+        ("Elapsed", str(t_elapsed)),
+        ("", ""),
+        ("Total Trials", str(n_total)),
+        ("Success Rate", f"{hit_rate:.1f}%")
+        ]
+    width = max(len(label) for label, _ in lines)
+
+    out = []
+    for label, value in lines:
+        if not label and not value:
+            out.append("")
+        else:
+            out.append(f"{label + ':':<{width + 1}}  {value}")
+    
+    return "\n".join(out)
+
+
+def send_email(session_data):
+    smtp_username = _require_env("SMTP_USERNAME")
+    smtp_password = _require_env("SMTP_PASSWORD")
+    smtp_to_addr = _require_env("SMTP_TO_ADDR")
+
+    date = session_data.meta['date']
+    animal = session_data.meta['animal']
+    phase = session_data.meta['phase']
+
+    subject = _format_subject(date, animal, phase)
+
+    t_start = datetime.fromisoformat(session_data.meta['start_wall']).strftime('%I:%M %p').lstrip('0')
+    t_stop = datetime.fromisoformat(session_data.meta['end_wall']).strftime('%I:%M %p').lstrip('0')
+    dur_s = session_data.meta['duration_sec']
+    evt = session_data.evt
+
+    body = _format_body(t_start, t_stop, dur_s, evt)
+
+    try:
+        recipients = json.loads(smtp_to_addr)
+
+        if isinstance(recipients, str):
+            recipients = [recipients]
+    except Exception:
+        recipients = [r.strip() for r in smtp_to_addr.split(",") if r.strip()]
+
+    to_addr = ", ".join(recipients)
+
+    msg = EmailMessage()
+    msg['From'] = smtp_username
+    msg['To'] = to_addr
+    msg['Subject'] = subject
+    msg.set_content(body)
+
+    try:
+        print('Notifying users of session completion...', end='\r', flush=True)
+
+        with smtplib.SMTP(SMTP_SERVER, SMTP_PORT, timeout=30) as server:
+            server.ehlo()
+            server.starttls()
+            server.ehlo()
+
+            server.login(smtp_username, smtp_password)
+            server.send_message(msg)
+        
+        print('Notifying users of session completion...done')
+    except Exception:
+        raise
+
+
+# ---------------------------
 # TERMINATION / CLEANUP
 # ---------------------------
 def _is_early_exit(trial_stack, N):
@@ -1204,7 +1297,6 @@ def setup():
             print("\nDEV MODE\n")
         else:
             validate_resources()
-
             animal_map = load_animal_map()
             validate_animal(animal_id, animal_map)
 
@@ -1289,7 +1381,7 @@ def setup():
         raise
 
 
-def main(link, session_data, cursor):
+def main(link, session_data, cursor, dev_mode):
     do_calibration = str(session_data.meta["phase"]) not in {"1", "2"}
 
     K = 5
@@ -1397,6 +1489,12 @@ def main(link, session_data, cursor):
         m, s = divmod(dt, 60)
         print(f"Session duration: {m}:{s:02d}", flush=True)
 
+        if not dev_mode:
+            try:
+                send_email(session_data)
+            except Exception as e:
+                log_error(session_data.meta['animal'], session_data.meta['phase'], e)
+
     return session_data
 
 
@@ -1417,7 +1515,7 @@ if __name__ == "__main__":
             animal_id_for_log = session_data.meta.get("animal", "UNKNOWN")
             phase_id_for_log = session_data.meta.get("phase", "0")
 
-        main(link, session_data, cursor)
+        main(link, session_data, cursor, dev_mode)
 
         if not dev_mode:
             if not session_data.any_data():
