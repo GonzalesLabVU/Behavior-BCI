@@ -24,6 +24,9 @@ from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from dotenv import load_dotenv
 
+import smtplib
+from email.message import EmailMessage
+
 import subprocess
 import shutil
 import tempfile
@@ -1333,6 +1336,7 @@ def main(link, session_data, cursor):
 
                 if p == 'cue':
                     trial_n += 1
+                    last_outcome = None
                 
                 if do_calibration and p in {'hit', 'miss'}:
                     if last_outcome == p:
