@@ -324,7 +324,7 @@ void setup() {
             break;
         }
         case 6: {
-            session_T = MINUTES(2);
+            session_T = MINUTES(45);
             trial_T = SECONDS(30);
             delay_T = SECONDS(3);
             threshold = DEGREES(30);
