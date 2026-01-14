@@ -73,6 +73,9 @@ arduino-cli config init >nul 2>&1
 arduino-cli core update-index >nul 2>&1
 arduino-cli core list | findstr /i "arduino:avr" >nul 2>&1 || arduino-cli core install arduino:avr >nul 2>&1
 
+echo Installing required Arduino libraries...
+arduino-cli lib install Servo >nul 2>&1
+
 arduino-cli version >nul 2>&1
 if errorlevel 1 call :kill "arduino-cli is present but not runnable"
 
