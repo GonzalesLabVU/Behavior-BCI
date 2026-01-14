@@ -97,7 +97,7 @@ if errorlevel 1 call :kill "arduino-cli is present but not runnable"
 echo Searching for Arduino...
 set "ARDUINO_CLI=arduino-cli"
 set "FQBN=arduino:avr:mega"
-call :detectPort || call :kill "No Arduino Mega 2560 port detected"
+call :detectPort || call :kill "No Arduino Mega 2560 detected"
 
 call :uploadToArduino "behavioral_controller" || call :kill "Arduino upload failed"
 
@@ -349,11 +349,11 @@ REM -----------------------------------
 
 :kill
     echo.
-    echo Downloading latest file versions...failed
     echo Fatal error: %~1
     echo.
     endlocal
     pause
     exit 1
 
-pause
+:eof
+    exit /b 0
