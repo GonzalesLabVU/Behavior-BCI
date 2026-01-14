@@ -50,7 +50,7 @@ if errorlevel 1 (
     )
 )
 
-<nul set /p "=Downloading latest file versions..."
+echo Downloading latest file versions...
 call :pullFile "https://github.com/GonzalesLabVU/Behavior-BCI/blob/main/pc/behavioral_master.py" || call :kill "pullFile subroutine failed for behavioral_master.py"
 call :pullFile "https://github.com/GonzalesLabVU/Behavior-BCI/blob/main/pc/cursor_utils.py" || call :kill "pullFile failed for cursor_utils.py"
 call :pullFile "https://github.com/GonzalesLabVU/Behavior-BCI/blob/main/pc/plot_utils.py" || call :kill "pullFile failed for plot_utils.py"
@@ -58,6 +58,8 @@ call :pullFile "https://github.com/GonzalesLabVU/Behavior-BCI/blob/main/pc/confi
 call :pullFile "https://github.com/GonzalesLabVU/Behavior-BCI/blob/main/pc/config/requirements.txt" || call :kill "pullFile failed for requirements.txt"
 call :pullFile "https://github.com/GonzalesLabVU/Behavior-BCI/blob/main/pc/config/errors.log" || call :kill "pullFile failed for errors.log"
 call :pullFolder "https://github.com/GonzalesLabVU/Behavior-BCI/tree/main/arduino/behavioral_controller" || call :kill "pullFolder subroutine failed for behavioral_controller\"
+
+call :sleep 2
 
 echo Making sure pip is up to date...
 python -m pip install --upgrade pip -q
