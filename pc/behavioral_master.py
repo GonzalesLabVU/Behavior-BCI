@@ -197,11 +197,11 @@ def log_error(animal_id, phase_id, exc):
         phase = str(phase_id)
 
         header = [
-            f'TIME = {date_str} {time_str}',
-            f'USER = {client}',
-            f'ANIMAL = {animal}',
-            f'PHASE = {phase}',
-            f'SOURCE = {script_name}'
+            f'TIME={date_str} {time_str}',
+            f'USER={client}',
+            f'ANIMAL={animal}',
+            f'PHASE={phase}',
+            f'SOURCE={script_name}'
             ]
         hline = ['-' * 40]
         body = []
@@ -285,9 +285,30 @@ def commit_error_log(animal_id='UNKNOWN', phase_id='0'):
         return False
 
 
+def log_and_commit(animal_id, phase_id, exc):
+    if isinstance(exc, KeyboardInterrupt):
+        return
+    
+    try:
+        log_error(animal_id, phase_id, exc)
+    finally:
+        try:
+            commit_error_log(animal_id, phase_id)
+        except Exception:
+            pass
+
+
 # ---------------------------
 # RESOURCE LOADING
 # ---------------------------
+def _require_env(name):
+    v = os.getenv(name)
+    if not v:
+        raise RuntimeError(f'{name} not found in .env')
+    
+    return v
+
+
 def load_animal_map(path=ANIMAL_MAP_PATH):
     with open(path, 'r', encoding='utf-8') as f:
         data = json.load(f)
@@ -317,14 +338,6 @@ def validate_resources():
         raise FileNotFoundError('credentials.json not found in the script directory')
 
     load_dotenv(SCRIPT_DIR / ".env")
-
-
-def _require_env(name):
-    v = os.getenv(name)
-    if not v:
-        raise RuntimeError(f'{name} not found in .env')
-    
-    return v
 
 
 # ---------------------------
@@ -448,6 +461,10 @@ class SessionData:
             }
         self.evt = {"timestamps": [], "values": []}
         self.enc = {"timestamps": [], "values": []}
+        self.raw = {
+            "evt": {"timestamps": [], "values": []},
+            "cap": {"timestamps": [], "values": []}
+            }
 
     def add_evt(self, ts, payload):
         self.evt["timestamps"].append(ts)
@@ -457,8 +474,29 @@ class SessionData:
         self.enc["timestamps"].append(ts)
         self.enc["values"].append(payload)
 
+    def add_raw(self, ts, payload):
+        def _is_numeric(s):
+            try:
+                float(s.strip())
+                return True
+            except Exception:
+                return False
+
+        if _is_numeric(payload):
+            dtype = "cap"
+        else:
+            dtype = "evt"
+        
+        self.raw[dtype]["timestamps"].append(ts)
+        self.raw[dtype]["values"].append(payload)
+
     def any_data(self):
-        return bool(self.evt["timestamps"]) or bool(self.enc["timestamps"])
+        return (
+            bool(self.evt["timestamps"]) or
+            bool(self.enc["timestamps"]) or
+            bool(self.raw["evt"]["timestamps"]) or
+            bool(self.raw["cap"]["timestamps"])
+            )
 
     def to_dict(self):
         def _json_safe(x):
@@ -484,12 +522,8 @@ class SessionData:
             right_targets = [c['trial'] for c in cfg if c.get('side') == "R"]
             both_targets = [c['trial'] for c in cfg if c.get('side') == "B"]
         except Exception:
-            easy_trials = []
-            normal_trials = []
-
-            left_targets = []
-            right_targets = []
-            both_targets = []
+            easy_trials, normal_trials = [], []
+            left_targets, right_targets, both_targets = [], [], []
         
         meta_out.setdefault('K1', 5)
         meta_out.setdefault('K2', None)
@@ -503,7 +537,8 @@ class SessionData:
         return {
             'meta': _json_safe(meta_out),
             'evt': _json_safe(self.evt),
-            'enc': _json_safe(self.enc)
+            'enc': _json_safe(self.enc),
+            'raw': _json_safe(self.raw)
             }
 
 
@@ -539,8 +574,13 @@ def choose_target_side(phase_id):
     return side
 
 
-def send_next_config(link, next_type, next_side, timeout=3.0):
-    link.send_and_wait(f'T {1 if next_type else 0} {next_side}', timeout=timeout)
+def send_next_config(link, next_type, next_side, dev_mode=False, timeout=3.0):
+    cmd = f'T {1 if next_type else 0} {next_side}'
+
+    if dev_mode:
+        link.send(cmd)
+    else:
+        link.send_and_wait(cmd, timeout=timeout)
 
 
 # ---------------------------
@@ -576,6 +616,7 @@ def _build_meta_rows(session_data):
     both_targets = [c['trial'] for c in cfg if c.get('side') == "B"]
 
     meta_pairs = [
+        ('client', os.getenv('CLIENT_ID')),
         ('K1', session_data.meta.get('K1', 5)),
         ('K2', session_data.meta.get('K2', None)),
         ('easy_trials', easy_trials),
@@ -599,6 +640,31 @@ def _build_meta_rows(session_data):
             out.append([key, "" if value is None else value])
     
     return out
+
+
+def _align_cells(wb, ws, r1, c1, r2, c2):
+    sheet_id = ws._properties["sheetId"]
+    req = {
+        "requests": [{
+            "repeatCell": {
+                "range": {
+                    "sheetId": sheet_id,
+                    "startRowIndex": r1 - 1,
+                    "endRowIndex": r2,      # exclusive
+                    "startColumnIndex": c1 - 1,
+                    "endColumnIndex": c2,   # exclusive
+                    },
+                "cell": {
+                    "userEnteredFormat": {
+                        "horizontalAlignment": "LEFT"
+                        }
+                    },
+                "fields": "userEnteredFormat.horizontalAlignment",
+                }
+            }]
+        }
+    
+    wb.batch_update(req)
 
 
 def _get_workbook_id(animal_id, animal_map):
@@ -997,15 +1063,52 @@ class FileLock:
 
 
 def save_data(session_data):
-    workbook_id = session_data.meta["workbook_id"]
+    workbook_id = session_data.meta.get("workbook_id")
+    if not workbook_id:
+        raise ValueError("session_data.meta['workbook_id'] is missing")
+    
     client_id = _get_client_id()
+
+    def _norm(x):
+        return (x or "").strip()
+    
+    def _target_headers():
+        d = _norm(session_data.meta.get("date", ""))
+        a = _norm(f"Animal {session_data.meta.get('animal', '')}")
+        p = _norm(f"Phase {session_data.meta.get('phase', '')}")
+
+        return d, a, p
+    
+    def _find_cols(ws):
+        target_d, target_a, target_p = _target_headers()
+
+        max_col = len(ws.row_values(2))
+        if max_col <= 0:
+            return 1, False
+        
+        header_rng = f'A1:{rowcol_to_a1(2, max_col)}'
+        header = ws.get(header_rng)
+        row1 = header[0] if len(header) > 0 else []
+        row2 = header[1] if len(header) > 1 else []
+
+        for c in range(1, max_col + 1, 2):
+            d_val = _norm(row1[c-1] if (c - 1) < len(row1) else "")
+            a_val = _norm(row2[c-1] if (c-1) < len(row2) else "")
+            p_val = _norm(row2[c] if c < len(row2) else "")
+
+            if (d_val == target_d) and (a_val == target_a) and (p_val == target_p):
+                return c, True
+        
+        new_col = (((max_col + 1) // 2) * 2) + 1
+        return new_col, False
 
     def _batch_write_cols(ws, start_row, start_col, data, chunk_rows=2000, group_chunks=10):
         sheet = ws.spreadsheet
         name = ws.title
 
-        _get_range = lambda r1, c1, r2, c2: f'{name}!{rowcol_to_a1(r1, c1)}:{rowcol_to_a1(r2, c2)}'
-
+        def _rng(r1, c1, r2, c2):
+            return f'{name}!{rowcol_to_a1(r1, c1)}:{rowcol_to_a1(r2, c2)}'
+        
         req = []
         n = len(data)
 
@@ -1016,7 +1119,7 @@ def save_data(session_data):
             c1 = start_col
             c2 = start_col + 1
 
-            req.append({'range': _get_range(r1, c1, r2, c2), 'values': chunk})
+            req.append({'range': _rng(r1, c1, r2, c2), 'values': chunk})
 
             if len(req) >= group_chunks:
                 sheet.values_batch_update(body={'valueInputOption': 'RAW', 'data': req})
@@ -1036,20 +1139,22 @@ def save_data(session_data):
         for dtype, sheet_name in (('evt', 'Event'), ('enc', 'Encoder'), ('meta', 'Metadata')):
             if dtype == 'meta':
                 data_rows = _build_meta_rows(session_data)
+                data = data_rows
                 n_rows = len(data_rows)
                 label = 'metadata'
             else:
                 d = getattr(session_data, dtype)
                 n_rows= len(d['timestamps'])
+                data = [[ts, val] for ts, val in zip(d['timestamps'], d['values'])]
                 label = sheet_name.lower()
+
+            if n_rows == 0:
+                continue
 
             if dtype != 'meta':
                 print(f'Writing {label} data...', flush=True)
             else:
                 print('Writing metadata...', flush=True)
-
-            if n_rows == 0:
-                continue
 
             lock.update()
             lock.reset()
@@ -1058,14 +1163,26 @@ def save_data(session_data):
                 ws = wb.worksheet(sheet_name)
             except Exception:
                 ws = wb.add_worksheet(title=sheet_name, rows=200, cols=26)
+            
+            lock.update()
+            lock.reset()
 
-            max_col = len(ws.row_values(2))
-            needed_cols = max_col + 2
+            start_col, overwrite = _find_cols(ws)
+            needed_cols = start_col + 1
+
             if ws.col_count < needed_cols:
                 ws.add_cols(needed_cols - ws.col_count)
+
+            if overwrite:
+                clear_rng = f'{rowcol_to_a1(1, start_col)}:{rowcol_to_a1(ws.row_count, start_col + 1)}'
+                
+                lock.update()
+                lock.reset()
+
+                ws.batch_clear([clear_rng])
             
-            header_rng = f'{rowcol_to_a1(1, max_col+1)}:{rowcol_to_a1(2, max_col+2)}'
-            skip_rng = f'{rowcol_to_a1(3, max_col+1)}:{rowcol_to_a1(3, max_col+2)}'
+            header_rng = f'{rowcol_to_a1(1, start_col)}:{rowcol_to_a1(2, start_col + 1)}'
+            skip_rng = f'{rowcol_to_a1(3, start_col)}:{rowcol_to_a1(3, start_col + 1)}'
 
             header = [
                 [session_data.meta['date'], ""],
@@ -1083,49 +1200,32 @@ def save_data(session_data):
             needed_rows = 3 + n_rows
             if ws.row_count < needed_rows:
                 ws.add_rows(needed_rows - ws.row_count)
-            
-            if dtype == 'meta':
-                data = data_rows
-            else:
-                data = [[ts, val] for ts, val in zip(d['timestamps'], d['values'])]
-            
-            first_row = 4
-            first_col = max_col + 1
 
             lock.update()
             lock.reset()
 
-            _batch_write_cols(ws, first_row, first_col, data)
-            print("\r\033[2K", end="", flush=True)
+            _batch_write_cols(ws, start_row=4, start_col=start_col, data=data)
 
+            if dtype == 'meta':
+                r1 = 1
+                r2 = 3 + n_rows
+                c1 = start_col
+                c2 = start_col + 1
+
+                lock.update()
+                lock.reset()
+
+                _align_cells(wb, ws, r1, c1, r2, c2)
+
+            print("\r\033[2K", end="", flush=True)
         
         return True
-    except KeyboardInterrupt as e:
-        try:
-            fallback_save(session_data, exc=e)
-        except Exception:
-            pass
-
-        return False
-    except Exception as e:
-        try:
-            fallback_save(session_data, exc=e)
-        except Exception as e2:
-            log_error(session_data.meta.get('animal', 'UNKNOWN'), session_data.meta.get('phase', '0'), e2)
-        
-        log_error(session_data.meta.get('animal', 'UNKNOWN'), session_data.meta.get('phase', '0'), e)
-        return False
     finally:
         if lock is not None:
             try:
                 lock.release()
             except Exception as e:
-                try:
-                    fallback_save(session_data, exc=e)
-                except Exception as e2:
-                    log_error(session_data.meta.get('animal', 'UNKNOWN'), session_data.meta.get('phase', '0'), e2)
-                
-                log_error(session_data.meta.get('animal', 'UNKNOWN'), session_data.meta.get('phase', '0'), e)
+                log_and_commit(session_data.meta.get('animal', 'UNKNOWN'), session_data.meta.get('phase', '0'), e)
 
 
 def fallback_save(session_data, exc=None):
@@ -1144,16 +1244,33 @@ def fallback_save(session_data, exc=None):
     
     with open(out_path, 'w', encoding='utf-8') as f:
         json.dump(payload, f, indent=4)
-
-    try:
-        commit_error_log(animal, phase)
-    except Exception:
-        pass
     
     print("\r\033[2K", end="", flush=True)
     print(f"[WARNING] Saved session data locally to {out_path.name}", flush=True)
 
     return out_path
+
+
+def safe_save(session_data):
+    animal = (session_data.meta.get('animal', 'UNKNOWN') if session_data else 'UNKNOWN')
+    phase = (session_data.meta.get('phase', '0') if session_data else '0')
+
+    try:
+        save_data(session_data)
+        return True
+    except Exception as e:
+        try:
+            fallback_save(session_data, exc=e)
+        except Exception as e2:
+            log_error(animal, phase, e2)
+        
+        log_error(animal, phase, e)
+        return False
+    finally:
+        try:
+            commit_error_log(animal, phase)
+        except Exception:
+            pass
 
 
 # ---------------------------
@@ -1163,15 +1280,16 @@ SMTP_SERVER = "smtp.gmail.com"
 SMTP_PORT = 587
 
 
-def _format_subject(date, animal, phase):
-    date_str = datetime.strptime(date, '%m/%d/%Y').strftime('%b-%d')
+def _format_subject(animal, phase):
     animal_str = f'Animal {animal}'
     phase_str = f'Phase {phase}'
 
-    return f'{date_str}  |  {animal_str}  |  {phase_str}'
+    return f'{animal_str}  |  {phase_str}'
 
 
-def _format_body(t_start, t_stop, dur_s, evt):
+def _format_body(date, t_start, t_stop, dur_s, evt):
+    date_str = datetime.strptime(date, '%m/%d/%Y').strftime('%b-%d')
+
     m, s = divmod(int(dur_s or 0), 60)
     t_elapsed = f'{m}:{s:02d}'
 
@@ -1180,9 +1298,11 @@ def _format_body(t_start, t_stop, dur_s, evt):
     hit_rate = ((n_hits / n_total) * 100) if n_total else 0.0
 
     lines = [
+        ("Date", date_str),
+        ("", ""),
         ("Started", str(t_start)),
         ("Finished", str(t_stop)),
-        ("Elapsed", str(t_elapsed)),
+        ("Duration", str(t_elapsed)),
         ("", ""),
         ("Total Trials", str(n_total)),
         ("Success Rate", f"{hit_rate:.1f}%")
@@ -1208,14 +1328,14 @@ def send_email(session_data):
     animal = session_data.meta['animal']
     phase = session_data.meta['phase']
 
-    subject = _format_subject(date, animal, phase)
+    subject = _format_subject(animal, phase)
 
     t_start = datetime.fromisoformat(session_data.meta['start_wall']).strftime('%I:%M %p').lstrip('0')
     t_stop = datetime.fromisoformat(session_data.meta['end_wall']).strftime('%I:%M %p').lstrip('0')
     dur_s = session_data.meta['duration_sec']
     evt = session_data.evt
 
-    body = _format_body(t_start, t_stop, dur_s, evt)
+    body = _format_body(date, t_start, t_stop, dur_s, evt)
 
     try:
         recipients = json.loads(smtp_to_addr)
@@ -1578,7 +1698,7 @@ def setup():
             side_1 = choose_target_side(phase_id=phase_id)
 
             try:
-                send_next_config(link, type_1, side_1)
+                send_next_config(link, type_1, side_1, dev_mode)
             except Exception as e:
                 print(f'[ERROR] Unhandled exception during initial phase hand-off: {e}')
 
@@ -1735,9 +1855,8 @@ def main(link, session_data, cursor, dev_mode):
                         next_type = choose_trial_type(next_trial_n, K)
                         next_side = choose_target_side(session_data.meta['phase'])
 
-                        if not dev_mode:
-                            send_next_config(link, next_type, next_side)
-                            log_trial_config(session_data, trial_n=next_trial_n, type=next_type, side=next_side)
+                        send_next_config(link, next_type, next_side, dev_mode)
+                        log_trial_config(session_data, trial_n=next_trial_n, type=next_type, side=next_side)
                         
                         cursor.update_config(next_type, next_side)
             elif typ == "ENC":
@@ -1751,6 +1870,13 @@ def main(link, session_data, cursor, dev_mode):
                     ENC_QUEUE.put_nowait((ts, p))
                 except Exception:
                     pass
+            elif typ == "RAW":
+                p = str(payload)
+
+                try:
+                    session_data.add_raw(ts, p)
+                except Exception:
+                    pass  
     except KeyboardInterrupt:
         session_data.meta["aborted"] = True
         end_session(link, "\nTerminated by KeyboardInterrupt")
@@ -1777,22 +1903,17 @@ def main(link, session_data, cursor, dev_mode):
         m, s = divmod(dt, 60)
         print(f"Session duration: {m}:{s:02d}", flush=True)
 
-        if not dev_mode:
-            try:
-                send_email(session_data)
-            except Exception as e:
-                log_error(session_data.meta['animal'], session_data.meta['phase'], e)
-
-    return session_data
-
 
 if __name__ == "__main__":
     link = None
     session_data = None
     cursor = None
     dev_mode = True
+
     animal_id_for_log = "UNKNOWN"
     phase_id_for_log = "0"
+
+    run_exc = None
 
     print()
 
@@ -1804,42 +1925,43 @@ if __name__ == "__main__":
             phase_id_for_log = session_data.meta.get("phase", "0")
 
         main(link, session_data, cursor, dev_mode)
-
-        if not dev_mode:
-            if not session_data.any_data():
-                raise ValueError('No data collected during session')
-
+    except BaseException as e:
+        run_exc = e
+    finally:
+        if (session_data is not None) and (not dev_mode) and session_data.any_data():
             print()
 
-            save_ok = save_data(session_data)
-            if not save_ok:
-                print('[WARNING] Failed to save data using Google Sheets API', flush=True)
-    except KeyboardInterrupt:
-        pass
-    except SystemExit as e:
-        if getattr(e, "code", 0) not in {0, None}:
-            log_error(animal_id_for_log, phase_id_for_log, e)
-
-        raise
-    except Exception as e:
-        log_error(animal_id_for_log, phase_id_for_log, e)
-        raise
-    finally:
+            ok = safe_save(session_data)
+            if not ok:
+                print('[WARNING] Google Sheets save failed (local fallback may have been used)', flush=True)
+        
         if cursor is not None:
             try:
-                cursor.stop(timeout=2.0)
-            except Exception:
-                pass
-
+                cursor.stop()
+            except Exception as e:
+                log_and_commit(animal_id_for_log, phase_id_for_log, e)
+        
         if link is not None:
             try:
                 link.close()
-            except Exception:
-                pass
+            except Exception as e:
+                log_and_commit(animal_id_for_log, phase_id_for_log, e)
         
-        try:
-            commit_error_log(animal_id_for_log, phase_id_for_log)
-        except Exception:
-            pass
+        if session_data is not None and session_data.meta.get('start_wall') and session_data.meta.get('end_wall'):
+            try:
+                send_email(session_data)
+            except Exception as e:
+                log_and_commit(animal_id_for_log, phase_id_for_log, e)
 
-        print()
+        if run_exc is not None:
+            if isinstance(run_exc, SystemExit):
+                code = getattr(run_exc, 'code', 0)
+
+                if code not in {0, None}:
+                    log_and_commit(animal_id_for_log, phase_id_for_log, run_exc)
+            elif isinstance(run_exc, KeyboardInterrupt):
+                print('Terminated by KeyboardInterrupt')
+            else:
+                log_and_commit(animal_id_for_log, phase_id_for_log, run_exc)
+            
+            raise run_exc
