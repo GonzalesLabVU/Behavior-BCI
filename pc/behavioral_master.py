@@ -66,6 +66,7 @@ SIDE_STREAK = 0
 
 EVT_QUEUE: "Queue[tuple[str, str]]" = Queue()
 ENC_QUEUE: "Queue[tuple[str, str]]" = Queue()
+DEV_QUEUE: "Queue[tuple[str, str, object]]" = Queue()
 
 
 # ---------------------------
@@ -88,50 +89,20 @@ def _now():
 
 
 # ---------------------------
-# PRINTING HELPERS
+# TRIAL INFO
 # ---------------------------
-def _p_line(msg):
-    global LAST_STATUS
-    LAST_STATUS = msg
+INFO_HEADER = "   TRIAL   |    AVG_DT    |    N_HIT    |    N_MISS    |     RATE"
+INFO_HLINE  = "----------------------------------------------------------------------"
 
-    sys.stdout.write("\r" + msg)
-    sys.stdout.flush()
+INFO_COL_WIDTH = (11, 14, 13, 14, 14)
+INFO_COL_PAD = [(" " * n) for n in (4, 4, 5, 6, 4)]
+INFO_HEADER_FLAG = False
 
-
-def _p_done(msg):
-    global LAST_STATUS
-    if LAST_STATUS:
-        sys.stdout.write("\n")
-        LAST_STATUS = None
-
-    print(msg, flush=True)
+INFO_WIN_SIZE = 20
 
 
-def _p_exit():
-    global LAST_STATUS
-
-    if LAST_STATUS:
-        sys.stdout.write("\r\033[2K")
-        sys.stdout.flush()
-
-        print(LAST_STATUS + '\n', flush=True)
-        LAST_STATUS = None
-
-
-# ---------------------------
-# STATUS OUTPUT
-# ---------------------------
-STATUS_HEADER = "   TRIAL   |   AVG_DT   |   N_HIT   |   N_MISS   |    RATE"
-STATUS_HLINE  = "--------------------------------------------------------------"
-
-STATUS_COL_WIDTH = (11, 12, 11, 12, 12)
-STATUS_HEADER_FLAG = False
-
-STATUS_N = 20
-
-
-def _status_cell(value, width):
-    entry = "   " + str(value)
+def _status_cell(value, pad, width):
+    entry = pad + str(value)
 
     if len(entry) < width:
         entry = entry + (" " * (width - len(entry)))
@@ -141,15 +112,12 @@ def _status_cell(value, width):
     return entry
 
 
-def show_trial_status(trial_n, avg_dt, n_hit, n_miss):
-    global STATUS_HEADER_FLAG
+def show_trial_header():
+    print(INFO_HEADER, flush=True)
+    print(INFO_HLINE, flush=True)
 
-    if not STATUS_HEADER_FLAG:
-        print(STATUS_HEADER, flush=True)
-        print(STATUS_HLINE, flush=True)
 
-        STATUS_HEADER_FLAG = True
-    
+def show_trial_info(trial_n, avg_dt, n_hit, n_miss):
     n_total = n_hit + n_miss
     rate = ((n_hit / n_total) * 100.0) if n_total else 0.0
 
@@ -162,7 +130,7 @@ def show_trial_status(trial_n, avg_dt, n_hit, n_miss):
     row = ""
 
     for i, s in enumerate([trial_str, dt_str, hit_str, miss_str, rate_str]):
-        row += _status_cell(s, STATUS_COL_WIDTH[i]) + "|"
+        row += _status_cell(s, INFO_COL_PAD[i], INFO_COL_WIDTH[i]) + "|"
     
     row = row[:-1]
     print(row, flush=True)
@@ -595,8 +563,6 @@ LOCK_TAG = "------ LOCK ------"
 LOCK_TAG_RANGE = "A1"
 LOCK_META_RANGE = "A2:D2"
 
-LAST_STATUS = None
-
 
 def _build_meta_rows(session_data):
     _ensure_session_tracking(session_data)
@@ -755,7 +721,7 @@ class FileLock:
         attempt = 0
         created_ts = _now()
 
-        _p_line(f'Acquiring lock...[TRIES={attempt}]')
+        print('Acquiring lock...', end='\r', flush=True)
 
         def q_sheet(title):
             return "'" + title.replace("'", "''") + "'"
@@ -827,7 +793,7 @@ class FileLock:
 
         while time.monotonic() < deadline:
             attempt += 1
-            _p_line(f'Acquiring lock...[TRIES={attempt}]')
+            print(f'Acquiring lock...[TRIES={attempt}]', end='\r', flush=True)
 
             now = _now()
 
@@ -855,7 +821,7 @@ class FileLock:
                     self.wb = wb
                     self.ws = None
 
-                    _p_done('Lock acquired')
+                    print("\r\033[2KLock acquired", flush=True)
                     return self
                 
                 remaining = int(winner['expires'] or 0) - now
@@ -916,7 +882,7 @@ class FileLock:
                 self.wb = wb
                 self.ws = None
 
-                _p_done('Lock acquired')
+                print("\r\033[2KLock acquired", flush=True)
                 return self
             
             my_id = None
@@ -998,7 +964,7 @@ class FileLock:
         last_e = RuntimeError('Lock release failed')
 
         for attempt in range(retries):
-            _p_line(f'Releasing lock...[TRIES={attempt + 1}]')
+            print(f'Releasing lock...[TRIES={attempt + 1}]', end='\r', flush=True)
 
             try:
                 wb = self.client.open_by_key(self.workbook_id)
@@ -1010,17 +976,18 @@ class FileLock:
                     owner = meta['owner']
                     token = meta['token']
                 except RuntimeError:
-                    _p_done('Lock released')
+                    print("\r\033[2KLock released", flush=True)
                     return True
                 
                 try:
                     self._ensure_control(owner, token, err_msg='Lock released (not owned)')
                 except RuntimeError:
-                    _p_done('Lock released')
+                    print("\r\033[2KLock released", flush=True)
                     return True
                 
                 wb.del_worksheet(ws)
-                _p_done('Lock released')
+
+                print("\r\033[2KLock released", flush=True)
                 return True
             except Exception as e:
                 last_e = e
@@ -1077,9 +1044,9 @@ def save_data(session_data):
                 label = sheet_name.lower()
 
             if dtype != 'meta':
-                _p_done(f'Writing {label} data...')
+                print(f'Writing {label} data...', flush=True)
             else:
-                _p_done('Writing metadata...')
+                print('Writing metadata...', flush=True)
 
             if n_rows == 0:
                 continue
@@ -1129,7 +1096,8 @@ def save_data(session_data):
             lock.reset()
 
             _batch_write_cols(ws, first_row, first_col, data)
-            _p_exit()
+            print("\r\033[2K", end="", flush=True)
+
         
         return True
     except KeyboardInterrupt as e:
@@ -1182,8 +1150,8 @@ def fallback_save(session_data, exc=None):
     except Exception:
         pass
     
-    _p_exit()
-    print(f'[WARNING] Saved session data locally to {out_path.name}', flush=True)
+    print("\r\033[2K", end="", flush=True)
+    print(f"[WARNING] Saved session data locally to {out_path.name}", flush=True)
 
     return out_path
 
@@ -1312,6 +1280,216 @@ def end_session(link, msg):
 # ---------------------------
 # TOP LEVEL
 # ---------------------------
+def _dev_start(evt_queue, enc_queue, dev_queue, session_data, state, stop_evt, cursor, key_speed=50.0, trial_ms=30_000, delay_ms=3000):
+    t = Thread(target=_dev_loop,
+               args=(
+                   evt_queue,
+                   enc_queue,
+                   dev_queue,
+                   session_data,
+                   state,
+                   stop_evt,
+                   cursor,
+                   float(key_speed),
+                   int(trial_ms),
+                   int(delay_ms)
+                   ),
+               daemon=True)
+    t.start()
+
+    return t
+
+
+def _dev_loop(evt_queue, enc_queue, dev_queue, session_data, state, stop_evt, cursor, key_speed, trial_ms, delay_ms):
+    try:
+        import pygame as pg
+    except Exception:
+        return
+    
+    MIN_DEG = -90.0
+    MAX_DEG = +90.0
+
+    def _emit_evt(e):
+        t = _get_ts()
+
+        try:
+            evt_queue.put_nowait((t, e))
+        except Exception:
+            pass
+
+        try:
+            dev_queue.put_nowait(("EVT", t, e))
+        except Exception:
+            pass
+
+        try:
+            session_data.add_evt(t, e)
+        except Exception:
+            pass
+    
+    def _emit_enc(d):
+        t = _get_ts()
+        v = f'{d:.2f}'
+
+        try:
+            enc_queue.put_nowait((t, v))
+        except Exception:
+            pass
+
+        try:
+            session_data.add_enc(t, v)
+        except Exception:
+            pass
+
+    def _is_hit(d):
+        try:
+            th = float(getattr(cursor, 'threshold'))
+            easy_th = float(getattr(cursor, 'easy_threshold', 15.0))
+        except Exception:
+            th = 30.0
+            easy_th = 15.0
+        
+        try:
+            from cursor_utils import TRIAL_CONFIG, TRIAL_LOCK
+
+            with TRIAL_LOCK:
+                is_easy, alignment = TRIAL_CONFIG
+        except Exception:
+            is_easy, alignment = (False, "B")
+        
+        alignment = (alignment or "B").upper()
+        if alignment not in {"L", "R", "B"}:
+            alignment = "B"
+        
+        T = easy_th if bool(is_easy) else th
+
+        match alignment:
+            case "B":
+                return abs(d) >= abs(T)
+            case "L":
+                return d <= -abs(T)
+            case "R":
+                return d >= +abs(T)
+            case _:
+                return False
+    
+    def _is_miss(d):
+        try:
+            th = float(getattr(cursor, 'threshold'))
+            easy_th = float(getattr(cursor, 'easy_threshold', 15.0))
+        except Exception:
+            th = 30.0
+            easy_th = 15.0
+        
+        try:
+            from cursor_utils import TRIAL_CONFIG, TRIAL_LOCK
+
+            with TRIAL_LOCK:
+                is_easy, alignment = TRIAL_CONFIG
+        except Exception:
+            is_easy, alignment = (False, "B")
+        
+        alignment = (alignment or "B").upper()
+        if alignment not in {"L", "R", "B"}:
+            alignment = "B"
+        
+        T = easy_th if bool(is_easy) else th
+
+        match alignment:
+            case "L":
+                return d >= +abs(T)
+            case "R":
+                return d <= -abs(T)
+            case _:
+                return False
+
+    def _now_ms():
+        return int(time.time() * 1000)
+   
+    try:
+        if not pg.get_init():
+            pg.init()
+    except Exception:
+        pass
+
+    deg = 0.0
+    last_t = time.time()
+
+    trial_active = False
+    trial_start_ms = None
+    outcome_sent = False
+    next_cue_ms = _now_ms()
+
+    state['trial_active'] = False
+
+    while not stop_evt.is_set():
+        now_s = time.time()
+        dt = max(0.0, now_s - last_t)
+        last_t = now_s
+
+        try:
+            pg.event.pump()
+        except Exception:
+            pass
+
+        now_ms = _now_ms()
+
+        if (not trial_active) and (now_ms >= next_cue_ms):
+            trial_active = True
+            state['trial_active'] = True
+
+            trial_start_ms = now_ms
+            outcome_sent = False
+            deg = 0.0
+
+            _emit_evt("cue")
+        
+        if not trial_active:
+            time.sleep(0.01)
+            continue
+
+        try:
+            keys = pg.key.get_pressed() if pg.get_init() else None
+        except Exception:
+            keys = None
+        
+        if keys:
+            dx = 0.0
+
+            if keys[pg.K_LEFT]:
+                dx -= key_speed * dt
+            if keys[pg.K_RIGHT]:
+                dx += key_speed * dt
+            
+            if dx:
+                deg = max(MIN_DEG, min(MAX_DEG, deg + dx))
+        
+        _emit_enc(deg)
+
+        elapsed_ms = 0 if trial_start_ms is None else max(0, now_ms - trial_start_ms)
+        hit = _is_hit(deg)
+        miss = _is_miss(deg)
+        timeout = elapsed_ms >= int(trial_ms)
+
+        if (not outcome_sent) and (hit or miss or timeout):
+            outcome_sent = True
+
+            if hit:
+                _emit_evt("hit")
+            if miss or timeout:
+                _emit_evt("miss")
+
+            trial_active = False
+            state['trial_active'] = False
+
+            trial_start_ms = None
+            deg = 0.0
+
+            next_cue_ms = _now_ms() + int(delay_ms)
+        
+        time.sleep(0.003)
+
+
 def setup():
     port = find_arduino_port()
     if not port:
@@ -1329,23 +1507,36 @@ def setup():
         
         print(f"Connected to {port} port\n", flush=True)
         try:
-            animal_raw = input("Animal ID:  ").strip().upper()
+            print("Animal ID:  ", end="", flush=True)
+
+            animal_raw = sys.stdin.readline()
+            if animal_raw == "":
+                raise EOFError
+            
+            animal_raw = animal_raw.rstrip("\n").upper()
         except KeyboardInterrupt:
             print('\n\nTerminated by KeyboardInterrupt')
             raise
 
-        animal_id = animal_raw if animal_raw else "DEV"
+        if not animal_raw:
+            sys.stdout.write('\x1b[1A')
+            sys.stdout.write('\x1b[2K')
+            sys.stdout.write('Animal ID:  DEV\n')
+            sys.stdout.flush()
+            
+            animal_id = "DEV"
+        else:
+            animal_id = animal_raw
+
         dev_mode = (animal_id == "DEV")
         workbook_id = None
 
-        if dev_mode:
-            print("\nDEV MODE\n")
-        else:
+        if not dev_mode:
             validate_resources()
             animal_map = load_animal_map()
             validate_animal(animal_id, animal_map)
 
-            workbook_id = _get_workbook_id(animal_id, animal_map)
+            workbook_id = _get_workbook_id(animal_id, animal_map)            
 
         valid_phases = {"1", "2"} | set(PHASE_CONFIG.keys())
 
@@ -1438,16 +1629,26 @@ def main(link, session_data, cursor, dev_mode):
     last_outcome = None
 
     trial_start_t = None
-    recent_dt = deque(maxlen=STATUS_N)
-    recent_outcomes = deque(maxlen=STATUS_N)
+    recent_dt = deque(maxlen=INFO_WIN_SIZE)
+    recent_outcomes = deque(maxlen=INFO_WIN_SIZE)
+
+    dev_stop_evt = Event()
+    dev_thread = None
+    dev_state = {'trial_active': False}
 
     started = False
     t0 = None
 
     try:
+        if dev_mode and cursor is not None:
+            dev_stop_evt.clear()
+            dev_thread = _dev_start(EVT_QUEUE, ENC_QUEUE, DEV_QUEUE, session_data, dev_state, dev_stop_evt, cursor)
+        
+        msg_q = DEV_QUEUE if (dev_mode and cursor is not None) else link.msg_q
+
         while link.ser and link.ser.is_open:
             try:
-                typ, ts, payload = link.msg_q.get(timeout=0.05)
+                typ, ts, payload = msg_q.get(timeout=0.05)
             except Empty:
                 continue
 
@@ -1455,23 +1656,30 @@ def main(link, session_data, cursor, dev_mode):
                 started = True
                 t0 = time.time()
                 session_data.meta["start_wall"] = datetime.now().isoformat(timespec="seconds")
+
                 print(f"\nSession started at {datetime.now().strftime('%I:%M %p')}", flush=True)
+                print()
+                show_trial_header()
 
             if typ == "ERR":
                 if isinstance(payload, BaseException):
+                    print()
                     raise payload
                 
-                raise RuntimeError(f"ArduinoLink reader error: {payload!r}")
+                raise RuntimeError(f"\nArduinoLink reader error: {payload!r}")
 
             if typ == "END":
                 break
 
             if typ == "EVT":
                 p = str(payload)
-                session_data.add_evt(ts, p)
+
+                if not (dev_mode and cursor is not None):
+                    session_data.add_evt(ts, p)
 
                 try:
-                    EVT_QUEUE.put_nowait((ts, p))
+                    if not (dev_mode and cursor is not None):
+                        EVT_QUEUE.put_nowait((ts, p))
                 except Exception:
                     pass
 
@@ -1479,8 +1687,11 @@ def main(link, session_data, cursor, dev_mode):
                     trial_n += 1
                     last_outcome = None
                     trial_start_t = time.time()
+                    dev_state['trial_active'] = True
                 
                 if p in {'hit', 'miss'}:
+                    dev_state['trial_active'] = False
+
                     if last_outcome == p:
                         continue
                     last_outcome = p
@@ -1494,6 +1705,8 @@ def main(link, session_data, cursor, dev_mode):
                     n_hit = sum(1 for o in recent_outcomes if o == 'hit')
                     n_miss = sum(1 for o in recent_outcomes if o == 'miss')
 
+                    show_trial_info(trial_n=trial_n, avg_dt=avg_dt, n_hit=n_hit, n_miss=n_miss)
+
                     if do_calibration:
                         trial_stack.insert(0, p)
                         if len(trial_stack) > N:
@@ -1501,7 +1714,7 @@ def main(link, session_data, cursor, dev_mode):
                         
                         if calibrated:
                             if len(trial_stack) >= N and is_early_exit(trial_stack, N):
-                                end_session(link, 'Terminated by early exit')
+                                end_session(link, '\nTerminated by early exit')
                                 session_data.meta['aborted'] = True
                                 break
                         else:
@@ -1511,18 +1724,22 @@ def main(link, session_data, cursor, dev_mode):
                                 session_data.meta['K2'] = K
                                 calibrated = True
                                 print(f'\nCalibration finished [hits={calibration_hits}/20, K={K}, N={N}]\n', flush=True)
-                    
-                    show_trial_status(trial_n=trial_n, avg_dt=avg_dt, n_hit=n_hit, n_miss=n_miss)
+                                show_trial_header()
                     
                     if cursor is not None:
                         next_trial_n = trial_n + 1
                         next_type = choose_trial_type(next_trial_n, K)
                         next_side = choose_target_side(session_data.meta['phase'])
 
-                        send_next_config(link, next_type, next_side)
-                        log_trial_config(session_data, trial_n=next_trial_n, type=next_type, side=next_side)
+                        if not dev_mode:
+                            send_next_config(link, next_type, next_side)
+                            log_trial_config(session_data, trial_n=next_trial_n, type=next_type, side=next_side)
+                        
                         cursor.update_config(next_type, next_side)
             elif typ == "ENC":
+                if dev_mode and cursor is not None:
+                    continue
+
                 p = str(payload)
                 session_data.add_enc(ts, p)
 
@@ -1532,10 +1749,17 @@ def main(link, session_data, cursor, dev_mode):
                     pass
     except KeyboardInterrupt:
         session_data.meta["aborted"] = True
-        end_session(link, "Terminated by KeyboardInterrupt")
-
+        end_session(link, "\nTerminated by KeyboardInterrupt")
         raise
     finally:
+        if dev_thread is not None:
+            dev_stop_evt.set()
+
+            try:
+                dev_thread.join(timeout=2.0)
+            except Exception:
+                pass
+
         if session_data.meta["start_wall"] is None:
             session_data.meta["start_wall"] = datetime.now().isoformat(timespec="seconds")
 
