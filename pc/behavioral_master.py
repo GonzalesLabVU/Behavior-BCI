@@ -190,7 +190,7 @@ def log_error(animal_id, phase_id, exc):
         date_str = now.strftime('%Y-%m-%d')
         time_str = now.strftime('%H:%M:%S')
 
-        client = os.getenv('USER_ID', 'UNKNOWN_USER')
+        client = os.getenv('CLIENT_ID', 'UNKNOWN_CLIENT')
         script_name = Path(__file__).name
 
         animal = str(animal_id)
@@ -1252,12 +1252,16 @@ def send_email(session_data):
 # ---------------------------
 # TERMINATION / CLEANUP
 # ---------------------------
-def is_early_exit(trial_stack, N):
+def is_early_exit(trial_stack, N, t_start, min_duration=20*60):
+    elapsed_s = 0.0 if t_start is None else max(0.0, time.time() - t_start)
+    if elapsed_s < min_duration:
+        return False
+
     if len(trial_stack) < N:
         return False
     
-    n_hits = sum(1 for x in trial_stack[:N] if x == "hit")
-    return n_hits < (N / 4)
+    n_hits = sum(1 for o in trial_stack[:N] if o == "hit")
+    return n_hits < (N // 4)
 
 
 def end_session(link, msg):
@@ -1713,7 +1717,7 @@ def main(link, session_data, cursor, dev_mode):
                             trial_stack.pop()
                         
                         if calibrated:
-                            if len(trial_stack) >= N and is_early_exit(trial_stack, N):
+                            if len(trial_stack) >= N and is_early_exit(trial_stack, N, t0):
                                 end_session(link, '\nTerminated by early exit')
                                 session_data.meta['aborted'] = True
                                 break
