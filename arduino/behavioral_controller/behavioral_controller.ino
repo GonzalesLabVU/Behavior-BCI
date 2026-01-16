@@ -19,13 +19,10 @@
 
 // unit conversion handles
 
-constexpr unsigned long SECONDS(float s) {
-    return (unsigned long)(s * 1000.0f);
-}
-constexpr unsigned long MINUTES(float m) {
-    return (unsigned long)(m * 60.0f * 1000.0f);
-}
-
+template <typename T>
+constexpr unsigned long SECONDS(T s) { return static_cast<unsigned long>(s * 1000.0f); }
+template <typename T>
+constexpr unsigned long MINUTES(T m) { return static_cast<unsigned long>(m * 60.0f * 1000.0f); }
 template <typename T>
 constexpr float DEGREES(T d) { return static_cast<float>(d); }
 
@@ -68,6 +65,8 @@ unsigned long session_T;
 unsigned long trial_T;
 unsigned long delay_T;
 unsigned long tone_T = SECONDS(1);
+unsigned long blink_T = SECONDS(0.05);
+unsigned long wait_T = SECONDS(2.5);
 
 float easy_threshold = DEGREES(15);
 float threshold;
@@ -88,6 +87,28 @@ void run_phase_2();
 void run_phase_3_plus();
 
 // helper functions
+void blink(unsigned long blink_ms, unsigned long wait_ms) {
+    static unsigned long t0 = 0;
+    static bool led_on = false;
+
+    unsigned long now = millis();
+
+    if (led_on) {
+        if (now - t0 >= blink_ms) {
+            digitalWrite(LED_BUILTIN, LOW);
+            
+            led_on = false;
+            t0 = now;
+        }
+    } else {
+        if (now - t0 >= wait_ms - blink_ms) {
+            digitalWrite(LED_BUILTIN, HIGH);
+
+            led_on = true;
+            t0 = now;
+        }
+    }
+}
 
 inline bool nearMultiple(float x, float step, float tol, float* nearestOut) {
     float q = roundf(x / step);
@@ -254,13 +275,16 @@ static void waitForInitConfig() {
 }
 
 // main
-
 void setup() {
-    // power, serial, RNG initialization
+    // power, status LED, serial, and RNG initialization
     pinMode(POWER_EN, OUTPUT);
     digitalWrite(POWER_EN, LOW);
 
+    pinMode(LED_BUILTIN, OUTPUT);
+    digitalWrite(LED_BUILTIN, LOW);
+
     Serial.begin(BAUDRATE);
+
     randomSeed(analogRead(SEED_PIN));
 
     // block until host sends phase ID and initial trial config
@@ -358,6 +382,7 @@ void setup() {
 
 void loop() {
     drainSerial();
+    blink(blink_T, wait_T);
 
     switch (session_state) {
         case SessionState::MAIN: {
