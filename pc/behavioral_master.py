@@ -94,7 +94,7 @@ def _now():
 # ---------------------------
 # TRIAL INFO
 # ---------------------------
-INFO_HEADER = "   TRIAL   |    AVG_DT    |    N_HIT    |    N_MISS    |     RATE"
+INFO_HEADER = "   TRIAL   |   DURATION   |    N_HIT    |    N_MISS    |     RATE"
 INFO_HLINE  = "----------------------------------------------------------------------"
 
 INFO_COL_WIDTH = (11, 14, 13, 14, 14)
