@@ -664,7 +664,7 @@ LOCK_META_RANGE = "A2:D2"
 def _build_meta_rows(session_data):
     _ensure_session_tracking(session_data)
 
-    client_id = os.getenv('CLIENT_ID')
+    client_id = str(os.getenv('CLIENT_ID'))
 
     cfg = session_data.meta.get('trial_config', []) or []
     easy_trials = [c['trial'] for c in cfg if c.get('is_easy') is True]
@@ -1824,8 +1824,8 @@ def main(link, session_data, cursor, dev_mode):
     last_outcome = None
 
     trial_start_t = None
-    recent_dt = deque(maxlen=INFO_WIN_SIZE)
-    recent_outcomes = deque(maxlen=INFO_WIN_SIZE)
+    trial_dt = 0.0
+    recent_outcomes = deque()
 
     dev_stop_evt = Event()
     dev_thread = None
@@ -1891,16 +1891,13 @@ def main(link, session_data, cursor, dev_mode):
                         continue
                     last_outcome = p
 
-                    dt = 0.0 if trial_start_t is None else max(0.0, time.time() - trial_start_t)                    
-                    recent_dt.append(dt)
-                    avg_dt = (sum(recent_dt) / len(recent_dt)) if recent_dt else 0.0
-
+                    trial_dt = 0.0 if trial_start_t is None else max(0.0, time.time() - trial_start_t)
                     recent_outcomes.append(p)
 
                     n_hit = sum(1 for o in recent_outcomes if o == 'hit')
                     n_miss = sum(1 for o in recent_outcomes if o == 'miss')
 
-                    show_trial_info(trial_n=trial_n, avg_dt=avg_dt, n_hit=n_hit, n_miss=n_miss)
+                    show_trial_info(trial_n=trial_n, avg_dt=trial_dt, n_hit=n_hit, n_miss=n_miss)
 
                     if do_calibration:
                         trial_stack.insert(0, p)
