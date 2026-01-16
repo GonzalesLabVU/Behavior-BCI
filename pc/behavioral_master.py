@@ -47,6 +47,8 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 ANIMAL_MAP_PATH = SCRIPT_DIR / "animal_map.json"
 ERROR_LOG_PATH = SCRIPT_DIR / "errors.log"
 
+load_dotenv(SCRIPT_DIR / ".env")
+
 BAUDRATE = 1_000_000
 EARLY_END_STRING = "E"
 SESSION_END_STRING = "S"
@@ -359,8 +361,6 @@ def print_stack():
 # RESOURCE LOADING
 # ---------------------------
 def _require_env(name):
-    load_dotenv()
-
     v = os.getenv(name)
     if not v:
         raise RuntimeError(f'{name} not found in .env')
@@ -395,8 +395,6 @@ def validate_resources():
     creds_file = SCRIPT_DIR / 'credentials.json'
     if not creds_file.exists():
         raise FileNotFoundError('credentials.json not found in the script directory')
-
-    load_dotenv(SCRIPT_DIR / ".env")
 
 
 # ---------------------------
@@ -666,6 +664,8 @@ LOCK_META_RANGE = "A2:D2"
 def _build_meta_rows(session_data):
     _ensure_session_tracking(session_data)
 
+    client_id = os.getenv('CLIENT_ID')
+
     cfg = session_data.meta.get('trial_config', []) or []
     easy_trials = [c['trial'] for c in cfg if c.get('is_easy') is True]
     normal_trials = [c['trial'] for c in cfg if c.get('is_easy') is False]
@@ -675,7 +675,7 @@ def _build_meta_rows(session_data):
     both_targets = [c['trial'] for c in cfg if c.get('side') == "B"]
 
     meta_pairs = [
-        ('client', os.getenv('CLIENT_ID')),
+        ('client', client_id),
         ('K1', session_data.meta.get('K1', 5)),
         ('K2', session_data.meta.get('K2', None)),
         ('easy_trials', easy_trials),
@@ -918,7 +918,7 @@ class FileLock:
 
         while time.monotonic() < deadline:
             attempt += 1
-            print(f'Acquiring lock...[TRIES={attempt}]', end='\r', flush=True)
+            print(f'Acquiring lock...[TRIES={attempt}]', flush=True)
 
             now = _now()
 
@@ -1086,10 +1086,10 @@ class FileLock:
         return int(self.expires or 0) - _now()
 
     def release(self, retries=5):
-        last_e = RuntimeError('Lock release failed')
+        last_e = RuntimeError('Lock release failed\n')
 
         for attempt in range(retries):
-            print(f'Releasing lock...[TRIES={attempt + 1}]', end='\r', flush=True)
+            print(f'Releasing lock...[TRIES={attempt + 1}]', flush=True)
 
             try:
                 wb = self.client.open_by_key(self.workbook_id)
@@ -1105,14 +1105,14 @@ class FileLock:
                     return True
                 
                 try:
-                    self._ensure_control(owner, token, err_msg='Lock released (not owned)')
+                    self._ensure_control(owner, token, err_msg='Lock released (not owned)\n')
                 except RuntimeError:
-                    print("\r\033[2KLock released", flush=True)
+                    print("\r\033[2KLock released\n", flush=True)
                     return True
                 
                 wb.del_worksheet(ws)
 
-                print("\r\033[2KLock released", flush=True)
+                print("\r\033[2KLock released\n", flush=True)
                 return True
             except Exception as e:
                 last_e = e
@@ -1976,7 +1976,7 @@ def main(link, session_data, cursor, dev_mode):
 
 
 if __name__ == "__main__":
-    cmd_run('cls', 'echo.')
+    cmd_run('echo.')
 
     link = None
     session_data = None
@@ -2027,7 +2027,7 @@ if __name__ == "__main__":
                 
                 if not dev_mode:
                     log_and_commit(animal_id_for_log, phase_id_for_log, e)
-        
+
         if session_data is not None and session_data.meta.get('start_wall') and session_data.meta.get('end_wall'):
             try:
                 send_email(session_data)
