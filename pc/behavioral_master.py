@@ -67,6 +67,7 @@ SIDE_STREAK = 0
 EVT_QUEUE: "Queue[tuple[str, str]]" = Queue()
 ENC_QUEUE: "Queue[tuple[str, str]]" = Queue()
 DEV_QUEUE: "Queue[tuple[str, str, object]]" = Queue()
+EXC_STACK: "deque[dict[str, object]]" = deque()
 
 
 # ---------------------------
@@ -144,22 +145,13 @@ REPO_BRANCH = "main"
 REPO_REL_PATH = Path("pc") / "config" / "errors.log"
 
 ERROR_LOGGED = False
+LOG_COMMIT_FAIL = False
 
 
 def _ensure_session_tracking(session_data):
     session_data.meta.setdefault('trial_config', [])
     session_data.meta.setdefault('K1', 5)
     session_data.meta.setdefault('K2', None)
-
-
-def log_trial_config(session_data, trial_n, type, side):
-    _ensure_session_tracking(session_data)
-
-    session_data.meta['trial_config'].append({
-        'trial': int(trial_n),
-        'is_easy': bool(type),
-        'side': str(side)
-        })
 
 
 def time_this(fcn):
@@ -179,6 +171,21 @@ def time_this(fcn):
         return result
     
     return wrapper
+
+
+def cmd_run(*args):
+    cmd = " & ".join(args)
+    os.system(cmd)
+
+
+def log_trial_config(session_data, trial_n, type, side):
+    _ensure_session_tracking(session_data)
+
+    session_data.meta['trial_config'].append({
+        'trial': int(trial_n),
+        'is_easy': bool(type),
+        'side': str(side)
+        })
 
 
 def log_error(animal_id, phase_id, exc):
@@ -225,6 +232,7 @@ def log_error(animal_id, phase_id, exc):
 
 def commit_error_log(animal_id='UNKNOWN', phase_id='0'):
     global ERROR_LOGGED
+    global LOG_COMMIT_FAIL
 
     if not ERROR_LOGGED:
         return False
@@ -281,7 +289,10 @@ def commit_error_log(animal_id='UNKNOWN', phase_id='0'):
 
             return True
     except Exception as e:
-        print(f'[WARNING] Failed to commit errors.log: {type(e).__name__}', flush=True)
+        if not LOG_COMMIT_FAIL:
+            LOG_COMMIT_FAIL = True
+            print(f'[WARNING] Failed to commit errors.log: {type(e).__name__}', flush=True)
+        
         return False
 
 
@@ -298,10 +309,58 @@ def log_and_commit(animal_id, phase_id, exc):
             pass
 
 
+def cache_exc(exc, caller_name):
+    EXC_STACK.append({
+        "type": type(exc).__name__,
+        "caller": caller_name,
+        "exc": exc
+        })
+
+
+def print_summary(session_data):
+    if not session_data:
+        return
+    
+    dur = session_data.meta.get('duration_sec')
+    if dur is None:
+        return
+    
+    m, s = divmod(int(max(0, dur)), 60)
+
+    print(f'\nSession duration: {m}:{s:02d}\n', flush=True)
+
+
+def print_exc(exc):
+    tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    print(f'\n{tb}', flush=True)
+
+
+def print_stack():
+    if not EXC_STACK:
+        cmd_run('echo.')
+        print('[Process exited with code 0]\n')
+        return
+    
+    hline_head = (50 * "=")
+    print(hline_head + "\nEXCEPTION STACK (in order of occurrence):\n" + hline_head, flush=True)
+
+    hline_exc = (50 * "-")
+
+    for i, info in enumerate(EXC_STACK, start=1):
+        print(f"\n[{i}] {info['type']} in {info['caller']}:", flush=True)
+        print_exc(info['exc'])
+        print(hline_exc, flush=True)
+            
+    
+    print('\n[Process exited with code 1]\n')
+
+
 # ---------------------------
 # RESOURCE LOADING
 # ---------------------------
 def _require_env(name):
+    load_dotenv()
+
     v = os.getenv(name)
     if not v:
         raise RuntimeError(f'{name} not found in .env')
@@ -1291,7 +1350,7 @@ def _format_body(date, t_start, t_stop, dur_s, evt):
     date_str = datetime.strptime(date, '%m/%d/%Y').strftime('%b-%d')
 
     m, s = divmod(int(dur_s or 0), 60)
-    t_elapsed = f'{m}:{s:02d}'
+    t_elapsed = f"{m}m {s}s"
 
     n_hits = sum(1 for e in evt['values'] if e == 'hit')
     n_total = sum(1 for e in evt['values'] if e == 'cue')
@@ -1314,7 +1373,7 @@ def _format_body(date, t_start, t_stop, dur_s, evt):
         if not label and not value:
             out.append("")
         else:
-            out.append(f"{label + ':':<{width + 1}}  {value}")
+            out.append(f"{label:<13}{value:>13}")
     
     return "\n".join(out)
 
@@ -1351,11 +1410,17 @@ def send_email(session_data):
     msg['From'] = smtp_username
     msg['To'] = to_addr
     msg['Subject'] = subject
+
+    import html
     msg.set_content(body)
+    msg.add_alternative(
+        f"<pre style=\"font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace;\">"
+        f"{html.escape(body)}"
+        f"</pre>",
+        subtype="html",
+        )
 
     try:
-        print('Notifying users of session completion...', end='\r', flush=True)
-
         with smtplib.SMTP(SMTP_SERVER, SMTP_PORT, timeout=30) as server:
             server.ehlo()
             server.starttls()
@@ -1363,14 +1428,12 @@ def send_email(session_data):
 
             server.login(smtp_username, smtp_password)
             server.send_message(msg)
-        
-        print('Notifying users of session completion...done')
     except Exception:
         raise
 
 
 # ---------------------------
-# TERMINATION / CLEANUP
+# EXIT
 # ---------------------------
 def is_early_exit(trial_stack, N, t_start, min_duration=20*60):
     elapsed_s = 0.0 if t_start is None else max(0.0, time.time() - t_start)
@@ -1384,19 +1447,25 @@ def is_early_exit(trial_stack, N, t_start, min_duration=20*60):
     return n_hits < (N // 4)
 
 
-def end_session(link, msg):
+def cleanup(link, msg, timeout=2.0):
     try:
-        link.send_and_wait(EARLY_END_STRING, timeout=2.0)
-        deadline = time.time() + 2.0
+        try:
+            link.send(EARLY_END_STRING)
+        except Exception:
+            pass
 
+        deadline = time.time() + timeout
         while time.time() < deadline:
             try:
                 typ, _, _ = link.msg_q.get(timeout=0.05)
+
                 if typ == "END":
-                    print(f"{msg}", flush=True)
+                    print(f'{msg}', flush=True)
                     return
             except Empty:
                 pass
+        
+        print(f'{msg}', flush=True)
     finally:
         link.close()
 
@@ -1706,7 +1775,7 @@ def setup():
                          evt_queue=EVT_QUEUE,
                          enc_queue=ENC_QUEUE,
                          display_idx=1,
-                         fullscreen=True,
+                         fullscreen=False,
                          easy_threshold=15.0)
             
             cursor.update_config(type_1, side_1)
@@ -1726,17 +1795,19 @@ def setup():
             log_trial_config(session_data, trial_n=1, type=type_1, side=side_1)
 
         return link, session_data, cursor, dev_mode
-    except Exception:
+    except Exception as e:
+        cache_exc(e, 'setup')
+
         if link is not None:
             try:
                 link.close()
-            except Exception:
-                pass
+            except Exception as close_exc:
+                cache_exc(close_exc, 'setup.cleanup')
         elif ser is not None:
             try:
                 ser.close()
-            except Exception:
-                pass
+            except Exception as close_exc:
+                cache_exc(close_exc, 'setup.cleanup')
         
         raise
 
@@ -1782,12 +1853,12 @@ def main(link, session_data, cursor, dev_mode):
                 session_data.meta["start_wall"] = datetime.now().isoformat(timespec="seconds")
 
                 print(f"\nSession started at {datetime.now().strftime('%I:%M %p')}", flush=True)
-                print()
+                cmd_run('echo.')
                 show_trial_header()
 
             if typ == "ERR":
                 if isinstance(payload, BaseException):
-                    print()
+                    cmd_run('echo.')
                     raise payload
                 
                 raise RuntimeError(f"\nArduinoLink reader error: {payload!r}")
@@ -1838,7 +1909,7 @@ def main(link, session_data, cursor, dev_mode):
                         
                         if calibrated:
                             if len(trial_stack) >= N and is_early_exit(trial_stack, N, t0):
-                                end_session(link, '\nTerminated by early exit')
+                                cleanup(link, '\nTerminated by early exit')
                                 session_data.meta['aborted'] = True
                                 break
                         else:
@@ -1879,8 +1950,10 @@ def main(link, session_data, cursor, dev_mode):
                     pass  
     except KeyboardInterrupt:
         session_data.meta["aborted"] = True
-        end_session(link, "\nTerminated by KeyboardInterrupt")
+        cleanup(link, "\nTerminated by KeyboardInterrupt")
         raise
+    except Exception as e:
+        cache_exc(e, 'main')
     finally:
         if dev_thread is not None:
             dev_stop_evt.set()
@@ -1900,11 +1973,11 @@ def main(link, session_data, cursor, dev_mode):
 
         dt = int(max(0, time.time() - t0))
         session_data.meta["duration_sec"] = dt
-        m, s = divmod(dt, 60)
-        print(f"Session duration: {m}:{s:02d}", flush=True)
 
 
 if __name__ == "__main__":
+    cmd_run('cls', 'echo.')
+
     link = None
     session_data = None
     cursor = None
@@ -1914,8 +1987,6 @@ if __name__ == "__main__":
     phase_id_for_log = "0"
 
     run_exc = None
-
-    print()
 
     try:
         link, session_data, cursor, dev_mode = setup()
@@ -1927,41 +1998,87 @@ if __name__ == "__main__":
         main(link, session_data, cursor, dev_mode)
     except BaseException as e:
         run_exc = e
+        cache_exc(e, '__main__')
     finally:
-        if (session_data is not None) and (not dev_mode) and session_data.any_data():
-            print()
+        print_summary(session_data)
 
-            ok = safe_save(session_data)
-            if not ok:
-                print('[WARNING] Google Sheets save failed (local fallback may have been used)', flush=True)
-        
+        if (session_data is not None) and (not dev_mode) and session_data.any_data():
+            try:
+                ok = safe_save(session_data)
+                if not ok:
+                    print('[WARNING] Google Sheets save failed (local fallback used instead)', flush=True)
+            except Exception as e:
+                cache_exc(e, '__main__.safe_save')
+
         if cursor is not None:
             try:
                 cursor.stop()
             except Exception as e:
-                log_and_commit(animal_id_for_log, phase_id_for_log, e)
+                cache_exc(e, '__main__.cursor_stop')
+
+                if not dev_mode:
+                    log_and_commit(animal_id_for_log, phase_id_for_log, e)
         
         if link is not None:
             try:
                 link.close()
             except Exception as e:
-                log_and_commit(animal_id_for_log, phase_id_for_log, e)
+                cache_exc(e, '__main__.link_close')
+                
+                if not dev_mode:
+                    log_and_commit(animal_id_for_log, phase_id_for_log, e)
         
         if session_data is not None and session_data.meta.get('start_wall') and session_data.meta.get('end_wall'):
             try:
                 send_email(session_data)
             except Exception as e:
-                log_and_commit(animal_id_for_log, phase_id_for_log, e)
-
-        if run_exc is not None:
+                cache_exc(e, '__main__.send_email')
+                
+                if not dev_mode:
+                    log_and_commit(animal_id_for_log, phase_id_for_log, e)
+        
+        if not dev_mode and run_exc is not None:
             if isinstance(run_exc, SystemExit):
                 code = getattr(run_exc, 'code', 0)
-
                 if code not in {0, None}:
                     log_and_commit(animal_id_for_log, phase_id_for_log, run_exc)
-            elif isinstance(run_exc, KeyboardInterrupt):
-                print('Terminated by KeyboardInterrupt')
-            else:
+            elif not isinstance(run_exc, KeyboardInterrupt):
                 log_and_commit(animal_id_for_log, phase_id_for_log, run_exc)
-            
-            raise run_exc
+        
+        print_stack()
+
+        # if (session_data is not None) and (not dev_mode) and session_data.any_data():
+        #     ok = safe_save(session_data)
+        #     if not ok:
+        #         print('[WARNING] Google Sheets save failed (local fallback may have been used)', flush=True)
+        
+        # if cursor is not None:
+        #     try:
+        #         cursor.stop()
+        #     except Exception as e:
+        #         log_and_commit(animal_id_for_log, phase_id_for_log, e)
+        
+        # if link is not None:
+        #     try:
+        #         link.close()
+        #     except Exception as e:
+        #         log_and_commit(animal_id_for_log, phase_id_for_log, e)
+        
+        # if session_data is not None and session_data.meta.get('start_wall') and session_data.meta.get('end_wall'):
+        #     try:
+        #         send_email(session_data)
+        #     except Exception as e:
+        #         log_and_commit(animal_id_for_log, phase_id_for_log, e)
+
+        # if run_exc is not None:
+        #     if isinstance(run_exc, SystemExit):
+        #         code = getattr(run_exc, 'code', 0)
+
+        #         if code not in {0, None}:
+        #             log_and_commit(animal_id_for_log, phase_id_for_log, run_exc)
+        #     elif isinstance(run_exc, KeyboardInterrupt):
+        #         pass
+        #     else:
+        #         log_and_commit(animal_id_for_log, phase_id_for_log, run_exc)
+
+        #     print_exc(run_exc)
