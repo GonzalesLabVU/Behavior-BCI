@@ -10,99 +10,107 @@ echo Getting script directory...
 set "SCRIPT_DIR=%~dp0"
 cd /d "%SCRIPT_DIR%"
 
-echo Making sure pip is up to date...
-python -m pip install --upgrade pip -q
+set "DO_UPDATE=Y"
+set /p "DO_UPDATE=Update local files? [Y/n]: "
+if not defined DO_UPDATE set "DO_UPDATE=Y"
 
-echo Verifying git installation...
-where git >nul 2>&1
-if errorlevel 1 (
-    echo.
-    echo Git not found, attempting to install...
+if /i "%DO_UPDATE%"=="Y" (
+    echo Making sure pip is up to date...
+    python -m pip install --upgrade pip -q
 
-    where winget >nul 2>&1
-    if not errorlevel 1 (
-        winget install --id Git.Git -e --source winget --accept-package-agreements --accept-source-agreements >nul 2>&1
-    )
-
+    echo Verifying git installation...
     where git >nul 2>&1
     if errorlevel 1 (
-        where choco >nul 2>&1
+        echo.
+        echo Git not found, attempting to install...
+
+        where winget >nul 2>&1
         if not errorlevel 1 (
-            choco install git -y >nul 2>&1
+            winget install --id Git.Git -e --source winget --accept-package-agreements --accept-source-agreements >nul 2>&1
+        )
+
+        where git >nul 2>&1
+        if errorlevel 1 (
+            where choco >nul 2>&1
+            if not errorlevel 1 (
+                choco install git -y >nul 2>&1
+            )
+        )
+
+        where git >nul 2>&1
+        if errorlevel 1 (
+            powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+                "$ErrorActionPreference='Stop';" ^
+                "$u='https://github.com/git-for-windows/git/releases/latest/download/Git-64-bit.exe';" ^
+                "$o=Join-Path $env:TEMP 'Git-64-bit.exe';" ^
+                "Invoke-WebRequest -Uri $u -OutFile $o -UseBasicParsing;" ^
+                "Start-Process -FilePath $o -ArgumentList '/VERYSILENT','/NORESTART','/SUPPRESSMSGBOXES' -Wait;"
+        )
+
+        if exist "%ProgramFiles%\Git\cmd\git.exe" set "PATH=%ProgramFiles%\Git\cmd;%PATH%"
+        if exist "%ProgramFiles(x86)%\Git\cmd\git.exe" set "PATH=%ProgramFiles(x86)%\Git\cmd;%PATH%"
+
+        where git >nul 2>&1
+        if errorlevel 1 (
+            call :kill "Git installation failed or git.exe not on PATH"
+        ) else (
+            for /f "delims=" %%v in ('git --version 2^>nul') do echo %%v
         )
     )
 
-    where git >nul 2>&1
+    echo Verifying arduino-cli installation...
+    where arduino-cli >nul 2>&1
     if errorlevel 1 (
-        powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-            "$ErrorActionPreference='Stop';" ^
-            "$u='https://github.com/git-for-windows/git/releases/latest/download/Git-64-bit.exe';" ^
-            "$o=Join-Path $env:TEMP 'Git-64-bit.exe';" ^
-            "Invoke-WebRequest -Uri $u -OutFile $o -UseBasicParsing;" ^
-            "Start-Process -FilePath $o -ArgumentList '/VERYSILENT','/NORESTART','/SUPPRESSMSGBOXES' -Wait;"
+        echo [WARNING] arduino-cli not found on path
+        echo Installing arduino-cli...
+        where winget >nul 2>&1 || call :kill "winget not found; install arduino-cli manually"
+        winget install --id ArduinoSA.CLI -e --source winget --accept-package-agreements --accept-source-agreements >nul 2>&1
     )
 
-    if exist "%ProgramFiles%\Git\cmd\git.exe" set "PATH=%ProgramFiles%\Git\cmd;%PATH%"
-    if exist "%ProgramFiles(x86)%\Git\cmd\git.exe" set "PATH=%ProgramFiles(x86)%\Git\cmd;%PATH%"
-
-    where git >nul 2>&1
+    where arduino-cli >nul 2>&1
     if errorlevel 1 (
-        call :kill "Git installation failed or git.exe not on PATH"
-    ) else (
-        for /f "delims=" %%v in ('git --version 2^>nul') do echo %%v
+        if exist "%LocalAppData%\Programs\Arduino CLI\arduino-cli.exe" set "PATH=%LocalAppData%\Programs\Arduino CLI;%PATH%"
+        if exist "%ProgramFiles%\Arduino CLI\arduino-cli.exe" set "PATH=%ProgramFiles%\Arduino CLI;%PATH%"
     )
+    where arduino-cli >nul 2>&1 || call :kill "arduino-cli install successful but arduino-cli.exe not found on PATH"
+
+    arduino-cli config init >nul 2>&1
+    arduino-cli core update-index >nul 2>&1
+    arduino-cli core list | findstr /i "arduino:avr" >nul 2>&1 || arduino-cli core install arduino:avr >nul 2>&1
+
+    echo Installing required Arduino libraries...
+    arduino-cli lib install Servo >nul 2>&1
+
+    arduino-cli version >nul 2>&1
+    if errorlevel 1 call :kill "arduino-cli is present but not runnable"
+
+    echo Downloading latest file versions...
+    call :pullFile "https://github.com/GonzalesLabVU/Behavior-BCI/blob/main/pc/behavioral_master.py" || call :kill "pullFile subroutine failed for behavioral_master.py"
+    call :pullFile "https://github.com/GonzalesLabVU/Behavior-BCI/blob/main/pc/cursor_utils.py" || call :kill "pullFile failed for cursor_utils.py"
+    call :pullFile "https://github.com/GonzalesLabVU/Behavior-BCI/blob/main/pc/plot_utils.py" || call :kill "pullFile failed for plot_utils.py"
+    call :pullFile "https://github.com/GonzalesLabVU/Behavior-BCI/blob/main/pc/config/animal_map.json" || call :kill "pullFile failed for animal_map.json"
+    call :pullFile "https://github.com/GonzalesLabVU/Behavior-BCI/blob/main/pc/config/requirements.txt" || call :kill "pullFile failed for requirements.txt"
+    call :pullFile "https://github.com/GonzalesLabVU/Behavior-BCI/blob/main/pc/config/errors.log" || call :kill "pullFile failed for errors.log"
+    call :pullFolder "https://github.com/GonzalesLabVU/Behavior-BCI/tree/main/arduino/behavioral_controller" || call :kill "pullFolder subroutine failed for behavioral_controller\"
+
+    call :sleep 1
+
+    echo Installing required dependencies...
+    if not exist "requirements.txt" (
+        echo requirements.txt not found in %SCRIPT_DIR%
+        exit /b 1
+    )
+    python -m pip install -r requirements.txt -q || exit /b 1
 )
-
-echo Verifying arduino-cli installation...
-where arduino-cli >nul 2>&1
-if errorlevel 1 (
-    echo [WARNING] arduino-cli not found on path
-    echo Installing arduino-cli...
-    where winget >nul 2>&1 || call :kill "winget not found; install arduino-cli manually"
-    winget install --id ArduinoSA.CLI -e --source winget --accept-package-agreements --accept-source-agreements >nul 2>&1
-)
-
-where arduino-cli >nul 2>&1
-if errorlevel 1 (
-    if exist "%LocalAppData%\Programs\Arduino CLI\arduino-cli.exe" set "PATH=%LocalAppData%\Programs\Arduino CLI;%PATH%"
-    if exist "%ProgramFiles%\Arduino CLI\arduino-cli.exe" set "PATH=%ProgramFiles%\Arduino CLI;%PATH%"
-)
-where arduino-cli >nul 2>&1 || call :kill "arduino-cli install successful but arduino-cli.exe not found on PATH"
-
-arduino-cli config init >nul 2>&1
-arduino-cli core update-index >nul 2>&1
-arduino-cli core list | findstr /i "arduino:avr" >nul 2>&1 || arduino-cli core install arduino:avr >nul 2>&1
-
-echo Installing required Arduino libraries...
-arduino-cli lib install Servo >nul 2>&1
-
-arduino-cli version >nul 2>&1
-if errorlevel 1 call :kill "arduino-cli is present but not runnable"
-
-echo Downloading latest file versions...
-call :pullFile "https://github.com/GonzalesLabVU/Behavior-BCI/blob/main/pc/behavioral_master.py" || call :kill "pullFile subroutine failed for behavioral_master.py"
-call :pullFile "https://github.com/GonzalesLabVU/Behavior-BCI/blob/main/pc/cursor_utils.py" || call :kill "pullFile failed for cursor_utils.py"
-call :pullFile "https://github.com/GonzalesLabVU/Behavior-BCI/blob/main/pc/plot_utils.py" || call :kill "pullFile failed for plot_utils.py"
-call :pullFile "https://github.com/GonzalesLabVU/Behavior-BCI/blob/main/pc/config/animal_map.json" || call :kill "pullFile failed for animal_map.json"
-call :pullFile "https://github.com/GonzalesLabVU/Behavior-BCI/blob/main/pc/config/requirements.txt" || call :kill "pullFile failed for requirements.txt"
-call :pullFile "https://github.com/GonzalesLabVU/Behavior-BCI/blob/main/pc/config/errors.log" || call :kill "pullFile failed for errors.log"
-call :pullFolder "https://github.com/GonzalesLabVU/Behavior-BCI/tree/main/arduino/behavioral_controller" || call :kill "pullFolder subroutine failed for behavioral_controller\"
-
-call :sleep 2
-
-echo Installing required dependencies...
-if not exist "requirements.txt" (
-    echo requirements.txt not found in %SCRIPT_DIR%
-    exit /b 1
-)
-python -m pip install -r requirements.txt -q || exit /b 1
 
 echo Searching for Arduino...
 set "ARDUINO_CLI=arduino-cli"
 set "FQBN=arduino:avr:mega"
 call :detectPort || call :kill "No Arduino Mega 2560 detected"
 
-call :uploadToArduino "behavioral_controller" || call :kill "Arduino upload failed"
+if /i "%DO_UPDATE%"=="Y" (
+    call :uploadSketch "behavioral_controller" || call :kill "Arduino upload failed"
+)
 
 echo Running Python script...
 python -m behavioral_master
@@ -115,7 +123,7 @@ echo.
 goto :eof
 
 REM -----------------------------------
-REM Subroutines
+REM SUBROUTINES
 REM -----------------------------------
 
 :selfUpdate
@@ -292,13 +300,13 @@ REM -----------------------------------
     if not defined PORT exit /b 1
     exit /b 0
 
-:uploadToArduino
+:uploadSketch
     @echo off
     setlocal EnableExtensions EnableDelayedExpansion
 
     set "SKETCH_DIR=%~1"
     if not defined SKETCH_DIR (
-        echo [ERROR] Missing folder argument for :uploadToArduino subroutine
+        echo [ERROR] Missing folder argument for :uploadSketch subroutine
         endlocal & exit /b 1
     )
 
@@ -360,3 +368,4 @@ REM -----------------------------------
 
 :eof
     exit /b 0
+    pause
