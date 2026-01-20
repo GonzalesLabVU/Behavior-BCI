@@ -20,6 +20,10 @@
 // unit conversion handles
 
 template <typename T>
+constexpr unsigned long MILLISECONDS(T s) { return static_cast<unsigned long>(s * 1000.0f); }
+template <typename T>
+constexpr unsigned long MICROSECONDS(T s) { return static_cast<unsigned long>(s * 1000000.0f); }
+template <typename T>
 constexpr unsigned long SECONDS(T s) { return static_cast<unsigned long>(s * 1000.0f); }
 template <typename T>
 constexpr unsigned long MINUTES(T m) { return static_cast<unsigned long>(m * 60.0f * 1000.0f); }
@@ -59,14 +63,16 @@ Logger logger;
 
 // global parameters
 
-int phase_id;
+int phase_id = 0;
+
+float engage_ms = 0.0f;
+float release_ms = 0.0f;
+float pulse_ms = 0.0f;
 
 unsigned long session_T;
 unsigned long trial_T;
 unsigned long delay_T;
 unsigned long tone_T = SECONDS(1);
-unsigned long blink_T = SECONDS(0.05);
-unsigned long wait_T = SECONDS(2.5);
 
 float easy_threshold = DEGREES(15);
 float threshold;
@@ -80,6 +86,10 @@ long last_disp_mark = LONG_MIN;
 bool next_easy_trial = false;
 char next_alignment = 'B';
 
+const bool read_raw = false;
+static constexpr uint32_t raw_sample_hz = 30;
+static constexpr uint32_t raw_sample_us = 1000000UL / raw_sample_hz;
+
 // phase logic forward declarations
 
 void run_phase_1();
@@ -87,25 +97,154 @@ void run_phase_2();
 void run_phase_3_plus();
 
 // helper functions
-void blink(unsigned long blink_ms, unsigned long wait_ms) {
-    static unsigned long t0 = 0;
-    static bool led_on = false;
 
-    unsigned long now = millis();
+static bool tokenLooksFloat_(const String& t) {
+    return (t.indexOf('.') >= 0) || (t.indexOf('e') >= 0) || (t.indexOf('E') >= 0);
+}
 
-    if (led_on) {
-        if (now - t0 >= blink_ms) {
-            digitalWrite(LED_BUILTIN, LOW);
-            
-            led_on = false;
-            t0 = now;
+static int countTokens_(const String& s) {
+    int count = 0;
+    bool in_token = false;
+
+    for (int i = 0; i < (int)s.length(); i++) {
+        char c = s[i];
+        bool ws = (c == ' ' || c == '\t');
+
+        if (!ws && !in_token) { in_token = true; count++; }
+        if (ws) in_token = false;
+    }
+
+    return count;
+}
+
+static String tokenAt_(const String& s, int idx) {
+    int seen = -1;
+    int i = 0;
+
+    while (i < (int)s.length()) {
+        while (i < (int)s.length() && (s[i] == ' ' || s[i] == '\t')) i++;
+        if (i >= (int)s.length()) break;
+
+        int start = i;
+        while (i < (int)s.length() && (s[i] != ' ' && s[i] != '\t')) i++;
+        int end = i;
+
+        seen++;
+        if (seen == idx) return s.substring(start, end);
+    }
+
+    return String("");
+}
+
+static bool parseConfig_(const String& line, bool* easy_out, char* align_out) {
+    if (!line.startsWith("T")) return false;
+
+    int first_space = line.indexOf(' ');
+    if (first_space < 0) return false;
+
+    int second_space = line.indexOf(' ', first_space + 1);
+    if (second_space < 0) return false;
+
+    String easy_str = line.substring(first_space + 1, second_space);
+    String align_str = line.substring(second_space + 1);
+    align_str.trim();
+
+    if (align_str.length() < 1) return false;
+
+    int e = easy_str.toInt();
+    char a = align_str.charAt(0);
+
+    if (!(a == 'L' || a == 'l' || a == 'R' || a == 'r' || a == 'B' || a == 'b')) return false;
+
+    if (easy_out) *easy_out = (e != 0);
+    if (align_out) *align_out = a;
+
+    return true;
+}
+
+static void parseParams() {
+    bool have_phase = false;
+    bool have_brake = false;
+    bool have_spout = false;
+    bool have_trial = false;
+
+    next_easy_trial = false;
+    next_alignment = 'B';
+
+    while (true) {
+        String msg = logger.read();
+        if (!msg.length()) continue;
+
+        if (msg == "E") {
+            session_state = SessionState::CLEANUP;
+            logger.ack();
+            return;
         }
-    } else {
-        if (now - t0 >= wait_ms - blink_ms) {
-            digitalWrite(LED_BUILTIN, HIGH);
 
-            led_on = true;
-            t0 = now;
+        if (!have_trial) {
+            bool e;
+            char a;
+
+            if (parseConfig_(msg, &e, &a)) {
+                next_easy_trial = e;
+                next_alignment = a;
+                have_trial = true;
+                logger.ack();
+                goto check_done;
+            }
+        }
+
+        {
+            int n_tokens = countTokens_(msg);
+
+            if (!have_brake && n_tokens == 2) {
+                String t0 = tokenAt_(msg, 0);
+                String t1 = tokenAt_(msg, 1);
+
+                float e_ms = t0.toFloat();
+                float r_ms = t1.toFloat();
+
+                if (e_ms > 0.0f && r_ms > 0.0f) {
+                    engage_ms = e_ms;
+                    release_ms = r_ms;
+                    have_brake = true;
+                    logger.ack();
+                    goto check_done;
+                }
+            }
+
+            if (n_tokens == 1) {
+                String t = tokenAt_(msg, 0);
+
+                if (!have_phase && !tokenLooksFloat_(t)) {
+                    long p = t.toInt();
+                    if (p > 0) {
+                        phase_id = (int)p;
+                        have_phase = true;
+                        logger.ack();
+                        goto check_done;
+                    }
+                }
+
+                if (!have_spout) {
+                    float p_ms = t.toFloat();
+                    if (p_ms > 0.0f) {
+                        pulse_ms = p_ms;
+                        have_spout = true;
+                        logger.ack();
+                        goto check_done;
+                    }
+                }
+            }
+        }
+
+    check_done:
+        if (have_phase && have_brake && have_spout) {
+            if (phase_id >= 3) {
+                if (have_trial) return;
+            } else {
+                return;
+            }
         }
     }
 }
@@ -185,32 +324,6 @@ void checkInactivity(float current_disp) {
     }
 }
 
-static bool parseConfig(const String& line, bool* easy_out, char* align_out) {
-    if (!line.startsWith("T")) return false;
-
-    int first_space = line.indexOf(' ');
-    if (first_space < 0) return false;
-
-    int second_space = line.indexOf(' ', first_space + 1);
-    if (second_space < 0) return false;
-
-    String easy_str = line.substring(first_space + 1, second_space);
-    String align_str = line.substring(second_space + 1);
-    align_str.trim();
-
-    if (align_str.length() < 1) return false;
-
-    int e = easy_str.toInt();
-    char a = align_str.charAt(0);
-
-    if (!(a == 'L' || a == 'l' || a == 'R' || a == 'r' || a == 'B' || a == 'b')) return false;
-
-    if (easy_out) *easy_out = (e != 0);
-    if (align_out) *align_out = a;
-
-    return true;
-}
-
 static void drainSerial() {
     while (true) {
         String msg = logger.read();
@@ -226,7 +339,7 @@ static void drainSerial() {
             bool e;
             char a;
 
-            if (parseConfig(msg, &e, &a)) {
+            if (parseConfig_(msg, &e, &a)) {
                 next_easy_trial = e;
                 next_alignment = a;
 
@@ -236,45 +349,8 @@ static void drainSerial() {
     }
 }
 
-static void waitForPhase() {
-    while (true) {
-        String msg = logger.read();
-        if (!msg.length()) continue;
+// top level
 
-        int p = msg.toInt();
-        if (p > 0) {
-            phase_id = p;
-            logger.ack();
-            return;
-        }
-    }
-}
-
-static void waitForInitConfig() {
-    while (true) {
-        String msg = logger.read();
-        if (!msg.length()) continue;
-
-        if (msg == "E") {
-            session_state = SessionState::CLEANUP;
-            logger.ack();
-            return;
-        }
-
-        bool e;
-        char a;
-
-        if (parseConfig(msg, &e, &a)) {
-            next_easy_trial = e;
-            next_alignment = a;
-            
-            logger.ack();
-            return;
-        }
-    }
-}
-
-// main
 void setup() {
     // power, status LED, serial, and RNG initialization
     pinMode(POWER_EN, OUTPUT);
@@ -287,28 +363,27 @@ void setup() {
 
     randomSeed(analogRead(SEED_PIN));
 
-    // block until host sends phase ID and initial trial config
-    waitForPhase();
+    // block until host sends initial configuration parameters
+    parseParams();
 
-    if (phase_id >= 3) {
-        waitForInitConfig();
-    } else {
-        next_easy_trial = false;
-        next_alignment = 'B';
-    }
+    unsigned long engage_us = (unsigned long)(engage_ms * 1000.0f);
+    unsigned long release_us = (unsigned long)(release_ms * 1000.0f);
+    unsigned long pulse_us = (unsigned long)(pulse_ms * 1000.0f);
 
+    // enable power sources
     digitalWrite(POWER_EN, HIGH);
     delay(200);
 
     // initialize external components
     // set session parameters based on phase ID
+    brake.init(engage_us, release_us);
     brake.engage();
 
     speaker.init();
 
-    spout.init();
+    spout.init(pulse_us);
 
-    lick.init();
+    lick.init(read_raw);
     lick.calibrate();
 
     switch (phase_id) {
@@ -334,7 +409,7 @@ void setup() {
             break;
         }
         case 4: {
-            session_T = MINUTES(45);
+            session_T = MINUTES(1); //#X
             trial_T = SECONDS(30);
             delay_T = SECONDS(3);
             threshold = DEGREES(60);
@@ -382,7 +457,6 @@ void setup() {
 
 void loop() {
     drainSerial();
-    blink(blink_T, wait_T);
 
     switch (session_state) {
         case SessionState::MAIN: {
@@ -390,6 +464,18 @@ void loop() {
                 case 1: run_phase_1(); break;
                 case 2: run_phase_2(); break;
                 default: run_phase_3_plus(); break;
+            }
+
+            if (read_raw) {
+                static uint32_t last_raw_us = 0;
+                uint32_t now_us = micros();
+
+                if ((uint32_t)(now_us - last_raw_us) >= raw_sample_us) {
+                    last_raw_us += raw_sample_us;
+
+                    uint16_t raw_val = lick.sampleRaw();
+                    logger.writeRaw(raw_val);
+                }
             }
 
             break;
@@ -440,7 +526,7 @@ void run_phase_1() {
         
         case PhaseState::TRIAL: {
             if (session_timer.isRunning()) {
-                lick.poll();
+                lick.sampleFiltered();
 
                 if (lick.justTouched()) {
                     logger.write("lick");
@@ -467,7 +553,7 @@ void run_phase_1() {
                 // active
                 else {
                     if (phase_timer.isRunning()) {
-                        lick.poll();
+                        lick.sampleFiltered();
 
                         if (lick.justTouched()) {
                             logger.write("lick");
@@ -521,7 +607,7 @@ void run_phase_2() {
             else {
                 // running
                 if (phase_timer.isRunning()) {
-                    lick.poll();
+                    lick.sampleFiltered();
 
                     if (lick.justTouched()) {
                         logger.write("lick");
@@ -549,7 +635,7 @@ void run_phase_2() {
             else {
                 // running
                 if (phase_timer.isRunning()) {
-                    lick.poll();
+                    lick.sampleFiltered();
 
                     if (lick.justTouched()) {
                         logger.write("lick");
@@ -580,7 +666,7 @@ void run_phase_2() {
             else {
                 // running
                 if (phase_timer.isRunning()) {
-                    lick.poll();
+                    lick.sampleFiltered();
 
                     if (lick.justTouched()) {
                         logger.write("lick");
@@ -609,7 +695,7 @@ void run_phase_2() {
                 else {
                     // running
                     if (phase_timer.isRunning()) {
-                        lick.poll();
+                        lick.sampleFiltered();
 
                         if (lick.justTouched()) {
                             logger.write("lick");
@@ -665,7 +751,7 @@ void run_phase_3_plus() {
             else {
                 // running
                 if (phase_timer.isRunning()) {
-                    lick.poll();
+                    lick.sampleFiltered();
                     if (lick.justTouched()) {
                         logger.write("lick");
                     }
@@ -699,7 +785,7 @@ void run_phase_3_plus() {
             else {
                 // running
                 if (phase_timer.isRunning()) {
-                    lick.poll();
+                    lick.sampleFiltered();
                     if (lick.justTouched()) {
                         logger.write("lick");
                     }
@@ -760,7 +846,7 @@ void run_phase_3_plus() {
             else {
                 // running
                 if (phase_timer.isRunning()) {
-                    lick.poll();
+                    lick.sampleFiltered();
                     if (lick.justTouched()) {
                         logger.write("lick");
                     }
@@ -800,7 +886,7 @@ void run_phase_3_plus() {
             else {
                 // running
                 if (phase_timer.isRunning()) {
-                    lick.poll();
+                    lick.sampleFiltered();
                     if (lick.justTouched()) {
                         logger.write("lick");
                     }
@@ -832,7 +918,7 @@ void run_phase_3_plus() {
                 else {
                     // running
                     if (phase_timer.isRunning()) {
-                        lick.poll();
+                        lick.sampleFiltered();
                         if (lick.justTouched()) {
                             logger.write("lick");
                         }
