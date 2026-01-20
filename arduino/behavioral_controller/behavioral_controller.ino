@@ -14,6 +14,7 @@
 // macros
 
 #define BAUDRATE 1000000
+#define RAW_FLAG false
 #define SEED_PIN A0
 #define POWER_EN 7
 
@@ -86,7 +87,6 @@ long last_disp_mark = LONG_MIN;
 bool next_easy_trial = false;
 char next_alignment = 'B';
 
-const bool read_raw = false;
 static constexpr uint32_t raw_sample_hz = 30;
 static constexpr uint32_t raw_sample_us = 1000000UL / raw_sample_hz;
 
@@ -383,7 +383,7 @@ void setup() {
 
     spout.init(pulse_us);
 
-    lick.init(read_raw);
+    lick.init(RAW_FLAG);
     lick.calibrate();
 
     switch (phase_id) {
@@ -409,7 +409,7 @@ void setup() {
             break;
         }
         case 4: {
-            session_T = MINUTES(1); //#X
+            session_T = MINUTES(45);
             trial_T = SECONDS(30);
             delay_T = SECONDS(3);
             threshold = DEGREES(60);
@@ -466,7 +466,7 @@ void loop() {
                 default: run_phase_3_plus(); break;
             }
 
-            if (read_raw) {
+            if (RAW_FLAG) {
                 static uint32_t last_raw_us = 0;
                 uint32_t now_us = micros();
 
