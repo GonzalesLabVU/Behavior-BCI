@@ -6,7 +6,7 @@ warnings.filterwarnings('ignore', message='pkg_resources is deprecated as an API
 
 import time
 import threading
-from queue import Empty
+from queue import Queue, Empty
 import pygame as pg
 
 # ---------------------------
@@ -31,6 +31,8 @@ PHASE_CONFIG = {
 TRIAL_CONFIG = (False, "B")
 TRIAL_LOCK = threading.Lock()
 
+ABORT_EVT = threading.Event()
+
 
 # ---------------------------
 # HELPERS
@@ -42,7 +44,7 @@ def _parse_event(payload):
     return str(payload).strip().split()[0].lower()
 
 
-def cursor_fcn(threshold, evt_queue, enc_queue, *, display_idx=None, fullscreen=True, easy_threshold=15.0, stop_evt=None):
+def cursor_fcn(threshold, evt_queue, enc_queue, *, display_idx=None, fullscreen=True, easy_threshold=15.0, stop_evt=None, blackout_evt=None):
     th = abs(float(threshold))
     easy_th = abs(float(easy_threshold))
     base_target_deg = 30.0
@@ -116,19 +118,27 @@ def cursor_fcn(threshold, evt_queue, enc_queue, *, display_idx=None, fullscreen=
                 pass
 
             return 'stopped'
+        
+        if blackout_evt is not None and blackout_evt.is_set():
+            screen.fill(BLACK)
+            pg.display.flip()
+            clock.tick(240)
 
         for event in pg.event.get():
             if event.type == pg.QUIT:
+                ABORT_EVT.set()
                 pg.quit()
                 return 'quit'
             
             if event.type == pg.KEYDOWN:
                 if event.key == pg.K_ESCAPE:
+                    ABORT_EVT.set()
                     pg.quit()
                     return 'quit'
 
                 mods = pg.key.get_mods()
                 if event.key == pg.K_c and (mods & (pg.KMOD_LCTRL | pg.KMOD_RCTRL)):
+                    ABORT_EVT.set()
                     pg.quit()
                     return 'quit'
 
@@ -231,9 +241,53 @@ class BCI:
         self.fullscreen = bool(fullscreen)
         self.easy_threshold = easy_threshold
 
+        self._evt_q_internal = Queue()
+        self._blackout_evt = threading.Event()
+        self._blackout_timer = None
+        self._evt_forward_thread = None
+
         self._stop_evt = threading.Event()
         self._thread = None
+
+    def _forward_events(self):
+        while not self._stop_evt.is_set():
+            try:
+                ts, evt = self.evt_q.get(timeout=0.5)
+            except Empty:
+                continue
+            except Exception:
+                continue
+
+            e = str(evt).strip().lower()
+
+            if e == "cue":
+                self._blackout_evt.clear()
+                t = self._blackout_timer
+                self._blackout_timer = None
+
+                if t is not None:
+                    try:
+                        t.cancel()
+                    except Exception:
+                        pass
+            elif e in {"hit", "miss"}:
+                t = self._blackout_timer
+
+                if t is not None:
+                    try:
+                        t.cancel()
+                    except Exception:
+                        pass
+                
+                self._blackout_timer = threading.Timer(1.0, self._blackout_evt.set)
+                self._blackout_timer.daemon = True
+                self._blackout_timer.start()
             
+            try:
+                self._evt_q_internal.put_nowait((ts, evt))
+            except Exception:
+                pass
+
     def start(self):
         if not self.enabled:
             return False
@@ -242,6 +296,11 @@ class BCI:
             return True
         
         self._stop_evt.clear()
+
+        if not self._evt_forward_thread or not self.evt_forward_thread.is_alive():
+            self._evt_forward_thread = threading.Thread(target=self._forward_events, daemon=True)
+            self._evt_forward_thread.start()
+
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
@@ -260,6 +319,16 @@ class BCI:
         self._stop_evt.set()
 
         try:
+            self._blackout_evt.clear()
+            t = self._blackout_timer
+            self._blackout_timer = None
+
+            if t is not None:
+                t.cancel()
+        except Exception:
+            pass
+
+        try:
             if pg.get_init():
                 pg.event.post(pg.event.Event(pg.QUIT))
         except Exception:
@@ -273,12 +342,13 @@ class BCI:
     
     def _run(self):
         cursor_fcn(threshold=self.threshold,
-                   evt_queue=self.evt_q,
+                   evt_queue=self._evt_q_internal,
                    enc_queue=self.enc_q,
                    display_idx=self.display_idx,
                    fullscreen=self.fullscreen,
                    easy_threshold=self.easy_threshold,
-                   stop_evt=self._stop_evt)
+                   stop_evt=self._stop_evt,
+                   blackout_evt=self._blackout_evt)
 
 
 # ---------------------------
