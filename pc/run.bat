@@ -18,13 +18,13 @@ if "%DO_UPDATE%"=="" set "DO_UPDATE=N"
 if /i "%DO_UPDATE%"=="Y" (
     set "CONFIRM=N"
     set /p "CONFIRM=This will overwrite local files. Continue? [y/N]: "
-    if "%CONFIRM%"=="" set "CONFIRM=N"
-    if /i "%CONFIRM%" NEQ "Y" set "DO_UPDATE=N"
+    if "!CONFIRM!"=="" set "CONFIRM=N"
+    if /i "!CONFIRM!" NEQ "Y" set "DO_UPDATE=N"
 )
 
 if /i "%DO_UPDATE%"=="Y" (
     call :selfUpdate
-    if "%ERRORLEVEL%"=="99" exit /b 0
+    if "!ERRORLEVEL!"=="99" exit /b 0
     if errorlevel 1 call :kill "selfUpdate failed"
 
     echo Making sure pip is up to date...
