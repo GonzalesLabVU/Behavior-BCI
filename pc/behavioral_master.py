@@ -87,6 +87,20 @@ def _get_ts():
     return f"{base}.{ms:03d}"
 
 
+def _ts_to_ms(ts):
+    try:
+        ts = str(ts).strip()
+        if not ts:
+            return None
+        
+        hms, ms = ts.split(".", 1)
+        h, m, s = hms.split(":")
+
+        return ((3600*int(h) + 60*int(m) + int(s)) * 1000) + int(ms[:3])
+    except Exception:
+        return None
+
+
 def _now():
     return int(time.time())
 
@@ -340,18 +354,16 @@ def print_exc(exc):
 def print_stack():
     if not EXC_STACK:
         cmd_run('echo.')
-        print('[Process exited with code 0]\n')
+        print('[Process exited with code 0]')
         return
     
-    hline_head = (50 * "=")
-    print(hline_head + "\nEXCEPTION STACK (in order of occurrence):\n" + hline_head, flush=True)
-
-    hline_exc = (50 * "-")
+    hline = (50 * "=")
+    print(hline + "\nEXCEPTION STACK (in order of occurrence):\n" + hline, flush=True)
 
     for i, info in enumerate(EXC_STACK, start=1):
         print(f"\n[{i}] {info['type']} in {info['caller']}:", flush=True)
         print_exc(info['exc'])
-        print(hline_exc, flush=True)
+        print(hline, flush=True)
             
     
     print('\n[Process exited with code 1]\n')
@@ -472,7 +484,10 @@ class ArduinoLink:
                     self.msg_q.put(("ENC", ts, payload))
                     continue
 
-                self.msg_q.put(("RAW", ts, line))
+                if line.startswith("[RAW]"):
+                    payload = line.split("]", 1)[1].strip()
+                    self.msg_q.put(("RAW", ts, payload))
+                    continue
 
         except Exception as e:
             try:
@@ -511,8 +526,8 @@ class SessionData:
             "date": date_str,
             "animal": animal_id,
             "phase": phase_id,
-            "start_wall": None,
-            "end_wall": None,
+            "tstart": None,
+            "tstop": None,
             "duration_sec": None,
             "aborted": False,
             }
@@ -531,29 +546,37 @@ class SessionData:
         self.enc["timestamps"].append(ts)
         self.enc["values"].append(payload)
 
-    def add_raw(self, ts, payload):
-        def _is_numeric(s):
-            try:
-                float(s.strip())
-                return True
-            except Exception:
-                return False
+    def add_raw_cap(self, ts, payload):
+        try:
+            v = int(str(payload).strip())
+        except Exception:
+            return
 
-        if _is_numeric(payload):
-            dtype = "cap"
-        else:
-            dtype = "evt"
+        self.raw["cap"]["timestamps"].append(ts)
+        self.raw["cap"]["values"].append(v)
+    
+    def add_raw_evt(self, ts, payload):
+        self.raw["evt"]["timestamps"].append(ts)
+        self.raw["evt"]["values"].append(str(payload))
+
+    def any_data(self, field=None):
+        if field is None:
+            return (
+                bool(self.evt["timestamps"]) or
+                bool(self.enc["timestamps"]) or
+                bool(self.raw["evt"]["timestamps"]) or
+                bool(self.raw["cap"]["timestamps"])
+                )
         
-        self.raw[dtype]["timestamps"].append(ts)
-        self.raw[dtype]["values"].append(payload)
-
-    def any_data(self):
-        return (
-            bool(self.evt["timestamps"]) or
-            bool(self.enc["timestamps"]) or
-            bool(self.raw["evt"]["timestamps"]) or
-            bool(self.raw["cap"]["timestamps"])
-            )
+        match field:
+            case "evt":
+                return bool(self.evt['timestamps'])
+            case "enc":
+                return bool(self.enc['timestamps'])
+            case "raw":
+                return bool(self.raw['cap']['timestamps'])
+        
+        raise ValueError(f"Invalid field: {field!r} (Expected one of: None, 'evt', 'enc', 'raw')")
 
     def to_dict(self):
         def _json_safe(x):
@@ -1287,6 +1310,51 @@ def save_data(session_data):
                 log_and_commit(session_data.meta.get('animal', 'UNKNOWN'), session_data.meta.get('phase', '0'), e)
 
 
+def save_raw(session_data):
+    if session_data is None:
+        return None
+    
+    cap = session_data.raw.get('cap', {})
+    ts_list = cap.get('timestamps', [])
+    val_list = cap.get('values', [])
+
+    if not ts_list:
+        return None
+    
+    animal_id = str(session_data.meta.get("animal", "UNKNOWN"))
+    animal_str = f'Animal={animal_id}'
+
+    phase_id = str(session_data.meta.get("phase", "0"))
+    phase_str = f'Phase={phase_id}'
+
+    date_str = str(session_data.meta.get("date", "")).strip()
+    try:
+        mm_dd_yyyy = datetime.strptime(date_str, "%m/%d/%Y").strftime("%m-%d-%Y")
+    except Exception:
+        mm_dd_yyyy = datetime.now().strftime("%m-%d-%Y")
+    
+    out_name = f'raw_cap_{animal_str}_{phase_str}_{mm_dd_yyyy}.json'
+    out_path = SCRIPT_DIR / out_name
+
+    payload = {
+        "meta": {
+            "animal": animal_id,
+            "phase": str(session_data.meta.get("phase", "")),
+            "date": date_str
+            },
+        "data": {
+            "timestamps": ts_list,
+            "values": val_list
+            }
+        }
+    
+    with open(out_path, 'w', encoding='utf-8') as out_file:
+        json.dump(payload, out_file, indent=4)
+    
+    print(f'Saved raw data locally to {out_path.name}', flush=True)
+    return out_path
+
+
 def fallback_save(session_data, exc=None):
     animal = str(session_data.meta.get('animal', 'UNKNOWN'))
     phase = str(session_data.meta.get('phase', '0'))
@@ -1389,8 +1457,8 @@ def send_email(session_data):
 
     subject = _format_subject(animal, phase)
 
-    t_start = datetime.fromisoformat(session_data.meta['start_wall']).strftime('%I:%M %p').lstrip('0')
-    t_stop = datetime.fromisoformat(session_data.meta['end_wall']).strftime('%I:%M %p').lstrip('0')
+    t_start = datetime.fromisoformat(session_data.meta['tstart']).strftime('%I:%M %p').lstrip('0')
+    t_stop = datetime.fromisoformat(session_data.meta['tstop']).strftime('%I:%M %p').lstrip('0')
     dur_s = session_data.meta['duration_sec']
     evt = session_data.evt
 
@@ -1473,7 +1541,19 @@ def cleanup(link, msg, timeout=2.0):
 # ---------------------------
 # TOP LEVEL
 # ---------------------------
-def _dev_start(evt_queue, enc_queue, dev_queue, session_data, state, stop_evt, cursor, key_speed=50.0, trial_ms=30_000, delay_ms=3000):
+def _dev_start(evt_queue, enc_queue, dev_queue, session_data, state, stop_evt,
+               cursor, key_speed=50.0, trial_ms=30_000, delay_ms=3000):
+    try:
+        link_active = bool(find_arduino_port())
+    except Exception:
+        link_active = False
+    
+    if link_active:
+        state['use_sim'] = False
+        return None
+    
+    state['use_sim'] = True
+
     t = Thread(target=_dev_loop,
                args=(
                    evt_queue,
@@ -1686,7 +1766,8 @@ def _dev_loop(evt_queue, enc_queue, dev_queue, session_data, state, stop_evt, cu
 def setup():
     port = find_arduino_port()
     if not port:
-        raise RuntimeError("No Arduino detected")
+        # raise RuntimeError("No Arduino detected")
+        pass
 
     ser = None
     link = None
@@ -1708,7 +1789,7 @@ def setup():
             
             animal_raw = animal_raw.rstrip("\n").upper()
         except KeyboardInterrupt:
-            print('\n\nTerminated by KeyboardInterrupt')
+            print('\nTerminated byKeyboardInterrupt')
             raise
 
         if not animal_raw:
@@ -1737,7 +1818,7 @@ def setup():
             try:
                 phase_id = input("Training Phase:  ").strip()
             except KeyboardInterrupt:
-                print('\n\nTerminated by KeyboardInterrupt')
+                print('\nTerminated byKeyboardInterrupt')
                 raise
             
             if phase_id in valid_phases:
@@ -1749,14 +1830,28 @@ def setup():
         LAST_SIDE = None
         SIDE_STREAK = 0
 
+        def _safe_float(var):
+            v = _require_env(var).strip()
+
+            if (len(v) >= 2) and ((v[0] == v[-1]) and v[0] in {"'", '"'}):
+                v = v[1:-1].strip()
+            
+            return float(v)
+
         link = ArduinoLink(ser)
         link.start()
 
+        engage_ms = _safe_float("BRAKE_ENGAGE_MS")
+        release_ms = _safe_float("BRAKE_RELEASE_MS")
+        pulse_ms = _safe_float("SPOUT_PULSE_MS")
+
         try:
-            link.send_and_wait(phase_id)
+            link.send_and_wait(str(int(phase_id)))
+            link.send_and_wait(f"{engage_ms:.4f} {release_ms:.4f}")
+            link.send_and_wait(f"{pulse_ms:.4f}")
         except Exception as e:
             link.close()
-            raise RuntimeError(f"Failed to send training phase to Arduino: {e}") from e
+            raise RuntimeError(f'Failed during Arduino initialization handshake: {e}') from e
 
         cursor = None
         type_1 = None
@@ -1823,7 +1918,7 @@ def main(link, session_data, cursor, dev_mode):
     calibrated = not do_calibration
     last_outcome = None
 
-    trial_start_t = None
+    trial_start_ms = None
     trial_dt = 0.0
     recent_outcomes = deque()
 
@@ -1839,18 +1934,32 @@ def main(link, session_data, cursor, dev_mode):
             dev_stop_evt.clear()
             dev_thread = _dev_start(EVT_QUEUE, ENC_QUEUE, DEV_QUEUE, session_data, dev_state, dev_stop_evt, cursor)
         
-        msg_q = DEV_QUEUE if (dev_mode and cursor is not None) else link.msg_q
+        def _get_msg(timeout=0.05):
+            try:
+                typ, ts, payload = link.msg_q.get(timeout=timeout)
+                return typ, ts, payload
+            except Empty:
+                pass
+
+            if dev_mode and cursor is not None:
+                try:
+                    typ, ts, payload = DEV_QUEUE.get_nowait()
+                    return typ, ts, payload
+                except Empty:
+                    pass
+            
+            raise Empty
 
         while link.ser and link.ser.is_open:
             try:
-                typ, ts, payload = msg_q.get(timeout=0.05)
+                typ, ts, payload = _get_msg(timeout=0.05)
             except Empty:
                 continue
 
             if not started:
                 started = True
                 t0 = time.time()
-                session_data.meta["start_wall"] = datetime.now().isoformat(timespec="seconds")
+                session_data.meta["tstart"] = datetime.now().isoformat(timespec="seconds")
 
                 print(f"\nSession started at {datetime.now().strftime('%I:%M %p')}", flush=True)
                 cmd_run('echo.')
@@ -1866,14 +1975,19 @@ def main(link, session_data, cursor, dev_mode):
             if typ == "END":
                 break
 
+            if typ == "RAW":
+                session_data.add_raw_cap(ts, payload)
+
             if typ == "EVT":
                 p = str(payload)
 
-                if not (dev_mode and cursor is not None):
+                use_sim = bool(dev_state.get('use_sim', False))
+
+                if not use_sim:
                     session_data.add_evt(ts, p)
 
                 try:
-                    if not (dev_mode and cursor is not None):
+                    if not use_sim:
                         EVT_QUEUE.put_nowait((ts, p))
                 except Exception:
                     pass
@@ -1881,7 +1995,8 @@ def main(link, session_data, cursor, dev_mode):
                 if p == 'cue':
                     trial_n += 1
                     last_outcome = None
-                    trial_start_t = time.time()
+
+                    trial_start_ms = _ts_to_ms(ts)
                     dev_state['trial_active'] = True
                 
                 if p in {'hit', 'miss'}:
@@ -1891,7 +2006,13 @@ def main(link, session_data, cursor, dev_mode):
                         continue
                     last_outcome = p
 
-                    trial_dt = 0.0 if trial_start_t is None else max(0.0, time.time() - trial_start_t)
+                    end_ms = _ts_to_ms(ts)
+
+                    if trial_start_ms is None or end_ms is None:
+                        trial_dt = 0.0
+                    else:
+                        trial_dt = max(0.0, (end_ms - trial_start_ms) / 1000.0)
+
                     recent_outcomes.append(p)
 
                     n_hit = sum(1 for o in recent_outcomes if o == 'hit')
@@ -1906,7 +2027,7 @@ def main(link, session_data, cursor, dev_mode):
                         
                         if calibrated:
                             if len(trial_stack) >= N and is_early_exit(trial_stack, N, t0):
-                                cleanup(link, '\nTerminated by early exit')
+                                cleanup(link, 'Terminated byearly exit')
                                 session_data.meta['aborted'] = True
                                 break
                         else:
@@ -1927,8 +2048,12 @@ def main(link, session_data, cursor, dev_mode):
                         log_trial_config(session_data, trial_n=next_trial_n, type=next_type, side=next_side)
                         
                         cursor.update_config(next_type, next_side)
-            elif typ == "ENC":
-                if dev_mode and cursor is not None:
+
+                if p in {"hit", "lick"}:
+                    session_data.add_raw_evt(ts, p)
+
+            if typ == "ENC":
+                if bool(dev_state.get('use_sim', False)):
                     continue
 
                 p = str(payload)
@@ -1938,16 +2063,9 @@ def main(link, session_data, cursor, dev_mode):
                     ENC_QUEUE.put_nowait((ts, p))
                 except Exception:
                     pass
-            elif typ == "RAW":
-                p = str(payload)
-
-                try:
-                    session_data.add_raw(ts, p)
-                except Exception:
-                    pass  
     except KeyboardInterrupt:
         session_data.meta["aborted"] = True
-        cleanup(link, "\nTerminated by KeyboardInterrupt")
+        cleanup(link, "Terminated byKeyboardInterrupt")
         raise
     except Exception as e:
         cache_exc(e, 'main')
@@ -1960,10 +2078,10 @@ def main(link, session_data, cursor, dev_mode):
             except Exception:
                 pass
 
-        if session_data.meta["start_wall"] is None:
-            session_data.meta["start_wall"] = datetime.now().isoformat(timespec="seconds")
+        if session_data.meta["tstart"] is None:
+            session_data.meta["tstart"] = datetime.now().isoformat(timespec="seconds")
 
-        session_data.meta["end_wall"] = datetime.now().isoformat(timespec="seconds")
+        session_data.meta["tstop"] = datetime.now().isoformat(timespec="seconds")
 
         if t0 is None:
             t0 = time.time()
@@ -1974,6 +2092,7 @@ def main(link, session_data, cursor, dev_mode):
 
 if __name__ == "__main__":
     cmd_run('echo.')
+    print(f'{"-" * 50}\n')
 
     link = None
     session_data = None
@@ -1998,14 +2117,7 @@ if __name__ == "__main__":
         cache_exc(e, '__main__')
     finally:
         print_summary(session_data)
-
-        if (session_data is not None) and (not dev_mode) and session_data.any_data():
-            try:
-                ok = safe_save(session_data)
-                if not ok:
-                    print('[WARNING] Google Sheets save failed (local fallback used instead)', flush=True)
-            except Exception as e:
-                cache_exc(e, '__main__.safe_save')
+        run_info = (animal_id_for_log, phase_id_for_log)
 
         if cursor is not None:
             try:
@@ -2014,68 +2126,36 @@ if __name__ == "__main__":
                 cache_exc(e, '__main__.cursor_stop')
 
                 if not dev_mode:
-                    log_and_commit(animal_id_for_log, phase_id_for_log, e)
+                    log_and_commit(*run_info, e)
         
         if link is not None:
             try:
                 link.close()
             except Exception as e:
                 cache_exc(e, '__main__.link_close')
-                
-                if not dev_mode:
-                    log_and_commit(animal_id_for_log, phase_id_for_log, e)
 
-        if session_data is not None and session_data.meta.get('start_wall') and session_data.meta.get('end_wall'):
-            try:
-                send_email(session_data)
-            except Exception as e:
-                cache_exc(e, '__main__.send_email')
-                
                 if not dev_mode:
-                    log_and_commit(animal_id_for_log, phase_id_for_log, e)
+                    log_and_commit(*run_info, e)
         
-        if not dev_mode and run_exc is not None:
-            if isinstance(run_exc, SystemExit):
-                code = getattr(run_exc, 'code', 0)
-                if code not in {0, None}:
-                    log_and_commit(animal_id_for_log, phase_id_for_log, run_exc)
-            elif not isinstance(run_exc, KeyboardInterrupt):
-                log_and_commit(animal_id_for_log, phase_id_for_log, run_exc)
-        
+        save_raw(session_data)
+
+        if not dev_mode:
+            if session_data is not None and session_data.meta.get('tstart') and session_data.meta.get('tstop'):
+                try:
+                    send_email(session_data)
+                except Exception as e:
+                    cache_exc(e, '__main__.send_email')
+                    log_and_commit(*run_info, e)
+            
+            if session_data is not None and session_data.any_data():
+                try:
+                    save_choice = input("\nSave current session? [Y/n]:  ").strip().lower()
+                    
+                    if save_choice in {"", "y", "yes"}:
+                        ok = safe_save(session_data)
+                        if not ok:
+                            print("[WARNING] Google Sheets save failed (local fallback used instead)", flush=True)
+                except Exception as e:
+                    cache_exc(e, '__main__.safe_save')
+
         print_stack()
-
-        # if (session_data is not None) and (not dev_mode) and session_data.any_data():
-        #     ok = safe_save(session_data)
-        #     if not ok:
-        #         print('[WARNING] Google Sheets save failed (local fallback may have been used)', flush=True)
-        
-        # if cursor is not None:
-        #     try:
-        #         cursor.stop()
-        #     except Exception as e:
-        #         log_and_commit(animal_id_for_log, phase_id_for_log, e)
-        
-        # if link is not None:
-        #     try:
-        #         link.close()
-        #     except Exception as e:
-        #         log_and_commit(animal_id_for_log, phase_id_for_log, e)
-        
-        # if session_data is not None and session_data.meta.get('start_wall') and session_data.meta.get('end_wall'):
-        #     try:
-        #         send_email(session_data)
-        #     except Exception as e:
-        #         log_and_commit(animal_id_for_log, phase_id_for_log, e)
-
-        # if run_exc is not None:
-        #     if isinstance(run_exc, SystemExit):
-        #         code = getattr(run_exc, 'code', 0)
-
-        #         if code not in {0, None}:
-        #             log_and_commit(animal_id_for_log, phase_id_for_log, run_exc)
-        #     elif isinstance(run_exc, KeyboardInterrupt):
-        #         pass
-        #     else:
-        #         log_and_commit(animal_id_for_log, phase_id_for_log, run_exc)
-
-        #     print_exc(run_exc)
