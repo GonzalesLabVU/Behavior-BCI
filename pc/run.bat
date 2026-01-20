@@ -2,13 +2,8 @@
 echo.
 setlocal EnableExtensions EnableDelayedExpansion
 
+cls
 call :sleep 2
-
-rem call :selfUpdate
-rem if "%ERRORLEVEL%"=="99" exit /b 0
-rem if errorlevel 1 call :kill "selfUpdate failed"
-
-rem call :sleep 2
 
 echo Getting script directory...
 set "SCRIPT_DIR=%~dp0"
@@ -16,119 +11,130 @@ cd /d "%SCRIPT_DIR%"
 
 call :sleep
 
-rem set "DO_UPDATE=Y"
-rem set /p "DO_UPDATE=Update local files? [Y/n]: "
-rem if not defined DO_UPDATE set "DO_UPDATE=Y"
+set "DO_UPDATE=N"
+set /p "DO_UPDATE=Update local files? [y/N]: "
+if "%DO_UPDATE%"=="" set "DO_UPDATE=N"
 
-rem if /i "%DO_UPDATE%"=="Y" (
+if /i "%DO_UPDATE%"=="Y" (
+    set "CONFIRM=N"
+    set /p "CONFIRM=This will overwrite local files. Continue? [y/N]: "
+    if "%CONFIRM%"=="" set "CONFIRM=N"
+    if /i "%CONFIRM%" NEQ "Y" set "DO_UPDATE=N"
+)
+
+if /i "%DO_UPDATE%"=="Y" (
+    call :selfUpdate
+    if "%ERRORLEVEL%"=="99" exit /b 0
+    if errorlevel 1 call :kill "selfUpdate failed"
+
     echo Making sure pip is up to date...
     python -m pip install --upgrade pip -q
 
     call :sleep
 
-    rem echo Verifying git installation...
-    rem where git >nul 2>&1
-    rem if errorlevel 1 (
-    rem     echo.
-    rem     echo Git not found, attempting to install...
+    echo Verifying git installation...
+    where git >nul 2>&1
+    if errorlevel 1 (
+        echo.
+        echo Git not found, attempting to install...
 
-    rem     where winget >nul 2>&1
-    rem     if not errorlevel 1 (
-    rem         winget install --id Git.Git -e --source winget --accept-package-agreements --accept-source-agreements >nul 2>&1
-    rem     )
+        where winget >nul 2>&1
+        if not errorlevel 1 (
+            winget install --id Git.Git -e --source winget --accept-package-agreements --accept-source-agreements >nul 2>&1
+        )
 
-    rem     where git >nul 2>&1
-    rem     if errorlevel 1 (
-    rem         where choco >nul 2>&1
-    rem         if not errorlevel 1 (
-    rem             choco install git -y >nul 2>&1
-    rem         )
-    rem     )
+        where git >nul 2>&1
+        if errorlevel 1 (
+            where choco >nul 2>&1
+            if not errorlevel 1 (
+                choco install git -y >nul 2>&1
+            )
+        )
 
-    rem     where git >nul 2>&1
-    rem     if errorlevel 1 (
-    rem         powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-    rem             "$ErrorActionPreference='Stop';" ^
-    rem             "$u='https://github.com/git-for-windows/git/releases/latest/download/Git-64-bit.exe';" ^
-    rem             "$o=Join-Path $env:TEMP 'Git-64-bit.exe';" ^
-    rem             "Invoke-WebRequest -Uri $u -OutFile $o -UseBasicParsing;" ^
-    rem             "Start-Process -FilePath $o -ArgumentList '/VERYSILENT','/NORESTART','/SUPPRESSMSGBOXES' -Wait;"
-    rem     )
+        where git >nul 2>&1
+        if errorlevel 1 (
+            powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+                "$ErrorActionPreference='Stop';" ^
+                "$u='https://github.com/git-for-windows/git/releases/latest/download/Git-64-bit.exe';" ^
+                "$o=Join-Path $env:TEMP 'Git-64-bit.exe';" ^
+                "Invoke-WebRequest -Uri $u -OutFile $o -UseBasicParsing;" ^
+                "Start-Process -FilePath $o -ArgumentList '/VERYSILENT','/NORESTART','/SUPPRESSMSGBOXES' -Wait;"
+        )
 
-    rem     if exist "%ProgramFiles%\Git\cmd\git.exe" set "PATH=%ProgramFiles%\Git\cmd;%PATH%"
-    rem     if exist "%ProgramFiles(x86)%\Git\cmd\git.exe" set "PATH=%ProgramFiles(x86)%\Git\cmd;%PATH%"
+        if exist "%ProgramFiles%\Git\cmd\git.exe" set "PATH=%ProgramFiles%\Git\cmd;%PATH%"
+        if exist "%ProgramFiles(x86)%\Git\cmd\git.exe" set "PATH=%ProgramFiles(x86)%\Git\cmd;%PATH%"
 
-    rem     where git >nul 2>&1
-    rem     if errorlevel 1 (
-    rem         call :kill "Git installation failed or git.exe not on PATH"
-    rem     ) else (
-    rem         for /f "delims=" %%v in ('git --version 2^>nul') do echo %%v
-    rem     )
-    rem )
+        where git >nul 2>&1
+        if errorlevel 1 (
+            call :kill "Git installation failed or git.exe not on PATH"
+        ) else (
+            for /f "delims=" %%v in ('git --version 2^>nul') do echo %%v
+        )
+    )
 
-    rem call :sleep
+    call :sleep
 
-    rem echo Verifying arduino-cli installation...
-    rem where arduino-cli >nul 2>&1
-    rem if errorlevel 1 (
-    rem     echo [WARNING] arduino-cli not found on path
-    rem     echo Installing arduino-cli...
-    rem     where winget >nul 2>&1 || call :kill "winget not found; install arduino-cli manually"
-    rem     winget install --id ArduinoSA.CLI -e --source winget --accept-package-agreements --accept-source-agreements >nul 2>&1
-    rem )
+    echo Verifying arduino-cli installation...
+    where arduino-cli >nul 2>&1
+    if errorlevel 1 (
+        echo [WARNING] arduino-cli not found on path
+        echo Installing arduino-cli...
+        where winget >nul 2>&1 || call :kill "winget not found; install arduino-cli manually"
+        winget install --id ArduinoSA.CLI -e --source winget --accept-package-agreements --accept-source-agreements >nul 2>&1
+    )
 
-    rem where arduino-cli >nul 2>&1
-    rem if errorlevel 1 (
-    rem     if exist "%LocalAppData%\Programs\Arduino CLI\arduino-cli.exe" set "PATH=%LocalAppData%\Programs\Arduino CLI;%PATH%"
-    rem     if exist "%ProgramFiles%\Arduino CLI\arduino-cli.exe" set "PATH=%ProgramFiles%\Arduino CLI;%PATH%"
-    rem )
-    rem where arduino-cli >nul 2>&1 || call :kill "arduino-cli install successful but arduino-cli.exe not found on PATH"
+    where arduino-cli >nul 2>&1
+    if errorlevel 1 (
+        if exist "%LocalAppData%\Programs\Arduino CLI\arduino-cli.exe" set "PATH=%LocalAppData%\Programs\Arduino CLI;%PATH%"
+        if exist "%ProgramFiles%\Arduino CLI\arduino-cli.exe" set "PATH=%ProgramFiles%\Arduino CLI;%PATH%"
+    )
+    where arduino-cli >nul 2>&1 || call :kill "arduino-cli install successful but arduino-cli.exe not found on PATH"
 
-    rem arduino-cli config init >nul 2>&1
-    rem arduino-cli core update-index >nul 2>&1
-    rem arduino-cli core list | findstr /i "arduino:avr" >nul 2>&1 || arduino-cli core install arduino:avr >nul 2>&1
+    arduino-cli config init >nul 2>&1
+    arduino-cli core update-index >nul 2>&1
+    arduino-cli core list | findstr /i "arduino:avr" >nul 2>&1 || arduino-cli core install arduino:avr >nul 2>&1
 
-    rem call :sleep
+    call :sleep
 
-    rem echo Installing required Arduino libraries...
-    rem arduino-cli lib install Servo >nul 2>&1
+    echo Installing required Arduino libraries...
+    arduino-cli lib install Servo >nul 2>&1
 
-    rem arduino-cli version >nul 2>&1
-    rem if errorlevel 1 call :kill "arduino-cli is present but not runnable"
+    arduino-cli version >nul 2>&1
+    if errorlevel 1 call :kill "arduino-cli is present but not runnable"
 
-    rem call :sleep
+    call :sleep
 
-    rem echo Downloading latest file versions...
-    rem call :pullFile "https://github.com/GonzalesLabVU/Behavior-BCI/blob/main/pc/behavioral_master.py" || call :kill "pullFile subroutine failed for behavioral_master.py"
-    rem call :pullFile "https://github.com/GonzalesLabVU/Behavior-BCI/blob/main/pc/cursor_utils.py" || call :kill "pullFile failed for cursor_utils.py"
-    rem call :pullFile "https://github.com/GonzalesLabVU/Behavior-BCI/blob/main/pc/plot_utils.py" || call :kill "pullFile failed for plot_utils.py"
-    rem call :pullFile "https://github.com/GonzalesLabVU/Behavior-BCI/blob/main/pc/config/animal_map.json" || call :kill "pullFile failed for animal_map.json"
-    rem call :pullFile "https://github.com/GonzalesLabVU/Behavior-BCI/blob/main/pc/config/requirements.txt" || call :kill "pullFile failed for requirements.txt"
-    rem call :pullFile "https://github.com/GonzalesLabVU/Behavior-BCI/blob/main/pc/config/errors.log" || call :kill "pullFile failed for errors.log"
-    rem call :pullFolder "https://github.com/GonzalesLabVU/Behavior-BCI/tree/main/arduino/behavioral_controller" || call :kill "pullFolder subroutine failed for behavioral_controller\"
+    echo Downloading latest file versions...
+    call :pullFile "https://github.com/GonzalesLabVU/Behavior-BCI/blob/main/pc/behavioral_master.py" || call :kill "pullFile subroutine failed for behavioral_master.py"
+    call :pullFile "https://github.com/GonzalesLabVU/Behavior-BCI/blob/main/pc/cursor_utils.py" || call :kill "pullFile failed for cursor_utils.py"
+    call :pullFile "https://github.com/GonzalesLabVU/Behavior-BCI/blob/main/pc/plot_utils.py" || call :kill "pullFile failed for plot_utils.py"
+    call :pullFile "https://github.com/GonzalesLabVU/Behavior-BCI/blob/main/pc/config/animal_map.json" || call :kill "pullFile failed for animal_map.json"
+    call :pullFile "https://github.com/GonzalesLabVU/Behavior-BCI/blob/main/pc/config/requirements.txt" || call :kill "pullFile failed for requirements.txt"
+    call :pullFile "https://github.com/GonzalesLabVU/Behavior-BCI/blob/main/pc/config/errors.log" || call :kill "pullFile failed for errors.log"
+    call :pullFolder "https://github.com/GonzalesLabVU/Behavior-BCI/tree/main/arduino/behavioral_controller" || call :kill "pullFolder subroutine failed for behavioral_controller\"
 
-    rem call :sleep
+    call :sleep
 
-    echo Installing required dependencies...
+    echo Installing required packages...
     if not exist "requirements.txt" (
         echo requirements.txt not found in %SCRIPT_DIR%
         exit /b 1
     )
     python -m pip install -r requirements.txt -q || exit /b 1
-rem )
+)
 
-rem call :sleep
+call :sleep
 
-rem echo Searching for Arduino...
-rem set "ARDUINO_CLI=arduino-cli"
-rem set "FQBN=arduino:avr:mega"
-rem call :detectPort || call :kill "No Arduino Mega 2560 detected"
+echo Searching for Arduino...
+set "ARDUINO_CLI=arduino-cli"
+set "FQBN=arduino:avr:mega"
+call :detectPort || echo [WARNING] No Arduino detected
 
-rem if /i "%DO_UPDATE%"=="Y" (
-rem     call :uploadSketch "behavioral_controller" || call :kill "Arduino upload failed"
-rem )
+if /i "%DO_UPDATE%"=="Y" (
+    call :uploadSketch "behavioral_controller" || call :kill "Arduino upload failed"
+)
 
-rem call :sleep
+call :sleep
 
 echo Running Python script...
 python -m behavioral_master
