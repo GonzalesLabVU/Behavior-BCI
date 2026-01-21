@@ -1567,6 +1567,80 @@ def cleanup(link, msg, timeout=2.0):
 # ---------------------------
 # TOP LEVEL
 # ---------------------------
+def plot_raw(filename):
+    import matplotlib.pyplot as plt
+
+    path = Path(filename)
+    with path.open('r', encoding='utf-8') as file:
+        obj = json.load(file)
+    
+    if not isinstance(obj, dict):
+        raise ValueError('JSON file must be an object/dict')
+    
+    meta = obj.get('meta', {})
+    data = obj.get('data', None)
+    if not isinstance(data, dict):
+        raise ValueError("Missing or invalid 'data' object'")
+
+    ts_list = data.get('timestamps', None)
+    vals_list = data.get('values', None)
+    if not isinstance(ts_list, list) or not isinstance(vals_list, list):
+        raise ValueError("Expected 'data.timestamps' and 'data.values' to be lists")
+    
+    if len(ts_list) != len(vals_list):
+        raise ValueError(f'Length mismatch: {len(ts_list)} timstamps vs {len(vals_list)} values')
+    
+    if len(ts_list) == 0:
+        raise ValueError('Empty timeseries')
+    
+    def _parse_time(s):
+        try:
+            return datetime.strptime(s, '%H:%M:%S.%f')
+        except ValueError as e:
+            raise ValueError(f'Bad timestamp format: {s!r} (expected HH:MM:SS.sss)') from e
+        
+    t_0 = _parse_time(ts_list[0])
+    prev_t = t_0
+    day_offset_s = 0.0
+
+    times = []
+    values = []
+
+    for t, v in zip(ts_list, vals_list):
+        t_i = _parse_time(t)
+
+        if t_i < prev_t:
+            day_offset_s += 24.0 * 3600.0
+
+        sec = (t_i - t_0).total_seconds() + day_offset_s
+        times.append(sec)
+        values.append(float(v))
+
+        prev_t = t_i
+    
+    _, ax = plt.subplots()
+
+    ax.plot(times, values)
+    ax.set_xlabel('Time [s]')
+    ax.set_ylabel('Raw Value')
+
+    parts = []
+
+    if isinstance(meta, dict):
+        if meta.get('animal') is not None:
+            parts.append(f"Animal={meta.get('animal')}")
+        if meta.get('phase') is not None:
+            parts.append(f"Phase={meta.get('phase')}")
+        if meta.get('date') is not None:
+            parts.append(f"Date={meta.get('date')}")
+    
+    title = "|".join(parts) if parts else path.name
+    ax.set_title(title)
+
+    if ax is not None and ax.figure is not None:
+        plt.show()
+
+
 def setup():
     port = find_arduino_port()
     if not port:
