@@ -2,6 +2,7 @@ import os
 import sys
 import warnings
 import traceback
+import msvcrt
 
 import random
 import time
@@ -68,7 +69,6 @@ SIDE_STREAK = 0
 
 EVT_QUEUE: "Queue[tuple[str, str]]" = Queue()
 ENC_QUEUE: "Queue[tuple[str, str]]" = Queue()
-DEV_QUEUE: "Queue[tuple[str, str, object]]" = Queue()
 EXC_STACK: "deque[dict[str, object]]" = deque()
 
 
@@ -108,15 +108,6 @@ def _now():
 # ---------------------------
 # TRIAL INFO
 # ---------------------------
-# INFO_COL_PADS = [
-#     (" " * 4, " " * 4),
-#     (" " * 4, " " * 4),
-#     (" " * 4, " " * 4),
-#     (" " * 4, " " * 4),
-#     (" " * 5, " " * 4),
-#     ]
-# INFO_VAL_WIDTH = {"TRIAL": 3, "ELAPSED": 7, "RATE": 7}
-
 INFO_LABELS = ["TRIAL", "ELAPSED", "SUCCESS", "FAILURE", "RATE"]
 INFO_LABEL_PADS = (5, 5, 4, 4, 5)
 INFO_VALUE_PADS = (6, 5, None, None, 3)
@@ -177,66 +168,6 @@ def show_trial_info(dt, n_hit, n_miss, outcome):
         cells.append(cell)
     
     print("|".join(cells))
-
-
-# def _center_cell(text, width):
-#     pad = width - len(text)
-#     left = pad // 2
-#     right = pad - left
-
-#     return (" " * left) + text + (" " * right)
-
-
-# def _right_cell(text, width):
-#     return text.rjust(width)
-
-
-# def show_trial_header():
-#     cols = []
-#     for label, (lpad, rpad) in zip(INFO_LABELS, INFO_COL_PADS):
-#         cell_w = INFO_VAL_WIDTH.get(label, len(label))
-#         cols.append(f'{lpad}{_center_cell(label, cell_w)}{rpad}')
-    
-#     header = "|".join(cols)
-#     hline = "-" * len(header)
-
-#     print(header, flush=True)
-#     print(hline, flush=True)
-
-
-# def show_trial_info(trial_n, trial_dt, n_hit, n_miss, trial_outcome):
-#     n_total = n_hit + n_miss
-#     rate = 100.0 * (n_hit / n_total) if n_total else 0.0
-
-#     trial_str = str(trial_n).rjust(INFO_VAL_WIDTH["TRIAL"])
-#     elapsed_str = f"{trial_dt:.2f} s".rjust(INFO_VAL_WIDTH["ELAPSED"])
-#     rate_str = f"{rate:.1f} %".rjust(INFO_VAL_WIDTH["RATE"])
-
-#     def _format_cell(label, text, align='center'):
-#         idx = INFO_LABELS.index(label)
-#         lpad, rpad = INFO_COL_PADS[idx]
-#         cell_w = INFO_VAL_WIDTH.get(label, len(label))
-
-#         if align == "right":
-#             inner = _right_cell(text, cell_w)
-#         else:
-#             inner = _center_cell(text, cell_w)
-        
-#         return f"{lpad}{inner}{rpad}"
-
-#     trial_cell = _format_cell('TRIAL', trial_str, align='center')
-#     elapsed_cell = _format_cell('ELAPSED', elapsed_str, align='center')
-#     rate_cell = _format_cell('RATE', rate_str, align='right')
-
-#     fill_sz = len("SUCCESS") + (2 * len(INFO_COL_PADS[2][0]))
-
-#     success_cell = BLOCK * fill_sz if trial_outcome == "hit" else " " * fill_sz
-#     failure_cell = BLOCK * fill_sz if trial_outcome == "miss" else " " * fill_sz
-
-#     cells = [trial_cell, elapsed_cell, success_cell, failure_cell, rate_cell]
-#     row = "|".join(cells)
-
-#     print(row, flush=True)
 
 
 # ---------------------------
@@ -530,6 +461,7 @@ def update_easy_rate(session_data, trial_stack):
 class ArduinoLink:
     def __init__(self, ser):
         self.ser = ser
+        self.active = ser.is_open
         self.stop_evt = Event()
         self.ack_evt = Event()
         self.msg_q: "Queue[tuple[str, str, object]]" = Queue()
@@ -582,7 +514,8 @@ class ArduinoLink:
                 pass
 
     def start(self):
-        self._reader.start()
+        if self.active:
+            self._reader.start()
 
     def close(self):
         self.stop_evt.set()
@@ -612,8 +545,8 @@ class SessionData:
             "date": date_str,
             "animal": animal_id,
             "phase": phase_id,
-            "tstart": None,
-            "tstop": None,
+            "t_start": None,
+            "t_stop": None,
             "duration_sec": None,
             "aborted": False,
             }
@@ -707,6 +640,9 @@ class SessionData:
             'raw': _json_safe(self.raw)
             }
 
+    def is_finished(self):
+        return self.meta['t_start'] and self.meta['t_stop']
+
 
 def choose_trial_type(trial_n, K):
     if trial_n <= 20:
@@ -740,7 +676,7 @@ def choose_target_side(phase_id):
     return side
 
 
-def send_config(is_easy, side, mode='ack', timeout=3.0):
+def send_config(link, is_easy, side, mode='ack', timeout=3.0):
     cfg = f'T {1 if is_easy else 0} {side}'
 
     if mode == 'ack':
@@ -749,15 +685,6 @@ def send_config(is_easy, side, mode='ack', timeout=3.0):
         link.send(cfg)
     else:
         raise ValueError("'mode' must be one of: 'ack', 'no_ack'")
-
-
-def send_next_config(link, next_type, next_side, dev_mode=False, timeout=3.0):
-    cmd = f'T {1 if next_type else 0} {next_side}'
-
-    if dev_mode:
-        link.send(cmd)
-    else:
-        link.send_and_wait(cmd, timeout=timeout)
 
 
 # ---------------------------
@@ -1243,8 +1170,10 @@ class FileLock:
 
 def save_data(session_data):
     workbook_id = session_data.meta.get("workbook_id")
+
     if not workbook_id:
-        raise ValueError("session_data.meta['workbook_id'] is missing")
+        print('[WARNING] No data recorded (skipping save)')
+        return
     
     client_id = _get_client_id()
 
@@ -1638,170 +1567,6 @@ def cleanup(link, msg, timeout=2.0):
 # ---------------------------
 # TOP LEVEL
 # ---------------------------
-def _dev_start(evt_q, enc_q, dev_q, session_data, state, stop_evt, cursor,
-               key_speed=50.0, trial_ms=30_000):
-    state.setdefault('sim_requested', False)
-    state.setdefault('sim_active', False)
-    state.setdefault('sim_arm', False)
-    state.setdefault('trial_active', False)
-    state.setdefault('trial_start_ms', None)
-    state.setdefault('key_left', False)
-    state.setdefault('key_right', False)
-
-    t = Thread(
-        target=_dev_loop,
-        args=(evt_q, enc_q, dev_q, session_data, state, stop_evt, cursor,
-              float(key_speed), int(trial_ms)),
-        daemon=True
-        )
-    t.start()
-
-    return t
-
-
-def _dev_loop(evt_q, enc_q, dev_q, session_data, state, stop_evt, cursor,
-              key_speed, trial_ms):
-    MIN_DEG = -90.0
-    MAX_DEG = +90.0
-
-    def _emit_evt(e):
-        t = _get_ts()
-
-        try:
-            dev_q.put_nowait(("EVT", t, e))
-        except Exception:
-            pass
-    
-    def _emit_enc(d):
-        t = _get_ts()
-        v = f'{d:.2f}'
-
-        try:
-            dev_q.put_nowait(("ENC", t, v))
-        except Exception:
-            pass
-    
-    def _is_hit(d):
-        try:
-            th = float(getattr(cursor, 'threshold'))
-            easy_th = float(getattr(cursor, 'easy_threshold', 15.0))
-        except Exception:
-            th = 30.0
-            easy_th = 15.0
-        
-        try:
-            from cursor_utils import TRIAL_CONFIG, TRIAL_LOCK
-
-            with TRIAL_LOCK:
-                is_easy, alignment = TRIAL_CONFIG
-        except Exception:
-            is_easy, alignment = (False, "B")
-        
-        alignment = (alignment or "B").upper()
-        if alignment not in {"L", "R", "B"}:
-            alignment = "B"
-        
-        T = easy_th if bool(is_easy) else th
-
-        match alignment:
-            case "B":
-                return abs(d) >= abs(T)
-            case "L":
-                return d <= -abs(T)
-            case "R":
-                return d >= +abs(T)
-            case _:
-                return False
-    
-    def _is_miss(d):
-        try:
-            th = float(getattr(cursor, 'threshold'))
-            easy_th = float(getattr(cursor, 'easy_threshold', 15.0))
-        except Exception:
-            th = 30.0
-            easy_th = 15.0
-        
-        try:
-            from cursor_utils import TRIAL_CONFIG, TRIAL_LOCK
-
-            with TRIAL_LOCK:
-                is_easy, alignment = TRIAL_CONFIG
-        except Exception:
-            is_easy, alignment = (False, "B")
-        
-        alignment = (alignment or "B").upper()
-        if alignment not in {"L", "R", "B"}:
-            alignment = "B"
-        
-        T = easy_th if bool(is_easy) else th
-
-        match alignment:
-            case "L":
-                return d >= +abs(T)
-            case "R":
-                return d <= -abs(T)
-            case _:
-                return False
-    
-    def _now_ms():
-        return int(time.time() * 1000)
-    
-    deg = 0.0
-    last_t = time.time()
-    outcome_sent = False
-
-    while not stop_evt.is_set():
-        sim_req = bool(state.get('sim_requested', False))
-        sim_active = bool(state.get('sim_active', False))
-        trial_active = bool(state.get('trial_active', False))
-
-        if not sim_req or not sim_active or not trial_active:
-            deg = 0.0
-            outcome_sent = False
-            last_t = time.time()
-            time.sleep(0.01)
-            continue
-
-        now_s = time.time()
-        dt = max(0.0, now_s - last_t)
-        last_t = now_s
-
-        key_left = bool(state.get('key_left', False))
-        key_right = bool(state.get('key_right', False))
-        dx = 0.0
-
-        if key_left:
-            dx -= key_speed * dt
-        if key_right:
-            dx += key_speed * dt
-        
-        if dx:
-            deg = max(MIN_DEG, min(MAX_DEG, deg + dx))
-        
-        _emit_enc(deg)
-
-        start_ms = state.get('trial_start_ms', None)
-        now_ms = _now_ms()
-        elapsed_ms = 0 if start_ms is None else max(0, now_ms - int(start_ms))
-
-        is_hit = _is_hit(deg)
-        is_miss = _is_miss(deg)
-        is_timeout = elapsed_ms >= int(trial_ms)
-
-        if not outcome_sent and (is_hit or is_miss or is_timeout):
-            outcome_sent = True
-
-            if is_hit:
-                _emit_evt("hit")
-            else:
-                _emit_evt("miss")
-        
-        if not bool(state.get('trial_active', False)):
-            outcome_sent = False
-        
-        time.sleep(0.003)
-
-
 def setup():
     port = find_arduino_port()
     if not port:
@@ -1839,16 +1604,16 @@ def setup():
             animal_id = "DEV"
         else:
             animal_id = animal_raw
-
-        dev_mode = (animal_id == "DEV")
-        workbook_id = None
-
-        if not dev_mode:
+        
+        if animal_id != "DEV":
             validate_resources()
             animal_map = load_animal_map()
             validate_animal(animal_id, animal_map)
 
-            workbook_id = _get_workbook_id(animal_id, animal_map)            
+        if animal_id != "DEV":
+            workbook_id = _get_workbook_id(animal_id, animal_map)
+        else:
+            workbook_id = None
 
         valid_phases = {"1", "2"} | set(PHASE_CONFIG.keys())
 
@@ -1865,6 +1630,7 @@ def setup():
             print("Please enter a valid phase", flush=True)
         
         global LAST_SIDE, SIDE_STREAK
+
         LAST_SIDE = None
         SIDE_STREAK = 0
 
@@ -1884,9 +1650,10 @@ def setup():
         pulse_ms = _safe_float("SPOUT_PULSE_MS")
 
         try:
-            link.send_and_wait(str(int(phase_id)))
-            link.send_and_wait(f"{engage_ms:.4f} {release_ms:.4f}")
-            link.send_and_wait(f"{pulse_ms:.4f}")
+            if link.active:
+                link.send_and_wait(str(int(phase_id)))
+                link.send_and_wait(f"{engage_ms:.4f} {release_ms:.4f}")
+                link.send_and_wait(f"{pulse_ms:.4f}")
         except Exception as e:
             link.close()
             raise RuntimeError(f'Failed during Arduino initialization handshake: {e}') from e
@@ -1900,7 +1667,8 @@ def setup():
             side_1 = choose_target_side(phase_id=phase_id)
 
             try:
-                send_next_config(link, type_1, side_1, dev_mode)
+                send_config(link, type_1, side_1,
+                            mode=f'{"ack" if link.active else "no_ack"}')
             except Exception as e:
                 print(f'[ERROR] Unhandled exception during initial phase hand-off: {e}')
 
@@ -1919,15 +1687,13 @@ def setup():
             phase_id=phase_id,
             date_str=_get_date()
             )
-        
-        if not dev_mode:
-            session_data.meta["workbook_id"] = workbook_id
-        
+        session_data.meta['workbook_id'] = workbook_id
+
         _ensure_session_tracking(session_data)
         if type_1 is not None and side_1 is not None:
             log_trial_config(session_data, trial_n=1, type=type_1, side=side_1)
 
-        return link, session_data, cursor, dev_mode
+        return link, session_data, cursor
     except Exception as e:
         cache_exc(e, 'setup')
 
@@ -1945,7 +1711,7 @@ def setup():
         raise
 
 
-def main(link, session_data, cursor, dev_mode):
+def main(link, session_data, cursor):
     do_calibration = str(session_data.meta["phase"]) not in {"1", "2"}
 
     K = 5
@@ -1960,44 +1726,14 @@ def main(link, session_data, cursor, dev_mode):
     trial_dt = 0.0
     recent_outcomes = deque()
 
-    dev_stop_evt = Event()
-    dev_thread = None
-
-    dev_state = (getattr(cursor, 'control_state', None) if (dev_mode and cursor is not None) else None)
-    if dev_state is None:
-        dev_state = {}
-    
-    dev_state.setdefault('sim_requested', False)
-    dev_state.setdefault('sim_active', False)
-    dev_state.setdefault('sim_arm', False)
-    dev_state.setdefault('trial_active', False)
-    dev_state.setdefault('trial_start_ms', None)
-    dev_state.setdefault('key_left', False)
-    dev_state.setdefault('key_right', False)
+    def _get_msg(timeout=0.05):
+        typ, ts, payload = link.msg_q.get(timeout=timeout)
+        return typ, ts, payload
 
     started = False
     t0 = None
 
     try:
-        if dev_mode and cursor is not None:
-            dev_stop_evt.clear()
-            dev_thread = _dev_start(EVT_QUEUE, ENC_QUEUE, DEV_QUEUE, session_data,
-                                    dev_state, dev_stop_evt, cursor)
-        
-        def _get_msg(timeout=0.05):
-            if dev_mode and cursor is not None:
-                while True:
-                    try:
-                        typ, ts, payload = DEV_QUEUE.get_nowait()
-                    except Empty:
-                        break
-
-                    if bool(dev_state.get('sim_active', False)):
-                        return typ, ts, payload
-            
-            typ, ts, payload = link.msg_q.get(timeout=timeout)
-            return typ, ts, payload
-
         while link.ser and link.ser.is_open:
             if ABORT_EVT.is_set():
                 raise KeyboardInterrupt
@@ -2032,12 +1768,6 @@ def main(link, session_data, cursor, dev_mode):
             if typ == "EVT":
                 p = str(payload)
 
-                sim_req = bool(dev_state.get('sim_requested', False))
-                sim_arm = bool(dev_state.get('sim_arm', False))
-
-                if sim_req and p in {"hit", "miss"}:
-                    continue
-
                 try:
                     EVT_QUEUE.put_nowait((ts, p))
                 except Exception:
@@ -2047,18 +1777,8 @@ def main(link, session_data, cursor, dev_mode):
                     trial_n += 1
                     last_outcome = None
                     trial_start_ms = _ts_to_ms(ts)
-
-                    dev_state['trial_start_ms'] = trial_start_ms
-                    dev_state['trial_active'] = True
-
-                    if sim_arm:
-                        dev_state['sim_active'] = True
-                        dev_state['sim_arm'] = False
                 
                 if p in {'hit', 'miss'}:
-                    dev_state['trial_start_ms'] = None
-                    dev_state['trial_active'] = False
-
                     if last_outcome == p:
                         continue
                     last_outcome = p
@@ -2100,7 +1820,7 @@ def main(link, session_data, cursor, dev_mode):
                         next_type = choose_trial_type(next_trial_n, K)
                         next_side = choose_target_side(session_data.meta['phase'])
 
-                        send_next_config(link, next_type, next_side, dev_mode)
+                        send_config(link, next_type, next_side, mode='ack')
                         log_trial_config(session_data, trial_n=next_trial_n, type=next_type, side=next_side)
                         
                         cursor.update_config(next_type, next_side)
@@ -2109,9 +1829,6 @@ def main(link, session_data, cursor, dev_mode):
                     session_data.add_raw_evt(ts, p)
 
             if typ == "ENC":
-                if bool(dev_state.get('sim_requested', False)):
-                    continue
-
                 p = str(payload)
                 session_data.add_enc(ts, p)
 
@@ -2126,14 +1843,6 @@ def main(link, session_data, cursor, dev_mode):
     except Exception as e:
         cache_exc(e, 'main')
     finally:
-        if dev_thread is not None:
-            dev_stop_evt.set()
-
-            try:
-                dev_thread.join(timeout=2.0)
-            except Exception:
-                pass
-
         if session_data.meta["t_start"] is None:
             session_data.meta["t_start"] = datetime.now().isoformat(timespec="seconds")
 
@@ -2153,7 +1862,6 @@ if __name__ == "__main__":
     link = None
     session_data = None
     cursor = None
-    dev_mode = True
 
     animal_id_for_log = "UNKNOWN"
     phase_id_for_log = "0"
@@ -2161,13 +1869,13 @@ if __name__ == "__main__":
     run_exc = None
 
     try:
-        link, session_data, cursor, dev_mode = setup()
+        link, session_data, cursor = setup()
 
         if session_data is not None:
             animal_id_for_log = session_data.meta.get("animal", "UNKNOWN")
             phase_id_for_log = session_data.meta.get("phase", "0")
 
-        main(link, session_data, cursor, dev_mode)
+        main(link, session_data, cursor)
     except BaseException as e:
         run_exc = e
         cache_exc(e, '__main__')
@@ -2180,38 +1888,39 @@ if __name__ == "__main__":
                 cursor.stop()
             except Exception as e:
                 cache_exc(e, '__main__.cursor_stop')
-
-                if not dev_mode:
-                    log_and_commit(*run_info, e)
+                log_and_commit(*run_info, e)
         
         if link is not None:
             try:
                 link.close()
             except Exception as e:
                 cache_exc(e, '__main__.link_close')
-
-                if not dev_mode:
-                    log_and_commit(*run_info, e)
+                log_and_commit(*run_info, e)
         
         save_raw(session_data)
 
-        if not dev_mode:
-            if session_data is not None and session_data.meta.get('t_start') and session_data.meta.get('t_stop'):
-                try:
-                    send_email(session_data)
-                except Exception as e:
-                    cache_exc(e, '__main__.send_email')
-                    log_and_commit(*run_info, e)
-            
-            if session_data is not None and session_data.any_data():
-                try:
-                    save_choice = input("\nSave current session? [Y/n]:  ").strip().lower()
-                    
-                    if save_choice in {"", "y", "yes"}:
-                        ok = safe_save(session_data)
-                        if not ok:
-                            print("[WARNING] Google Sheets save failed (local fallback used instead)", flush=True)
-                except Exception as e:
-                    cache_exc(e, '__main__.safe_save')
+        if session_data is not None and session_data.is_finished():
+            try:
+                pass # send_email(session_data)
+            except Exception as e:
+                cache_exc(e, '__main__.send_email')
+                log_and_commit(*run_info, e)
+        
+        if session_data is not None and session_data.any_data():
+            try:
+                save_choice = input("\nSave current session? [Y/n]:  ").strip().lower()
+                cmd_run('echo.')
+                
+                if save_choice in {"", "y", "yes"}:
+                    pass
+                    # ok = safe_save(session_data)
+                    # if not ok:
+                    #     print("[WARNING] Google Sheets save failed (local fallback used instead)", flush=True)
+            except Exception as e:
+                cache_exc(e, '__main__.safe_save')
 
         print_stack()
+
+        print('\nPress any key to continue . . .', flush=True)
+        msvcrt.getch()
+        cmd_run('echo.')
