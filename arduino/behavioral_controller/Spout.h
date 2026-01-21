@@ -7,7 +7,7 @@ class Spout {
     public:
         Spout();
 
-        void init();
+        void init(unsigned long pulse_dur_us);
         void pulse();
         void flush();
     
@@ -15,7 +15,8 @@ class Spout {
         static constexpr uint8_t PULSE_PIN = 5;
         static constexpr uint8_t INIT_PIN = 4;
         static constexpr unsigned long INIT_DUR = 10000;
-        static constexpr unsigned int PULSE_DUR_US = 5750;
+
+        unsigned long pulse_dur_us_;
 };
 
 #endif

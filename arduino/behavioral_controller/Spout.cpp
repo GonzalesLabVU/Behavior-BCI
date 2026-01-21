@@ -3,11 +3,13 @@
 Spout::Spout()
 {}
 
-void Spout::init() {
+void Spout::init(unsigned long pulse_dur_us) {
     pinMode(PULSE_PIN, OUTPUT);
     digitalWrite(PULSE_PIN, LOW);
 
     pinMode(INIT_PIN, INPUT);
+
+    pulse_dur_us_ = pulse_dur_us;
     
     unsigned long t_start = millis();
     while ((millis() - t_start) < INIT_DUR) {
@@ -21,7 +23,7 @@ void Spout::init() {
 
 void Spout::pulse() {
     digitalWrite(PULSE_PIN, HIGH);
-    delayMicroseconds(PULSE_DUR_US);
+    delayMicroseconds(pulse_dur_us_);
     digitalWrite(PULSE_PIN, LOW);
 }
 
