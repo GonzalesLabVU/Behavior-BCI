@@ -200,7 +200,7 @@ void Lick::calibrate() {
     writeReg_(0x5B, 0x00);
 }
 
-void Lick::poll() {
+void Lick::sampleFiltered() {
     Wire.beginTransmission(ADDR);
     Wire.write(TOUCHSTATUS);
     Wire.endTransmission(false);
@@ -226,24 +226,7 @@ bool Lick::justTouched() {
     return just_touched_;
 }
 
-uint16_t Lick::getRaw() {
-    if (!read_raw_enabled_) {
-        return 0;
-    }
-
-    uint32_t now = millis();
-    bool valid_sample = (uint32_t)(now - last_raw_sample_ms_) >= RAW_SAMPLE_MS;
-
-    if (last_raw_sample_ms_ != 0 && !valid_sample) {
-        return 0;
-    }
-
-    uint16_t val = readFiltered_(RAW_ELECTRODE);
-
-    if (val != 0) {
-        last_raw_sample_ms_ = now;
-        return val;
-    }
-
-    return 0;
+uint16_t Lick::sampleRaw() {
+    if (!read_raw_enabled_) return 0;
+    return readFiltered_(RAW_ELECTRODE);
 }

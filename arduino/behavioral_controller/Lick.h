@@ -10,9 +10,9 @@ class Lick {
 
         void init(bool read_raw = false);
         void calibrate();
-        void poll();
+        void sampleFiltered();
         bool justTouched();
-        uint16_t getRaw();
+        uint16_t sampleRaw();
     
     private:
         static constexpr uint8_t ADDR = 0x5A;
