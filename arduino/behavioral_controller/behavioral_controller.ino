@@ -14,7 +14,7 @@
 // macros
 
 #define BAUDRATE 1000000
-#define RAW_FLAG false
+#define RAW_FLAG true
 #define SEED_PIN A0
 #define POWER_EN 7
 
@@ -59,6 +59,7 @@ Speaker speaker;
 
 Timer session_timer;
 Timer phase_timer;
+Timer raw_timer;
 
 Logger logger;
 
@@ -74,6 +75,7 @@ unsigned long session_T;
 unsigned long trial_T;
 unsigned long delay_T;
 unsigned long tone_T = SECONDS(1);
+unsigned long sample_T = MINUTES(5);
 
 float easy_threshold = DEGREES(15);
 float threshold;
@@ -87,7 +89,7 @@ long last_disp_mark = LONG_MIN;
 bool next_easy_trial = false;
 char next_alignment = 'B';
 
-static constexpr uint32_t raw_sample_hz = 30;
+static constexpr uint32_t raw_sample_hz = 100;
 static constexpr uint32_t raw_sample_us = 1000000UL / raw_sample_hz;
 
 // phase logic forward declarations
@@ -453,6 +455,10 @@ void setup() {
 
     // settle delay
     delay(5000);
+
+    // start raw sample timer
+    raw_timer.init(sample_T);
+    raw_timer.start();
 }
 
 void loop() {
@@ -466,8 +472,9 @@ void loop() {
                 default: run_phase_3_plus(); break;
             }
 
-            if (RAW_FLAG) {
-                static uint32_t last_raw_us = 0;
+            static uint32_t last_raw_us = 0;
+
+            if (RAW_FLAG && raw_timer.isRunning()) {
                 uint32_t now_us = micros();
 
                 if ((uint32_t)(now_us - last_raw_us) >= raw_sample_us) {
@@ -476,6 +483,8 @@ void loop() {
                     uint16_t raw_val = lick.sampleRaw();
                     logger.writeRaw(raw_val);
                 }
+            } else {
+                last_raw_us = micros();
             }
 
             break;
