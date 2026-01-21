@@ -1975,7 +1975,7 @@ if __name__ == "__main__":
 
         if session_data is not None and session_data.is_finished():
             try:
-                pass # send_email(session_data)
+                send_email(session_data)
             except Exception as e:
                 cache_exc(e, '__main__.send_email')
                 log_and_commit(*run_info, e)
@@ -1986,10 +1986,9 @@ if __name__ == "__main__":
                 cmd_run('echo.')
                 
                 if save_choice in {"", "y", "yes"}:
-                    pass
-                    # ok = safe_save(session_data)
-                    # if not ok:
-                    #     print("[WARNING] Google Sheets save failed (local fallback used instead)", flush=True)
+                    ok = safe_save(session_data)
+                    if not ok:
+                        print("[WARNING] Google Sheets save failed (local fallback used instead)", flush=True)
             except Exception as e:
                 cache_exc(e, '__main__.safe_save')
 
