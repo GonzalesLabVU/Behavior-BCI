@@ -28,6 +28,12 @@ void Logger::write(float data) {
     Serial.flush();
 }
 
+void Logger::writeRaw(uint16_t data) {
+    String output = "[RAW] " + String(data);
+    Serial.println(output);
+    Serial.flush();
+}
+
 String Logger::read() {
     if (Serial.available() > 0) {
         String line = Serial.readStringUntil('\n');

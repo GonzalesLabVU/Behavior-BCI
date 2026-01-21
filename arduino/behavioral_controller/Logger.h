@@ -10,6 +10,7 @@ class Logger {
         void write(const String& data);
         void write(int data);
         void write(float data);
+        void writeRaw(uint16_t data);
         String read();
         void ack();
 };
