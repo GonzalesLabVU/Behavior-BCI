@@ -335,6 +335,26 @@ static void drainSerial() {
             session_state = SessionState::CLEANUP;
             logger.ack();
             continue;
+        } else if (msg == "H") {
+            logger.ack();
+
+            if (phase_id >= 3 && phase_state == PhaseState::TRIAL) {
+                phase_timer.reset();
+                trial_hit = true;
+                reward_given = false;
+                phase_state = PhaseState::HIT;
+            }
+
+            continue;
+        } else if (msg == "M") {
+            logger.ack();
+
+            if (phase_id >= 3 && phase_state == PhaseState::TRIAL) {
+                phase_timer.reset();
+                trial_hit = false;
+                reward_given = false;
+                phase_state = PhaseState::MISS;
+            }
         }
 
         if (phase_id >= 3) {
@@ -439,6 +459,27 @@ void setup() {
             break;
         }
         case 8: {
+            session_T = MINUTES(45);
+            trial_T = SECONDS(30);
+            delay_T = SECONDS(3);
+            threshold = DEGREES(90);
+            break;
+        }
+        case 9: {
+            session_T = MINUTES(45);
+            trial_T = SECONDS(30);
+            delay_T = SECONDS(3);
+            threshold = DEGREES(30);
+            break;
+        }
+        case 10: {
+            session_T = MINUTES(45);
+            trial_T = SECONDS(30);
+            delay_T = SECONDS(3);
+            threshold = DEGREES(60);
+            break;
+        }
+        case 11: {
             session_T = MINUTES(45);
             trial_T = SECONDS(30);
             delay_T = SECONDS(3);
