@@ -577,12 +577,13 @@ void run_phase_1() {
         case PhaseState::TRIAL: {
             if (session_timer.isRunning()) {
                 lick.sampleFiltered();
-
                 if (lick.justTouched()) {
                     logger.write("lick");
 
                     phase_state = PhaseState::DELAY;
                 }
+
+                spout.poll();
             }
             else {
                 spout.pulse();
@@ -686,10 +687,11 @@ void run_phase_2() {
                 // running
                 if (phase_timer.isRunning()) {
                     lick.sampleFiltered();
-
                     if (lick.justTouched()) {
                         logger.write("lick");
                     }
+
+                    spout.poll();
                 }
                 // exit
                 else {
@@ -868,6 +870,8 @@ void run_phase_3_plus() {
                         trial_hit = false;
                         phase_state = PhaseState::MISS;
                     }
+
+                    spout.poll();
                 }
                 // failure exit
                 else {
