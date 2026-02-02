@@ -1,5 +1,6 @@
-// include libraries
-
+// ---------------------------
+// IMPORTS
+// ---------------------------
 #include "Wheel.h"
 #include "Brake.h"
 #include "Lick.h"
@@ -10,47 +11,52 @@
 
 #include <math.h>
 #include <limits.h>
+#include <string.h>
+#include <stdlib.h>
+#include <ctype.h>
 
-// macros
-
-#define BAUDRATE 1000000
-#define RAW_FLAG true
-#define SEED_PIN A0
-#define POWER_EN 7
-
-// unit conversion handles
-
+// ---------------------------
+// CONVERSION HANDLES
+// ---------------------------
 template <typename T>
 constexpr unsigned long MILLISECONDS(T s) { return static_cast<unsigned long>(s * 1000.0f); }
+
 template <typename T>
 constexpr unsigned long MICROSECONDS(T s) { return static_cast<unsigned long>(s * 1000000.0f); }
+
 template <typename T>
 constexpr unsigned long SECONDS(T s) { return static_cast<unsigned long>(s * 1000.0f); }
+
 template <typename T>
 constexpr unsigned long MINUTES(T m) { return static_cast<unsigned long>(m * 60.0f * 1000.0f); }
+
 template <typename T>
 constexpr float DEGREES(T d) { return static_cast<float>(d); }
 
-// phase_state machine
+// ---------------------------
+// CONFIG
+// ---------------------------
+#define BAUDRATE 1000000
+#define RAW_FLAG false
+#define SEED_PIN A0
+#define POWER_EN 7
 
-enum class SessionState {
-    MAIN,
-    CLEANUP
-};
-SessionState session_state;
+static constexpr uint32_t RAW_HZ = 100;
+static constexpr uint32_t RAW_US = 1000000UL / RAW_HZ;
+static constexpr unsigned long sample_T = MINUTES(5);
 
-enum class PhaseState {
-    IDLE,
-    CUE,
-    TRIAL,
-    HIT,
-    MISS,
-    DELAY
-};
-PhaseState phase_state;
+// ---------------------------
+// STATE
+// ---------------------------
+enum class SessionState { MAIN, CLEANUP };
+enum class PhaseState { IDLE, CUE, TRIAL, HIT, MISS, DELAY };
 
-// component objects
+SessionState session_state = SessionState::MAIN;
+PhaseState phase_state = PhaseState::IDLE;
 
+// ---------------------------
+// COMPONENTS
+// ---------------------------
 Brake brake;
 Lick lick;
 Wheel wheel;
@@ -63,209 +69,289 @@ Timer raw_timer;
 
 Logger logger;
 
-// global parameters
+// ---------------------------
+// TRIAL CONFIG
+// ---------------------------
+struct SessionConfig {
+    int phase = 3;
+    float engage_ms = 0.0f;
+    float release_ms = 0.0f;
+    float pulse_ms = 0.0f;
+    float threshold = 30.0f;
+    char side = 'B';
+    bool reverse = false;
+};
 
-int phase_id = 0;
+struct TrialConfig {
+    long trial_n = 0;
+    bool easy = false;
+    char side = 'B';
+    bool pending = false;
+};
 
-float engage_ms = 0.0f;
-float release_ms = 0.0f;
-float pulse_ms = 0.0f;
+static SessionConfig session_cfg;
+static TrialConfig trial_cfg;
 
-unsigned long session_T;
-unsigned long trial_T;
-unsigned long delay_T;
-unsigned long tone_T = SECONDS(1);
-unsigned long sample_T = MINUTES(5);
+static unsigned long session_T = MINUTES(45);
+static unsigned long trial_T = SECONDS(30);
+static unsigned long delay_T = SECONDS(3);
+static unsigned long tone_T = SECONDS(1);
 
-float easy_threshold = DEGREES(15);
-float threshold;
+static float easy_threshold = DEGREES(15.0f);
 
-bool session_initialized = false;
-bool trial_hit;
-bool reward_given = false;
+static bool session_initialized = false;
+static bool trial_hit = false;
+static bool reward_given = false;
+static long last_disp_mark = LONG_MIN;
 
-long last_disp_mark = LONG_MIN;
+// ---------------------------
+// SERIAL HELPERS
+// ---------------------------
+static bool readLine(char* buf, size_t cap) {
+    if (!Serial.available()) return false;
 
-bool next_easy_trial = false;
-char next_alignment = 'B';
+    size_t n = Serial.readBytesUntil('\n', buf, cap - 1);
+    if (n == 0) return false;
 
-static constexpr uint32_t raw_sample_hz = 100;
-static constexpr uint32_t raw_sample_us = 1000000UL / raw_sample_hz;
+    buf[n] = '\0';
 
-// phase logic forward declarations
-
-void run_phase_1();
-void run_phase_2();
-void run_phase_3_plus();
-
-// helper functions
-
-static bool tokenLooksFloat_(const String& t) {
-    return (t.indexOf('.') >= 0) || (t.indexOf('e') >= 0) || (t.indexOf('E') >= 0);
-}
-
-static int countTokens_(const String& s) {
-    int count = 0;
-    bool in_token = false;
-
-    for (int i = 0; i < (int)s.length(); i++) {
-        char c = s[i];
-        bool ws = (c == ' ' || c == '\t');
-
-        if (!ws && !in_token) { in_token = true; count++; }
-        if (ws) in_token = false;
+    while (n && (buf[n - 1] == '\r' || buf[n - 1] == ' ' || buf[n - 1] == '\t')) {
+        buf[--n] = '\0';
     }
 
-    return count;
+    char* p = buf;
+    while (*p == ' ' || *p == '\t') p++;
+    if (p != buf) memmove(buf, p, strlen(p) + 1);
+
+    return buf[0] != '\0';
 }
 
-static String tokenAt_(const String& s, int idx) {
-    int seen = -1;
-    int i = 0;
+static bool isSideChar(char c) {
+    c = (char)toupper((unsigned char)c);
+    return (c == 'L' || c == 'R' || c == 'B');
+}
 
-    while (i < (int)s.length()) {
-        while (i < (int)s.length() && (s[i] == ' ' || s[i] == '\t')) i++;
-        if (i >= (int)s.length()) break;
+static void applyPhaseDefaults(int phase_id) {
+    if (phase_id == 1) {
+        session_T = MINUTES(10);
+        trial_T = SECONDS(0);
+        delay_T = SECONDS(5);
+    } else if (phase_id == 2) {
+        session_T = MINUTES(22.5f);
+        trial_T = SECONDS(30);
+        delay_T = SECONDS(3);
+    } else {
+        session_T = MINUTES(2);
+        trial_T = SECONDS(30);
+        delay_T = SECONDS(3);
+    }
+}
 
-        int start = i;
-        while (i < (int)s.length() && (s[i] != ' ' && s[i] != '\t')) i++;
-        int end = i;
+static bool parseTrialConfig(char* line) {
+    if (isalpha((unsigned char)line[0])) return false;
 
-        seen++;
-        if (seen == idx) return s.substring(start, end);
+    char* s = line;
+    char* t0 = strtok(s, " \t");
+    char* t1 = strtok(nullptr, " \t");
+    char* t2 = strtok(nullptr, " \t");
+
+    if (!t0 || !t1) return false;
+
+    char* end0 = nullptr;
+    long tn = strtol(t0, &end0, 10);
+    if (!end0 || *end0 != '\0') return false;
+
+    char* end1 = nullptr;
+    long ef = strtol(t1, &end1, 10);
+    if (!end1 || *end1 != '\0') return false;
+
+    trial_cfg.trial_n = tn;
+    trial_cfg.easy = (ef != 0);
+    trial_cfg.side = session_cfg.side;
+
+    if (t2 && t2[0] && isSideChar(t2[0])) {
+        trial_cfg.side = (char)toupper((unsigned char)t2[0]);
     }
 
-    return String("");
-}
-
-static bool parseConfig_(const String& line, bool* easy_out, char* align_out) {
-    if (!line.startsWith("T")) return false;
-
-    int first_space = line.indexOf(' ');
-    if (first_space < 0) return false;
-
-    int second_space = line.indexOf(' ', first_space + 1);
-    if (second_space < 0) return false;
-
-    String easy_str = line.substring(first_space + 1, second_space);
-    String align_str = line.substring(second_space + 1);
-    align_str.trim();
-
-    if (align_str.length() < 1) return false;
-
-    int e = easy_str.toInt();
-    char a = align_str.charAt(0);
-
-    if (!(a == 'L' || a == 'l' || a == 'R' || a == 'r' || a == 'B' || a == 'b')) return false;
-
-    if (easy_out) *easy_out = (e != 0);
-    if (align_out) *align_out = a;
-
+    trial_cfg.pending = true;
     return true;
 }
 
-static void parseParams() {
-    bool have_phase = false;
-    bool have_brake = false;
-    bool have_spout = false;
+static bool parseKeyValue(char* line) {
+    char* key = strtok(line, " \t");
+    char* val = strtok(nullptr, " \t");
+    if (!key || !val) return false;
+
+    if (strcmp(key, "engage") == 0) {
+        session_cfg.engage_ms = atof(val);
+        return (session_cfg.engage_ms > 0.0f);
+    }
+    if (strcmp(key, "release") == 0) {
+        session_cfg.release_ms = atof(val);
+        return (session_cfg.release_ms > 0.0f);
+    }
+    if (strcmp(key, "pulse") == 0) {
+        session_cfg.pulse_ms = atof(val);
+        return (session_cfg.pulse_ms > 0.0f);
+    }
+    if (strcmp(key, "threshold") == 0) {
+        session_cfg.threshold = DEGREES(atof(val));
+        return (session_cfg.threshold >= 0.0f);
+    }
+    if (strcmp(key, "side") == 0) {
+        char c = (char)toupper((unsigned char)val[0]);
+        if (!isSideChar(c)) return false;
+
+        session_cfg.side = c;
+        return true;
+    }
+    if (strcmp(key, "reverse") == 0) {
+        long v = strtol(val, nullptr, 10);
+        if (!(v == 0 || v == 1)) return false;
+
+        session_cfg.reverse = (v == 1);
+        return true;
+    }
+    if (strcmp(key, "phase") == 0) {
+        long v = strtol(val, nullptr, 10);
+        if (v < 1 || v > 99) return false;
+
+        session_cfg.phase = (int)v;
+        return true;
+    }
+
+    return false;
+}
+
+static void waitForHandshake() {
+    bool have_engage = false;
+    bool have_release = false;
+    bool have_pulse = false;
+    bool have_threshold = false;
+    bool have_side = false;
+    bool have_reverse = false;
     bool have_trial = false;
 
-    next_easy_trial = false;
-    next_alignment = 'B';
+    session_cfg.phase = 3;
 
-    while (true) {
-        String msg = logger.read();
-        if (!msg.length()) continue;
+    char line[96];
 
-        if (msg == "E") {
+    for (;;) {
+        if (!readLine(line, sizeof(line))) continue;
+
+        // control override messages
+        if (strcmp(line, "E") == 0) {
             session_state = SessionState::CLEANUP;
             logger.ack();
             return;
         }
 
-        if (!have_trial) {
-            bool e;
-            char a;
+        // trial config settings
+        {
+            char tmp[96];
+            strncpy(tmp, line, sizeof(tmp));
+            tmp[sizeof(tmp)-1] = 0;
 
-            if (parseConfig_(msg, &e, &a)) {
-                next_easy_trial = e;
-                next_alignment = a;
+            if (!have_trial && parseTrialConfig(tmp)) {
                 have_trial = true;
                 logger.ack();
                 goto check_done;
             }
         }
 
+        // session config settings
         {
-            int n_tokens = countTokens_(msg);
+            char tmp[96];
+            strncpy(tmp, line, sizeof(tmp));
+            tmp[sizeof(tmp)-1] = 0;
 
-            if (!have_brake && n_tokens == 2) {
-                String t0 = tokenAt_(msg, 0);
-                String t1 = tokenAt_(msg, 1);
+            if (parseKeyValue(tmp)) {
+                if (strncmp(line, "engage", 6) == 0) have_engage = (session_cfg.engage_ms > 0.0f);
+                if (strncmp(line, "release", 7) == 0) have_release = (session_cfg.release_ms > 0.0f);
+                if (strncmp(line, "pulse", 5) == 0) have_pulse = (session_cfg.pulse_ms > 0.0f);
+                if (strncmp(line, "threshold", 9) == 0) have_threshold = true;
+                if (strncmp(line, "side", 4) == 0) have_side = true;
+                if (strncmp(line, "reverse", 7) == 0) have_reverse = true;
 
-                float e_ms = t0.toFloat();
-                float r_ms = t1.toFloat();
+                logger.ack();
+            }
+        }
+    
+    check_done:
+        if (have_engage && have_release && have_pulse && have_threshold && have_side && have_reverse && have_trial) {
+            applyPhaseDefaults(session_cfg.phase);
+            return;
+        }
+    }
+}
 
-                if (e_ms > 0.0f && r_ms > 0.0f) {
-                    engage_ms = e_ms;
-                    release_ms = r_ms;
-                    have_brake = true;
-                    logger.ack();
-                    goto check_done;
-                }
+static void drainSerial() {
+    char line[96];
+
+    while (readLine(line, sizeof(line))) {
+        // control override messages
+        if (strcmp(line, "E") == 0) {
+            session_state = SessionState::CLEANUP;
+            logger.ack();
+            continue;
+        }
+
+        if (strcmp(line, "H") == 0 || strcmp(line, "M") == 0) {
+            logger.ack();
+
+            if (phase_state == PhaseState::TRIAL) {
+                phase_timer.reset();
+                trial_hit = (line[0] == 'H');
+                reward_given = false;
+                phase_state = trial_hit ? PhaseState::HIT : PhaseState::MISS;
             }
 
-            if (n_tokens == 1) {
-                String t = tokenAt_(msg, 0);
+            continue;
+        }
 
-                if (!have_phase && !tokenLooksFloat_(t)) {
-                    long p = t.toInt();
-                    if (p > 0) {
-                        phase_id = (int)p;
-                        have_phase = true;
-                        logger.ack();
-                        goto check_done;
-                    }
-                }
+        // trial config settings
+        {
+            char tmp[96];
+            strncpy(tmp, line, sizeof(tmp));
+            tmp[sizeof(tmp)-1] = 0;
 
-                if (!have_spout) {
-                    float p_ms = t.toFloat();
-                    if (p_ms > 0.0f) {
-                        pulse_ms = p_ms;
-                        have_spout = true;
-                        logger.ack();
-                        goto check_done;
-                    }
-                }
+            if (parseTrialConfig(tmp)) {
+                logger.ack();
+                continue;
             }
         }
 
-    check_done:
-        if (have_phase && have_brake && have_spout) {
-            if (phase_id >= 3) {
-                if (have_trial) return;
-            } else {
-                return;
+        // session config settings
+        {
+            char tmp[96];
+            strncpy(tmp, line, sizeof(tmp));
+            tmp[sizeof(tmp)-1] = 0;
+
+            if (parseKeyValue(tmp)) {
+                logger.ack();
+                continue;
             }
         }
     }
 }
 
-inline bool nearMultiple(float x, float step, float tol, float* nearestOut) {
+// ---------------------------
+// DATA HELPERS
+// ---------------------------
+inline bool nearMultiple(float x, float step, float tol, float* nearest_out) {
     float q = roundf(x / step);
     float m = q * step;
 
-    if (nearestOut) *nearestOut = m;
+    if (nearest_out) *nearest_out = m;
 
     return fabsf(x - m) <= tol;
 }
 
-void checkInactivity(float current_disp) {
+static void checkInactivity(float current_disp) {
     static Timer inactivity_timer;
     static bool cue_active = false;
     static unsigned long timeout_T = SECONDS(5);
     static float init_disp = 0.0f;
-
     const unsigned long inactivity_start_T = SECONDS(5);
 
     if (phase_state != PhaseState::TRIAL) {
@@ -276,7 +362,6 @@ void checkInactivity(float current_disp) {
     }
 
     unsigned long elapsed_ms = phase_timer.timeElapsed();
-
     if (elapsed_ms < inactivity_start_T) {
         cue_active = false;
         inactivity_timer.reset();
@@ -289,14 +374,12 @@ void checkInactivity(float current_disp) {
     if (!cue_active) {
         if (!inactivity_timer.started()) {
             init_disp = current_disp;
-
             inactivity_timer.init(timeout_T);
             inactivity_timer.start();
         }
 
         if (fabsf(current_disp - init_disp) >= DEGREES(5)) {
             init_disp = current_disp;
-
             inactivity_timer.init(timeout_T);
             inactivity_timer.start();
         }
@@ -304,19 +387,16 @@ void checkInactivity(float current_disp) {
         if (!inactivity_timer.isRunning() && (remaining_ms > tone_T)) {
             speaker.cue();
             cue_active = true;
-
             inactivity_timer.init(tone_T);
             inactivity_timer.start();
         }
-    }
-    else {
+    } else {
         if (!inactivity_timer.isRunning()) {
             speaker.stop();
             cue_active = false;
 
             if (remaining_ms > 0) {
                 init_disp = current_disp;
-
                 inactivity_timer.init(timeout_T);
                 inactivity_timer.start();
             } else {
@@ -326,78 +406,30 @@ void checkInactivity(float current_disp) {
     }
 }
 
-static void drainSerial() {
-    while (true) {
-        String msg = logger.read();
-        if (!msg.length()) break;
-
-        if (msg == "E") {
-            session_state = SessionState::CLEANUP;
-            logger.ack();
-            continue;
-        } else if (msg == "H") {
-            logger.ack();
-
-            if (phase_id >= 3 && phase_state == PhaseState::TRIAL) {
-                phase_timer.reset();
-                trial_hit = true;
-                reward_given = false;
-                phase_state = PhaseState::HIT;
-            }
-
-            continue;
-        } else if (msg == "M") {
-            logger.ack();
-
-            if (phase_id >= 3 && phase_state == PhaseState::TRIAL) {
-                phase_timer.reset();
-                trial_hit = false;
-                reward_given = false;
-                phase_state = PhaseState::MISS;
-            }
-        }
-
-        if (phase_id >= 3) {
-            bool e;
-            char a;
-
-            if (parseConfig_(msg, &e, &a)) {
-                next_easy_trial = e;
-                next_alignment = a;
-
-                logger.ack();
-            }
-        }
-    }
-}
-
-// top level
+// ---------------------------
+// TOP LEVEL
+// ---------------------------
+void run_phase_1();
+void run_phase_2();
+void run_phase_3_plus();
 
 void setup() {
-    // power, status LED, serial, and RNG initialization
     pinMode(POWER_EN, OUTPUT);
     digitalWrite(POWER_EN, LOW);
 
-    pinMode(LED_BUILTIN, OUTPUT);
-    digitalWrite(LED_BUILTIN, LOW);
-
     Serial.begin(BAUDRATE);
-
     randomSeed(analogRead(SEED_PIN));
 
-    // block until host sends initial configuration parameters
-    parseParams();
+    while (!Serial) {}
+    waitForHandshake();
 
-    unsigned long engage_us = (unsigned long)(engage_ms * 1000.0f);
-    unsigned long release_us = (unsigned long)(release_ms * 1000.0f);
-    unsigned long pulse_us = (unsigned long)(pulse_ms * 1000.0f);
+    unsigned long engage_us = (unsigned long)(session_cfg.engage_ms * 1000.0f);
+    unsigned long release_us = (unsigned long)(session_cfg.release_ms * 1000.0f);
+    unsigned long pulse_us = (unsigned long)(session_cfg.pulse_ms * 1000.0f);
 
-    // enable power sources
     digitalWrite(POWER_EN, HIGH);
     delay(200);
 
-    // initialize external components
-    // set session parameters based on phase ID
     brake.init(engage_us, release_us);
     brake.engage();
 
@@ -408,98 +440,15 @@ void setup() {
     lick.init(RAW_FLAG);
     lick.calibrate();
 
-    switch (phase_id) {
-        case 1: {
-            session_T = MINUTES(10);
-            trial_T = SECONDS(0);
-            delay_T = SECONDS(5);
-            threshold = DEGREES(0);
-            break;
-        }
-        case 2: {
-            session_T = MINUTES(22.5);
-            trial_T = SECONDS(30);
-            delay_T = SECONDS(3);
-            threshold = DEGREES(0);
-            break;
-        }
-        case 3: {
-            session_T = MINUTES(45);
-            trial_T = SECONDS(30);
-            delay_T = SECONDS(3);
-            threshold = DEGREES(30);
-            break;
-        }
-        case 4: {
-            session_T = MINUTES(45);
-            trial_T = SECONDS(30);
-            delay_T = SECONDS(3);
-            threshold = DEGREES(60);
-            break;
-        }
-        case 5: {
-            session_T = MINUTES(45);
-            trial_T = SECONDS(30);
-            delay_T = SECONDS(3);
-            threshold = DEGREES(90);
-            break;
-        }
-        case 6: {
-            session_T = MINUTES(45);
-            trial_T = SECONDS(30);
-            delay_T = SECONDS(3);
-            threshold = DEGREES(30);
-            break;
-        }
-        case 7: {
-            session_T = MINUTES(45);
-            trial_T = SECONDS(30);
-            delay_T = SECONDS(3);
-            threshold = DEGREES(60);
-            break;
-        }
-        case 8: {
-            session_T = MINUTES(45);
-            trial_T = SECONDS(30);
-            delay_T = SECONDS(3);
-            threshold = DEGREES(90);
-            break;
-        }
-        case 9: {
-            session_T = MINUTES(45);
-            trial_T = SECONDS(30);
-            delay_T = SECONDS(3);
-            threshold = DEGREES(30);
-            break;
-        }
-        case 10: {
-            session_T = MINUTES(45);
-            trial_T = SECONDS(30);
-            delay_T = SECONDS(3);
-            threshold = DEGREES(60);
-            break;
-        }
-        case 11: {
-            session_T = MINUTES(45);
-            trial_T = SECONDS(30);
-            delay_T = SECONDS(3);
-            threshold = DEGREES(90);
-            break;
-        }
-    }
+    wheel.init(easy_threshold, session_cfg.threshold, trial_cfg.side, session_cfg.reverse);
 
-    wheel.init(easy_threshold, threshold, next_alignment);
+    delay(2500);
 
-    // set initial states
-    phase_state = PhaseState::IDLE;
-    session_state = SessionState::MAIN;
-
-    // settle delay
-    delay(5000);
-
-    // start raw sample timer
     raw_timer.init(sample_T);
     raw_timer.start();
+
+    session_state = SessionState::MAIN;
+    phase_state = PhaseState::IDLE;
 }
 
 void loop() {
@@ -507,19 +456,18 @@ void loop() {
 
     switch (session_state) {
         case SessionState::MAIN: {
-            switch (phase_id) {
+            switch (session_cfg.phase) {
                 case 1: run_phase_1(); break;
                 case 2: run_phase_2(); break;
                 default: run_phase_3_plus(); break;
             }
 
             static uint32_t last_raw_us = 0;
-
             if (RAW_FLAG && raw_timer.isRunning()) {
                 uint32_t now_us = micros();
 
-                if ((uint32_t)(now_us - last_raw_us) >= raw_sample_us) {
-                    last_raw_us += raw_sample_us;
+                if ((uint32_t)(now_us - last_raw_us) >= RAW_US) {
+                    last_raw_us += RAW_US;
 
                     uint16_t raw_val = lick.sampleRaw();
                     logger.writeRaw(raw_val);
@@ -533,7 +481,6 @@ void loop() {
 
         case SessionState::CLEANUP: {
             logger.write("S");
-
             brake.engage();
 
             phase_timer.reset();
@@ -776,14 +723,10 @@ void run_phase_3_plus() {
     switch (phase_state) {        
         case PhaseState::IDLE: {
             if (!session_initialized) {
-                // start session timer
                 session_timer.init(session_T);
                 session_timer.start();
 
-                // flip session initialized flag
                 session_initialized = true;
-
-                // IDLE -> CUE
                 phase_state = PhaseState::CUE;
             }
 
@@ -827,7 +770,9 @@ void run_phase_3_plus() {
         case PhaseState::TRIAL: {
             // entry
             if (!phase_timer.started()) {
-                wheel.reset(next_easy_trial, next_alignment);
+                wheel.reset(trial_cfg.easy, trial_cfg.side);
+                trial_cfg.pending = false;
+
                 last_disp_mark = LONG_MIN;
 
                 phase_timer.init(trial_T);
@@ -843,7 +788,8 @@ void run_phase_3_plus() {
                     }
 
                     wheel.update();
-                    float disp = wheel.getDisplacement();
+                    float disp = wheel.displacement;
+
                     float nearest;
                     if (nearMultiple(disp, 0.5f, 0.1f, &nearest)) {
                         long mark = lroundf(nearest);
