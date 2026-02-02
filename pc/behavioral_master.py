@@ -2,19 +2,20 @@ import os
 import sys
 import warnings
 import traceback
-import msvcrt
 
+import keyboard
 import random
 import time
 import socket
 import uuid
 import json
 import functools
+import inspect
 from datetime import datetime
 from pathlib import Path
 from queue import Queue, Empty
 from collections import deque
-from threading import Thread, Event
+from threading import Thread, Event, Lock
 
 import serial
 import serial.tools.list_ports
@@ -26,6 +27,7 @@ from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from dotenv import load_dotenv
 
+import html
 import smtplib
 from email.message import EmailMessage
 
@@ -53,14 +55,19 @@ load_dotenv(SCRIPT_DIR / ".env")
 BAUDRATE = 1_000_000
 EARLY_END_STRING = "E"
 SESSION_END_STRING = "S"
+SIM_HIT_STRING = "H"
+SIM_MISS_STRING = "M"
 
 PHASE_CONFIG = {
-    "3": {"bidirectional": True, "threshold": 30.0},
-    "4": {"bidirectional": True, "threshold": 60.0},
-    "5": {"bidirectional": True, "threshold": 90.0},
-    "6": {"bidirectional": False, "threshold": 30.0},
-    "7": {"bidirectional": False, "threshold": 60.0},
-    "8": {"bidirectional": False, "threshold": 90.0}
+    '3': {'threshold': 30.0, 'side': 'B', 'reverse': False},
+    '4': {'threshold': 60.0, 'side': 'B', 'reverse': False},
+    '5': {'threshold': 90.0, 'side': 'B', 'reverse': False},
+
+    '6': {'threshold': 30.0, 'side': 'L', 'reverse': False},
+    '7': {'threshold': 30.0, 'side': 'R', 'reverse': False},
+
+    '8': {'threshold': 30.0, 'side': 'L', 'reverse': True},
+    '9': {'threshold': 30.0, 'side': 'R', 'reverse': True}
     }
 
 MAX_STREAK = 4
@@ -68,7 +75,8 @@ LAST_SIDE = None
 SIDE_STREAK = 0
 
 EVT_QUEUE: "Queue[tuple[str, str]]" = Queue()
-ENC_QUEUE: "Queue[tuple[str, str]]" = Queue()
+ENC_QUEUE: "Queue[tuple[str, object]]" = Queue()
+SIM_QUEUE: "Queue[tuple[str, float]]" = Queue()
 EXC_STACK: "deque[dict[str, object]]" = deque()
 
 
@@ -187,23 +195,49 @@ def _ensure_session_tracking(session_data):
     session_data.meta.setdefault('K2', None)
 
 
-def time_this(fcn):
-    @functools.wraps(fcn)
-
-    def wrapper(*args, **kwargs):
-        start = time.perf_counter()
-        result = fcn(*args, **kwargs)
-        elapsed = time.perf_counter() - start
-        units = 's'
-
-        if elapsed < 0.001:
-            elapsed = elapsed * 1000
-            units = 'ms'
-
-        print(f'{fcn.__name__} executed in {elapsed:.3f} {units}\n')
-        return result
+def time_this(obj):
+    if inspect.isfunction(obj):
+        @functools.wraps(obj)
+        def function_wrapper(*args, **kwargs):
+            start = time.perf_counter()
+            result = obj(*args, **kwargs)
+            elapsed = time.perf_counter() - start
+            
+            units = "s"
+            if elapsed < 1e-3:
+                elapsed *= 1e3
+                units = "ms"
+            
+            print(f'[{obj.__name__}] runtime: {elapsed:.3f} {units}')
+            return result
+        
+        return function_wrapper
     
-    return wrapper
+    if inspect.isclass(obj):
+        for name, attr in obj.__dict__.items():
+            if callable(attr) and not name.startswith('__'):
+                @functools.wraps(attr)
+                def make_wrapper(method):
+                    def method_wrapper(self, *args, **kwargs):
+                        start = time.perf_counter()
+                        result = method(self, *args, **kwargs)
+                        elapsed = time.perf_counter() - start
+
+                        units = "s"
+                        if elapsed < 1e-3:
+                            elapsed *= 1e3
+                            units = "ms"
+                        
+                        print(f'[{obj.__name__}.{method.__name__}] runtime: {elapsed:.3f} {units}')
+                        return result
+                    
+                    return method_wrapper
+                
+                setattr(obj, name, make_wrapper(attr))
+
+        return obj
+    
+    raise TypeError('@time_this can only be applied to functions or classes')
 
 
 def cmd_run(*args):
@@ -369,12 +403,15 @@ def print_exc(exc):
 
 
 def print_stack():
+    hline = (100 * "-")
+
     if not EXC_STACK:
         cmd_run('echo.')
+        list(print(f'{hline.replace("-", "-")}\n') for _ in range(2))
+
         print('[Process exited with code 0]')
         return
     
-    hline = (50 * "=")
     print(hline + "\nEXCEPTION STACK (in order of occurrence):\n" + hline, flush=True)
 
     for i, info in enumerate(EXC_STACK, start=1):
@@ -427,7 +464,7 @@ def validate_resources():
 
 
 # ---------------------------
-# SERIAL COMMUNICATION
+# SERIAL INTERFACE
 # ---------------------------
 def find_arduino_port():
     ports = serial.tools.list_ports.comports()
@@ -542,14 +579,26 @@ class ArduinoLink:
 class SessionData:
     def __init__(self, animal_id, phase_id, date_str):
         self.meta = {
+            "client": None,
+            "workbook_id": None,
             "date": date_str,
             "animal": animal_id,
             "phase": phase_id,
+            "aborted": False,
             "t_start": None,
             "t_stop": None,
             "duration_sec": None,
-            "aborted": False,
+            "K1": 5,
+            "K2": None,
+            "easy_trials": [],
+            "normal_trials": [],
+            "left_targets": [],
+            "right_targets": [],
+            "both_targets": []
             }
+        
+        self.trial_config = []
+
         self.evt = {"timestamps": [], "values": []}
         self.enc = {"timestamps": [], "values": []}
         self.raw = {
@@ -623,9 +672,6 @@ class SessionData:
         except Exception:
             easy_trials, normal_trials = [], []
             left_targets, right_targets, both_targets = [], [], []
-        
-        meta_out.setdefault('K1', 5)
-        meta_out.setdefault('K2', None)
 
         meta_out['easy_trials'] = list(easy_trials)
         meta_out['normal_trials'] = list(normal_trials)
@@ -640,11 +686,12 @@ class SessionData:
             'raw': _json_safe(self.raw)
             }
 
+    @property
     def is_finished(self):
-        return self.meta['t_start'] and self.meta['t_stop']
+        return (self.meta['t_start'] is not None) and (self.meta['t_stop'] is not None)
 
 
-def choose_trial_type(trial_n, K):
+def get_easy(trial_n, K):
     if trial_n <= 20:
         return ((trial_n - 1) % 5) == 0
 
@@ -652,48 +699,12 @@ def choose_trial_type(trial_n, K):
     return ((trial_n - 21) % K) == 0
 
 
-def choose_target_side(phase_id):
-    global LAST_SIDE, SIDE_STREAK
-
-    cfg = PHASE_CONFIG.get(str(phase_id))
-    if not cfg:
-        return "B"
-    
-    if cfg.get('bidirectional', False):
-        return "B"
-    
-    if LAST_SIDE in {"L", "R"} and SIDE_STREAK >= MAX_STREAK:
-        side = "R" if LAST_SIDE == "L" else "L"
-    else:
-        side = random.choice(["L", "R"])
-    
-    if side == LAST_SIDE:
-        SIDE_STREAK += 1
-    else:
-        LAST_SIDE = side
-        SIDE_STREAK = 1
-    
-    return side
-
-
-def send_config(link, is_easy, side, mode='ack', timeout=3.0):
-    cfg = f'T {1 if is_easy else 0} {side}'
-
-    if mode == 'ack':
-        link.send_and_wait(cfg, timeout=timeout)
-    elif mode == 'no_ack':
-        link.send(cfg)
-    else:
-        raise ValueError("'mode' must be one of: 'ack', 'no_ack'")
-
-
 # ---------------------------
 # DATA SAVING
 # ---------------------------
 API_SCOPES = ["https://www.googleapis.com/auth/spreadsheets",
               "https://www.googleapis.com/auth/drive"]
-API_CREDS = Credentials.from_service_account_file(str(SCRIPT_DIR / 'credentials.json'),
-                                                  scopes=API_SCOPES)
+API_CREDS = Credentials.from_service_account_file(str(SCRIPT_DIR / 'credentials.json'), scopes=API_SCOPES)
 API_CLIENT = gspread.authorize(API_CREDS)
 API_DRIVE = build('drive', 'v3', credentials=API_CREDS, cache_discovery=False)
 
@@ -773,7 +784,7 @@ def _align_cells(wb, ws, r1, c1, r2, c2):
     wb.batch_update(req)
 
 
-def _get_workbook_id(animal_id, animal_map):
+def get_workbook_id(animal_id, animal_map):
     try:
         map_key = next(key for key in animal_map.keys() if animal_id in key)
     except StopIteration:
@@ -785,7 +796,7 @@ def _get_workbook_id(animal_id, animal_map):
     return _require_env(env_var)
 
 
-def _get_client_id():
+def get_client_id():
     return f'{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}'
 
 
@@ -1175,7 +1186,7 @@ def save_data(session_data):
         print('[WARNING] No data recorded (skipping save)')
         return
     
-    client_id = _get_client_id()
+    client_id = get_client_id()
 
     def _norm(x):
         return (x or "").strip()
@@ -1381,7 +1392,7 @@ def save_raw(session_data):
     return out_path
 
 
-def fallback_save(session_data, exc=None):
+def fallback_save(session_data):
     animal = str(session_data.meta.get('animal', 'UNKNOWN'))
     phase = str(session_data.meta.get('phase', '0'))
     date = str(session_data.meta.get('date', '0000-00-00')).replace('/', '.')
@@ -1389,11 +1400,6 @@ def fallback_save(session_data, exc=None):
 
     out_path = SCRIPT_DIR / f'{date}_animal={animal}_phase={phase}_id={rand}.json'
     payload = session_data.to_dict()
-
-    if exc is not None:
-        payload.setdefault('meta', {})
-        payload['meta']['fallback_saved'] = True
-        payload['meta']['fallback_reason'] = f'{type(exc).__name__}: {exc}'
     
     with open(out_path, 'w', encoding='utf-8') as f:
         json.dump(payload, f, indent=4)
@@ -1413,7 +1419,7 @@ def safe_save(session_data):
         return True
     except Exception as e:
         try:
-            fallback_save(session_data, exc=e)
+            fallback_save(session_data)
         except Exception as e2:
             log_error(animal, phase, e2)
         
@@ -1483,16 +1489,31 @@ def send_email(session_data):
 
     subject = _format_subject(animal, phase)
 
-    t_start = datetime.fromisoformat(session_data.meta["t_start"]).strftime('%I:%M %p').lstrip('0')
-    t_stop = datetime.fromisoformat(session_data.meta["t_stop"]).strftime('%I:%M %p').lstrip('0')
-    dur_s = session_data.meta['duration_sec']
+    def _ms_to_12h(ms):
+        ms = int(ms)
+        total_s = ms // 1000
+        h24 = (total_s // 3600) % 24
+        m = (total_s % 3600) // 60
+
+        am_pm = "AM" if h24 < 12 else "PM"
+        h12 = h24 % 12
+        if h12 == 0:
+            h12 = 12
+        
+        return f'{h12}:{m:02d} {am_pm}'
+    
+    start_ms = session_data.meta.get('t_start')
+    stop_ms = session_data.meta.get('t_stop')
+
+    t_start = _ms_to_12h(start_ms) if start_ms is not None else "?"
+    t_stop = _ms_to_12h(stop_ms) if stop_ms is not None else "?"
+    dur_s = session_data.meta.get('duration_sec', 0)
     evt = session_data.evt
 
     body = _format_body(date, t_start, t_stop, dur_s, evt)
 
     try:
         recipients = json.loads(smtp_to_addr)
-
         if isinstance(recipients, str):
             recipients = [recipients]
     except Exception:
@@ -1505,7 +1526,6 @@ def send_email(session_data):
     msg['To'] = to_addr
     msg['Subject'] = subject
 
-    import html
     msg.set_content(body)
     msg.add_alternative(
         f"<pre style=\"font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace;\">"
@@ -1530,7 +1550,14 @@ def send_email(session_data):
 # EXIT
 # ---------------------------
 def is_early_exit(trial_stack, N, t_start, min_duration=20*60):
-    elapsed_s = 0.0 if t_start is None else max(0.0, time.time() - t_start)
+    if t_start is None:
+        return False
+    
+    now_ms = _ts_to_ms(_get_ts())
+    if now_ms is None:
+        return False
+
+    elapsed_s = max(0.0, (now_ms - int(t_start)) / 1000.0)
     if elapsed_s < min_duration:
         return False
 
@@ -1562,6 +1589,260 @@ def cleanup(link, msg, timeout=2.0):
         print(f'{msg}', flush=True)
     finally:
         link.close()
+
+
+# ---------------------------
+# SIMULATION
+# ---------------------------
+SIM_ENABLED = Event()
+SIM_ENABLED.set()
+
+
+class Simulator(Thread):
+    def __init__(self, arbiter, phase, enc_queue, sim_queue, rate=75.0, poll_dt=0.01):
+        super().__init__(daemon=True)
+
+        self.arbiter = arbiter
+        self.phase = str(phase)
+        self.enc_q = enc_queue
+        self.sim_q = sim_queue
+        
+        self.rate = float(rate)
+        self.dt = float(poll_dt)
+
+        self._running = True
+        self._lock = Lock()
+
+        self._sim_stream = 0.0
+        self._enc_stream = 0.0
+
+        self._enc_pos = None
+        self._enc_init_pos = None
+
+        self._net_pos = 0.0
+
+        self._side = "B"
+        self._threshold = 0.0
+        self._easy_threshold = 15.0
+
+        self._cue_delay_s = 1.5
+        self._enable_s = float("inf")
+
+        self._outcome_sent = False
+        self._clamp_pos = None
+        self._retry_s = 0.5
+        self._last_send_s = 0.0
+    
+    def _update_enc(self):
+        if self._enc_pos is None or self._enc_init_pos is None:
+            self._enc_stream = 0.0
+        else:
+            self._enc_stream = float(self._enc_pos) - float(self._enc_init_pos)
+    
+    def _update_net(self):
+        self._net_pos = float(self._sim_stream) + float(self._enc_stream)
+
+        if self._clamp_pos is not None:
+            self._sim_stream = float(self._clamp_pos) - float(self._enc_stream)
+            self._net_pos = float(self._clamp_pos)
+        
+        return float(self._net_pos)
+    
+    def _hit_reached(self, pos):
+        th = float(self._threshold)
+
+        match self._side:
+            case "B":
+                return abs(pos) >= th
+            case "R":
+                return pos >= +th
+            case "L":
+                return pos <= -th
+        
+        return False
+
+    def _miss_reached(self, pos):
+        th = float(self._threshold)
+
+        match self._side:
+            case "B":
+                return False
+            case "R":
+                return pos <= -th
+            case "L":
+                return pos >= +th
+        
+        return False
+    
+    def _clamp_to_pos(self, pos):
+        th = float(self._threshold)
+        s = self._side
+
+        if s == "R":
+            return +th
+        if s == "L":
+            return -th
+        
+        if pos >= +th:
+            return +th
+        if pos <= -th:
+            return -th
+        
+        return max(-th, min(+th, float(pos)))
+    
+    def _input_enabled(self):
+        return SIM_ENABLED.is_set() and time.monotonic() >= self._enable_s
+    
+    def _send_enabled(self):
+        return self._input_enabled() and (not self._outcome_sent)
+    
+    def stop(self):
+        self._running = False
+
+    def update_trial(self, is_easy, side):
+        with self._lock:
+            self._side = str(side or "B")
+
+            try:
+                if is_easy:
+                    self._threshold = self._easy_threshold
+                else:
+                    self._threshold = PHASE_CONFIG.get(self.phase).get('threshold', 0.0)
+            except Exception:
+                self._threshold = 0.0
+    
+    def on_cue(self):
+        with self._lock:
+            self._enc_pos = None
+            self._enc_init_pos = None
+
+            self._sim_stream = 0.0
+            self._enc_stream = 0.0
+            self._net_pos = 0.0
+
+            self._outcome_sent = False
+            self._clamp_pos = None
+
+            self._enable_s = time.monotonic() + self._cue_delay_s
+            self._last_send_s = 0.0
+    
+    def update_from_enc(self, pos):
+        try:
+            pos = float(pos)
+        except Exception:
+            return self.get_pos()
+
+        with self._lock:
+            if pos == 0.0:
+                self._enc_pos = 0.0
+                self._enc_init_pos = 0.0
+                self._sim_stream = 0.0
+                self._enc_stream = 0.0
+                self._net_pos = 0.0
+                self._clamp_pos = None
+                return 0.0
+            
+            self._enc_pos = pos
+            if self._enc_init_pos is None:
+                self._enc_init_pos = pos
+
+            self._update_enc()
+            return self._update_net()
+    
+    def get_pos(self):
+        with self._lock:
+            return float(self._net_pos)
+        
+    def is_hit(self):
+        with self._lock:
+            if not self._send_enabled():
+                return False
+            
+            return self._hit_reached(self._net_pos)
+    
+    def is_miss(self):
+        with self._lock:
+            if not self._send_enabled():
+                return False
+            
+            return self._miss_reached(self._net_pos)
+
+    def get_outcome(self):
+        if self.is_hit():
+            return "hit"
+        if self.is_miss():
+            return "miss"
+        
+        return None
+
+    def can_send(self):
+        with self._lock:
+            now_s = time.time()
+            return (now_s - self._last_send_s) >= self._retry_s
+    
+    def log_send(self):
+        with self._lock:
+            self._last_send_s = time.time()
+    
+    def confirm_send(self):
+        with self._lock:
+            if self._outcome_sent:
+                return
+            
+            clamp_pos = self._clamp_to_pos(self._net_pos)
+            self._clamp_pos = float(clamp_pos)
+            self._outcome_sent = True
+
+            self._update_enc()
+            self._update_net()
+    
+    def run(self):
+        while self._running:
+            input_enabled = self._input_enabled()
+            delta = 0.0
+
+            if input_enabled:
+                try:
+                    if keyboard.is_pressed('right'):
+                        delta = +self.rate * self.dt
+                    elif keyboard.is_pressed('left'):
+                        delta = -self.rate * self.dt
+                except Exception as e:
+                    cache_exc(e, 'Simulator.run')
+            
+            if delta != 0.0 and input_enabled and self.arbiter.kb_enabled():
+                with self._lock:
+                    if not self._outcome_sent:
+                        self._sim_stream += float(delta)
+                        net_pos = self._update_net()
+                    else:
+                        net_pos = float(self._net_pos)
+                
+                try:
+                    self.enc_q.put(("SIM", net_pos))
+                except Exception:
+                    pass
+                    
+                try:
+                    self.sim_q.put(("SIM", net_pos))
+                except Exception:
+                    pass
+            
+            time.sleep(self.dt)
+
+
+class InputArbiter:
+    def __init__(self, kb_lockout_s=0.5):
+        self.last_enc_pos = None
+        self.kb_disabled_until = 0.0
+        self.kb_lockout_s = kb_lockout_s
+    
+    def update_enc(self, pos):
+        self.last_enc_pos = pos
+        self.kb_disabled_until = time.time() + self.kb_lockout_s
+    
+    def kb_enabled(self):
+        return time.time() >= self.kb_disabled_until
 
 
 # ---------------------------
@@ -1645,6 +1926,9 @@ def setup():
     port = find_arduino_port()
     if not port:
         raise RuntimeError("No Arduino detected")
+    
+    animal_id = "DEV"
+    phase_id = "3"
 
     ser = None
     link = None
@@ -1666,7 +1950,7 @@ def setup():
             
             animal_raw = animal_raw.rstrip("\n").upper()
         except KeyboardInterrupt:
-            print('\nTerminated byKeyboardInterrupt')
+            print('\nTerminated by KeyboardInterrupt')
             raise
 
         if not animal_raw:
@@ -1679,15 +1963,13 @@ def setup():
         else:
             animal_id = animal_raw
         
+        workbook_id = None
+
         if animal_id != "DEV":
             validate_resources()
             animal_map = load_animal_map()
             validate_animal(animal_id, animal_map)
-
-        if animal_id != "DEV":
-            workbook_id = _get_workbook_id(animal_id, animal_map)
-        else:
-            workbook_id = None
+            workbook_id = get_workbook_id(animal_id, animal_map)
 
         valid_phases = {"1", "2"} | set(PHASE_CONFIG.keys())
 
@@ -1695,18 +1977,13 @@ def setup():
             try:
                 phase_id = input("Training Phase:  ").strip()
             except KeyboardInterrupt:
-                print('\nTerminated byKeyboardInterrupt')
+                print('\nTerminated by KeyboardInterrupt')
                 raise
             
             if phase_id in valid_phases:
                 break
 
             print("Please enter a valid phase", flush=True)
-        
-        global LAST_SIDE, SIDE_STREAK
-
-        LAST_SIDE = None
-        SIDE_STREAK = 0
 
         def _safe_float(var):
             v = _require_env(var).strip()
@@ -1723,51 +2000,59 @@ def setup():
         release_ms = _safe_float("BRAKE_RELEASE_MS")
         pulse_ms = _safe_float("SPOUT_PULSE_MS")
 
+        cfg = PHASE_CONFIG.get(str(phase_id))
+        if cfg is None and str(phase_id) not in {"1", "2"}:
+            raise ValueError(f'No PHASE_CONFIG entry for phase_id={phase_id}')
+        
+        threshold = float(cfg.get('threshold', 0.0)) if cfg else 0.0
+        side = str(cfg.get('side', 'B')).upper() if cfg else "B"
+        reverse = bool(cfg.get('reverse', False)) if cfg else False
+
         try:
             if link.active:
-                link.send_and_wait(str(int(phase_id)))
-                link.send_and_wait(f"{engage_ms:.4f} {release_ms:.4f}")
-                link.send_and_wait(f"{pulse_ms:.4f}")
+                link.send_and_wait(f"engage {engage_ms:.4f}")
+                link.send_and_wait(f"release {release_ms:.4f}")
+                link.send_and_wait(f"pulse {pulse_ms:.4f}")
+                link.send_and_wait(f"threshold {threshold:.4f}")
+                link.send_and_wait(f"side {side}")
+                link.send_and_wait(f"reverse {'1' if reverse else '0'}")
+                link.send_and_wait(f"phase {phase_id}")
         except Exception as e:
             link.close()
-            raise RuntimeError(f'Failed during Arduino initialization handshake: {e}') from e
+            raise RuntimeError(f'Failed during initial Arduino handshake: {e}') from e
 
+        easy = False
         cursor = None
-        type_1 = None
-        side_1 = None
 
-        if phase_id in PHASE_CONFIG:
-            type_1 = choose_trial_type(trial_n=1, K=5)
-            side_1 = choose_target_side(phase_id=phase_id)
-
+        if cfg:
+            easy = get_easy(trial_n=1, K=5)
+            
             try:
-                send_config(link, type_1, side_1,
-                            mode=f'{"ack" if link.active else "no_ack"}')
+                link.send_and_wait(f"1 {'1' if easy else '0'}")
             except Exception as e:
                 print(f'[ERROR] Unhandled exception during initial phase hand-off: {e}')
 
             cursor = BCI(phase_id=phase_id,
                          evt_queue=EVT_QUEUE,
                          enc_queue=ENC_QUEUE,
+                         config=PHASE_CONFIG,
                          display_idx=1,
                          fullscreen=False,
                          easy_threshold=15.0)
-            
-            cursor.update_config(type_1, side_1)
+            cursor.update_config(easy, side)
             cursor.start()
 
-        session_data = SessionData(
-            animal_id=animal_id,
-            phase_id=phase_id,
-            date_str=_get_date()
-            )
+        arbiter = InputArbiter()
+        
+        sim = Simulator(arbiter, phase_id, ENC_QUEUE, SIM_QUEUE)
+        sim.update_trial(easy, side)
+
+        session_data = SessionData(animal_id, str(phase_id), _get_date())
         session_data.meta['workbook_id'] = workbook_id
 
-        _ensure_session_tracking(session_data)
-        if type_1 is not None and side_1 is not None:
-            log_trial_config(session_data, trial_n=1, type=type_1, side=side_1)
+        log_trial_config(session_data, trial_n=1, type=easy, side=side)
 
-        return link, session_data, cursor
+        return link, session_data, cursor, sim
     except Exception as e:
         cache_exc(e, 'setup')
 
@@ -1776,7 +2061,8 @@ def setup():
                 link.close()
             except Exception as close_exc:
                 cache_exc(close_exc, 'setup.cleanup')
-        elif ser is not None:
+        
+        if ser is not None:
             try:
                 ser.close()
             except Exception as close_exc:
@@ -1785,7 +2071,7 @@ def setup():
         raise
 
 
-def main(link, session_data, cursor):
+def main(link, session_data, cursor, sim):
     do_calibration = str(session_data.meta["phase"]) not in {"1", "2"}
 
     K = 5
@@ -1804,8 +2090,39 @@ def main(link, session_data, cursor):
         typ, ts, payload = link.msg_q.get(timeout=timeout)
         return typ, ts, payload
 
+    sim.start()
+
+    def _send_sim_outcome():
+        outcome = sim.get_outcome()
+        if outcome is None:
+            return
+        
+        if not sim.can_send():
+            return
+        
+        sim.log_send()
+
+        try:
+            if outcome == "hit":
+                link.send_and_wait(SIM_HIT_STRING, timeout=2.0)
+            else:
+                link.send_and_wait(SIM_MISS_STRING, timeout=2.0)
+            
+            sim.confirm_send()
+        except Exception as e:
+            cache_exc(e, 'main._send_sim_outcome')
+
+    def _drain_sim_queue(max_items=50):
+        for _ in range(max_items):
+            try:
+                src, net = SIM_QUEUE.get_nowait()
+            except Empty:
+                break
+
+            if src in {"SIM", "WHEEL"}:
+                _send_sim_outcome()
+
     started = False
-    t0 = None
 
     try:
         while link.ser and link.ser.is_open:
@@ -1815,15 +2132,15 @@ def main(link, session_data, cursor):
             try:
                 typ, ts, payload = _get_msg(timeout=0.05)
             except Empty:
+                _drain_sim_queue()
+                _send_sim_outcome()
                 continue
 
             if not started:
                 started = True
-                t0 = time.time()
-                session_data.meta["t_start"] = datetime.now().isoformat(timespec="seconds")
+                session_data.meta["t_start"] = _ts_to_ms(_get_ts())
 
-                print(f"\nSession started at {datetime.now().strftime('%I:%M %p')}", flush=True)
-                cmd_run('echo.')
+                print(f"\nSession started at {datetime.now().strftime('%I:%M %p')}\n", flush=True)
                 show_trial_header()
 
             if typ == "ERR":
@@ -1848,11 +2165,18 @@ def main(link, session_data, cursor):
                     pass
 
                 if p == 'cue':
+                    session_data.add_evt(ts, p)
+                    sim.on_cue()
+
+                    _send_sim_outcome()
+
                     trial_n += 1
                     last_outcome = None
                     trial_start_ms = _ts_to_ms(ts)
                 
                 if p in {'hit', 'miss'}:
+                    session_data.add_evt(ts, p)
+
                     if last_outcome == p:
                         continue
                     last_outcome = p
@@ -1876,8 +2200,8 @@ def main(link, session_data, cursor):
                             trial_stack.pop()
                         
                         if calibrated:
-                            if len(trial_stack) >= N and is_early_exit(trial_stack, N, t0):
-                                cleanup(link, 'Terminated byearly exit')
+                            if len(trial_stack) >= N and is_early_exit(trial_stack, N, session_data.meta['t_start']):
+                                cleanup(link, 'Terminated by early exit')
                                 session_data.meta['aborted'] = True
                                 break
                         else:
@@ -1891,47 +2215,63 @@ def main(link, session_data, cursor):
                     
                     if cursor is not None:
                         next_trial_n = trial_n + 1
-                        next_type = choose_trial_type(next_trial_n, K)
-                        next_side = choose_target_side(session_data.meta['phase'])
+                        next_easy = get_easy(next_trial_n, K)
+                        next_side = PHASE_CONFIG[session_data.meta['phase']]['side']
 
-                        send_config(link, next_type, next_side, mode='ack')
-                        log_trial_config(session_data, trial_n=next_trial_n, type=next_type, side=next_side)
-                        
-                        cursor.update_config(next_type, next_side)
+                        link.send_and_wait(f"{next_trial_n} {'1' if next_easy else '0'}")
+                        log_trial_config(session_data, trial_n=next_trial_n, type=next_easy, side=next_side)
+
+                        sim.update_trial(next_easy, next_side)
+                        cursor.update_config(next_easy, next_side)
 
                 if p in {"hit", "lick"}:
                     session_data.add_raw_evt(ts, p)
 
             if typ == "ENC":
                 p = str(payload)
-                session_data.add_enc(ts, p)
-
+                
                 try:
-                    ENC_QUEUE.put_nowait((ts, p))
+                    pos = float(p)
+
+                    net = sim.update_from_enc(pos)
+                    sim.arbiter.update_enc(pos)
+
+                    session_data.add_enc(ts, str(net))
+
+                    ENC_QUEUE.put_nowait(("WHEEL", net))
+
+                    try:
+                        SIM_QUEUE.put_nowait(("WHEEL", net))
+                    except Exception:
+                        pass
+
+                    _send_sim_outcome()
                 except Exception:
                     pass
+            
+            _drain_sim_queue()
     except KeyboardInterrupt:
         session_data.meta["aborted"] = True
-        cleanup(link, "Terminated byKeyboardInterrupt")
+        cleanup(link, "Terminated by KeyboardInterrupt")
         raise
     except Exception as e:
         cache_exc(e, 'main')
     finally:
+        sim.stop()
+
         if session_data.meta["t_start"] is None:
-            session_data.meta["t_start"] = datetime.now().isoformat(timespec="seconds")
+            session_data.meta["t_start"] = _ts_to_ms(_get_ts())
 
-        session_data.meta["t_stop"] = datetime.now().isoformat(timespec="seconds")
+        session_data.meta["t_stop"] = _ts_to_ms(_get_ts())
 
-        if t0 is None:
-            t0 = time.time()
-
-        dt = int(max(0, time.time() - t0))
-        session_data.meta["duration_sec"] = dt
+        t0 = session_data.meta['t_start']
+        t1 = session_data.meta['t_stop']
+        dt = 0 if (t0 is None or t1 is None) else max(0, (t1 - t0) // 1000)
+        session_data.meta["duration_sec"] = int(dt)
 
 
 if __name__ == "__main__":
-    cmd_run('echo.')
-    print(f'{"-" * 50}\n')
+    cmd_run('cls')
 
     link = None
     session_data = None
@@ -1943,13 +2283,13 @@ if __name__ == "__main__":
     run_exc = None
 
     try:
-        link, session_data, cursor = setup()
+        link, session_data, cursor, sim = setup()
 
         if session_data is not None:
             animal_id_for_log = session_data.meta.get("animal", "UNKNOWN")
             phase_id_for_log = session_data.meta.get("phase", "0")
 
-        main(link, session_data, cursor)
+        main(link, session_data, cursor, sim)
     except BaseException as e:
         run_exc = e
         cache_exc(e, '__main__')
@@ -1970,30 +2310,33 @@ if __name__ == "__main__":
             except Exception as e:
                 cache_exc(e, '__main__.link_close')
                 log_and_commit(*run_info, e)
-        
-        save_raw(session_data)
 
-        if session_data is not None and session_data.is_finished():
-            try:
-                send_email(session_data)
-            except Exception as e:
-                cache_exc(e, '__main__.send_email')
-                log_and_commit(*run_info, e)
+        if session_data is not None and session_data.is_finished:
+            if session_data.meta.get('animal', None) not in {None, "DEV"}:
+                try:
+                    send_email(session_data)
+                except Exception as e:
+                    cache_exc(e, '__main__.send_email')
+                    log_and_commit(*run_info, e)
         
         if session_data is not None and session_data.any_data():
-            try:
-                save_choice = input("\nSave current session? [Y/n]:  ").strip().lower()
-                cmd_run('echo.')
-                
-                if save_choice in {"", "y", "yes"}:
-                    ok = safe_save(session_data)
-                    if not ok:
-                        print("[WARNING] Google Sheets save failed (local fallback used instead)", flush=True)
-            except Exception as e:
-                cache_exc(e, '__main__.safe_save')
+            if session_data.meta.get('animal', None) not in {None, "DEV"}:
+                try:
+                    save_choice = input("\nSave current session? [Y/n]:  ").strip().lower()
+                    cmd_run('echo.')
+                    
+                    if save_choice in {"", "y", "yes"}:
+                        save_raw(session_data)
+
+                        ok = safe_save(session_data)
+                        if not ok:
+                            print("[WARNING] Google Sheets save failed (local fallback used instead)", flush=True)
+                except Exception as e:
+                    cache_exc(e, '__main__.safe_save')
 
         print_stack()
 
-        print('\nPress any key to continue . . .', flush=True)
-        msvcrt.getch()
-        cmd_run('echo.')
+        print('\nPress any key to continue . . .', end='', flush=True)
+        time.sleep(0.25)
+        keyboard.read_key()
+        cmd_run('echo.', 'echo.')
