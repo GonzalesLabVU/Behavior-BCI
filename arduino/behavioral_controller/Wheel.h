@@ -9,15 +9,11 @@ class Wheel {
 
         Wheel();
 
-        void init(float easy_threshold, float normal_threshold, char alignment);
+        void init(float easy_threshold, float normal_threshold, char side, bool reverse);
         void update();
-        float getDisplacement();
         bool thresholdReached();
         bool thresholdMissed();
-        // void reset(bool easy_trial);
-        void reset(bool easy_trial, char alignment);
-
-        // inline void reset() { reset(false); }
+        void reset(bool easy, char side);
         inline void reset() { reset(false, 'B'); }
             
     private:
@@ -27,16 +23,20 @@ class Wheel {
         static volatile uint8_t* s_b_in_reg_;
         static uint8_t s_b_mask_;
 
-        long easy_threshold_counts_;
-        long normal_threshold_counts_;
-        long active_threshold_counts_;
+        long easy_counts_;
+        long normal_counts_;
+        long active_counts_;
+
         static volatile long current_pos_;
         long init_pos_;
+
         bool threshold_reached_;
         bool threshold_missed_;
-        bool bidirectional_;
-        bool positive_threshold_;
 
+        int8_t dir_;
+        bool reverse_;
+
+        static int8_t sideToDir_(char side);
         static long degToCounts_(float deg);
         static void isr_();
 };

@@ -1,5 +1,6 @@
 #include "Wheel.h"
 #include <math.h>
+#include <ctype.h>
 
 volatile long Wheel::current_pos_ = 0;
 volatile uint8_t* Wheel::s_b_in_reg_ = nullptr;
@@ -7,17 +8,17 @@ uint8_t Wheel::s_b_mask_ = 0;
 
 Wheel::Wheel():
     displacement(0.0f),
-    easy_threshold_counts_(0),
-    normal_threshold_counts_(0),
-    active_threshold_counts_(0),
+    easy_counts_(0),
+    normal_counts_(0),
+    active_counts_(0),
     init_pos_(0),
     threshold_reached_(false),
     threshold_missed_(false),
-    bidirectional_(false),
-    positive_threshold_(true)
+    dir_(0),
+    reverse_(false)
 {}
 
-void Wheel::init(float easy_threshold, float normal_threshold, char alignment) {
+void Wheel::init(float easy_threshold, float normal_threshold, char side, bool reverse) {
     pinMode(A_PIN, INPUT_PULLUP);
     pinMode(B_PIN, INPUT_PULLUP);
 
@@ -26,24 +27,14 @@ void Wheel::init(float easy_threshold, float normal_threshold, char alignment) {
 
     attachInterrupt(digitalPinToInterrupt(A_PIN), Wheel::isr_, RISING);
 
-    easy_threshold_counts_ = degToCounts_(easy_threshold);
-    normal_threshold_counts_ = degToCounts_(normal_threshold);
+    easy_counts_ = degToCounts_(easy_threshold);
+    normal_counts_ = degToCounts_(normal_threshold);
 
-    bidirectional_ = (alignment == 'B' || alignment == 'b');
+    reverse_ = reverse;
+    dir_ = sideToDir_(side);
+    if (reverse_ && dir_ != 0) dir_ = (int8_t)(-dir_);
 
-    if (!bidirectional_) {
-        if (alignment == 'L' || alignment == 'l') {
-            positive_threshold_ = false;
-        } else if (alignment == 'R' || alignment == 'r') {
-            positive_threshold_ = true;
-        } else {
-            positive_threshold_ = true;
-        }
-    } else {
-        positive_threshold_ = true;
-    }
-
-    reset(true, alignment);
+    reset(true, side);
 }
 
 void Wheel::update() {
@@ -58,27 +49,21 @@ void Wheel::update() {
     long centi = (counts >= 0)
                  ? ((counts * 4500L + 64L) >> 7)
                  : -(((-counts) * 4500L + 64L) >> 7);
-    displacement = centi * 0.01f;
 
-    const long th_c = active_threshold_counts_;
+    float disp = centi * 0.01f;
+    displacement = reverse_ ? -disp : disp;
 
-    if (bidirectional_) {
-        if (counts >= th_c || counts <= -th_c) {
-            threshold_reached_ = true;
-        }
-    } else {
-        if (positive_threshold_) {
-            if (counts >= th_c) threshold_reached_ = true;
-            if (counts <= -th_c) threshold_missed_ = true;
-        } else {
-            if (counts >= th_c) threshold_missed_ = true;
-            if (counts <= -th_c) threshold_reached_ = true;
-        }
+    const long th = active_counts_;
+
+    if (dir_ == 0) {
+        if (counts >= th || counts <= -th) threshold_reached_ = true;
+        return;
     }
-}
 
-float Wheel::getDisplacement() {
-    return displacement;
+    long counts_proj = (long)dir_ * counts;
+
+    if (counts_proj >= th) threshold_reached_ = true;
+    if (counts_proj <= -th) threshold_missed_ = true;
 }
 
 bool Wheel::thresholdReached() {
@@ -90,27 +75,21 @@ bool Wheel::thresholdReached() {
 }
 
 bool Wheel::thresholdMissed() {
-    if (bidirectional_) {
-        return false;
-    }
-
+    if (dir_ == 0) return false;
+    
     if (threshold_missed_) {
         threshold_missed_ = false;
         return true;
     }
+
     return false;
 }
 
-void Wheel::reset(bool easy_trial, char alignment) {
-    if (!bidirectional_) {
-        if (alignment == 'L' || alignment == 'l') {
-            positive_threshold_ = false;
-        } else if (alignment == 'R' || alignment == 'r') {
-            positive_threshold_ = true;
-        }
-    }
+void Wheel::reset(bool easy, char side) {
+    dir_ = sideToDir_(side);
+    if (reverse_ && dir_ != 0) dir_ = (int8_t)(-dir_);
 
-    active_threshold_counts_ = easy_trial ? easy_threshold_counts_ : normal_threshold_counts_;
+    active_counts_ = easy ? easy_counts_ : normal_counts_;
 
     noInterrupts();
     init_pos_ = current_pos_;
@@ -121,7 +100,14 @@ void Wheel::reset(bool easy_trial, char alignment) {
     threshold_missed_ = false;
 }
 
-static long Wheel::degToCounts_(float deg) {
+int8_t Wheel::sideToDir_(char side) {
+    char a = (char)tolower((unsigned char)side);
+    if (a == 'r') return +1;
+    if (a == 'l') return -1;
+    return 0;
+}
+
+long Wheel::degToCounts_(float deg) {
     long c = lroundf(deg * (1024.0f / 360.0f));
     return (c >= 0) ? c : -c;
 }
