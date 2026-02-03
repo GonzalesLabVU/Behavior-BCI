@@ -19,19 +19,13 @@ DELAY_MS = 1000
 BLUE = (50, 50, 255)
 BLACK = (0, 0, 0)
 
-PHASE_CONFIG = {
-    '3': {'bidirectional': True, 'threshold': 30.0},
-    '4': {'bidirectional': True, 'threshold': 60.0},
-    '5': {'bidirectional': True, 'threshold': 90.0},
-    '6': {'bidirectional': False, 'threshold': 30.0},
-    '7': {'bidirectional': False, 'threshold': 60.0},
-    '8': {'bidirectional': False, 'threshold': 90.0},
-    }
-
 TRIAL_CONFIG = (False, "B")
 TRIAL_LOCK = threading.Lock()
-
 ABORT_EVT = threading.Event()
+
+ENC_TAG = "WHEEL"
+SIM_TAG = "SIM"
+TAGS = {ENC_TAG, SIM_TAG}
 
 
 # ---------------------------
@@ -44,7 +38,8 @@ def _parse_event(payload):
     return str(payload).strip().split()[0].lower()
 
 
-def cursor_fcn(threshold, evt_queue, enc_queue, *, display_idx=None, fullscreen=True, easy_threshold=15.0, stop_evt=None, blackout_evt=None):
+def cursor_fcn(threshold, evt_queue, enc_queue, *, display_idx=None, fullscreen=True,
+               easy_threshold=15.0, stop_evt=None):
     th = abs(float(threshold))
     easy_th = abs(float(easy_threshold))
     base_target_deg = 30.0
@@ -107,8 +102,12 @@ def cursor_fcn(threshold, evt_queue, enc_queue, *, display_idx=None, fullscreen=
         frac = (d - MIN_X) / X_SPAN
         return int(round(frac * WIDTH))
     
-    latest_disp = 0.0
+    current_disp = 0.0
     trial_active = False
+    is_blackout = False
+    delay_until = None
+    freeze_disp = None
+    active_is_easy, active_alignment = TRIAL_CONFIG
 
     while True:
         if stop_evt is not None and stop_evt.is_set():
@@ -118,11 +117,6 @@ def cursor_fcn(threshold, evt_queue, enc_queue, *, display_idx=None, fullscreen=
                 pass
 
             return 'stopped'
-        
-        if blackout_evt is not None and blackout_evt.is_set():
-            screen.fill(BLACK)
-            pg.display.flip()
-            clock.tick(240)
 
         for event in pg.event.get():
             if event.type == pg.QUIT:
@@ -150,8 +144,14 @@ def cursor_fcn(threshold, evt_queue, enc_queue, *, display_idx=None, fullscreen=
 
             evt = _parse_event(payload)
 
-            if evt == 'cue':
-                latest_disp = 0.0
+            if evt == "cue":
+                is_blackout = False
+                delay_until = None
+                freeze_disp = None
+                current_disp = 0.0
+
+                with TRIAL_LOCK:
+                    active_is_easy, active_alignment = TRIAL_CONFIG
 
                 while True:
                     try:
@@ -160,31 +160,57 @@ def cursor_fcn(threshold, evt_queue, enc_queue, *, display_idx=None, fullscreen=
                         break
                 
                 trial_active = True
-            elif evt in {'hit', 'miss'}:
-                trial_active = False
+            elif evt in {"hit", "miss"}:
+                if trial_active and (delay_until is None) and (not is_blackout):
+                    freeze_disp = current_disp
+                    delay_until = time.monotonic() + (DELAY_MS / 1000.0)
         
+        if delay_until is not None and time.monotonic() >= delay_until:
+            is_blackout = True
+            delay_until = None
+        
+        if is_blackout:
+            while True:
+                try:
+                    enc_queue.get_nowait()
+                except Empty:
+                    break
+
+            screen.fill(BLACK)
+            pg.display.flip()
+            clock.tick(240)
+            continue
+
         if not trial_active:
             clock.tick(240)
             continue
 
-        last_disp = None
-        while True:
-            try:
-                _, payload = enc_queue.get_nowait()
-                last_disp = payload
-            except Empty:
-                break
-        
-        if last_disp is not None:
-            try:
-                latest_disp = float(last_disp)
-            except (TypeError, ValueError):
-                pass
+        delay_active = (delay_until is not None)
+
+        if not delay_active:
+            new_disp = None
+
+            while True:
+                try:
+                    tag, payload = enc_queue.get_nowait()
+                except Empty:
+                    break
+            
+                tag = str(tag).upper().strip()
+                if tag not in TAGS:
+                    continue
+
+                new_disp = payload
+            
+            if new_disp is not None:
+                try:
+                    current_disp = float(new_disp)
+                except (TypeError, ValueError):
+                    pass
         
         screen.fill(BLACK)
 
-        with TRIAL_LOCK:
-            is_easy, alignment = TRIAL_CONFIG
+        is_easy, alignment = active_is_easy, active_alignment
         
         alignment = (alignment or "B").upper()
         if alignment not in {"L", "R", "B"}:
@@ -194,7 +220,10 @@ def cursor_fcn(threshold, evt_queue, enc_queue, *, display_idx=None, fullscreen=
         target_deg = easy_th if is_easy else base_target_deg
         gain = target_deg / max(1e-6, T)
 
-        cx = _deg_to_x(_clamp_deg(latest_disp * gain))
+        enc_val = (freeze_disp if (delay_until is not None and freeze_disp is not None)
+                     else current_disp)
+
+        cx = _deg_to_x(_clamp_deg(enc_val * gain))
         cursor = pg.Rect(cx - (cursor_w // 2), 0, cursor_w, HEIGHT)
 
         pg.draw.rect(screen, BLUE, cursor)
@@ -226,12 +255,13 @@ def cursor_fcn(threshold, evt_queue, enc_queue, *, display_idx=None, fullscreen=
 # BCI CLASS
 # ---------------------------
 class BCI:
-    def __init__(self, *, phase_id, evt_queue, enc_queue, display_idx=1, fullscreen=True, easy_threshold=15.0):
+    def __init__(self, *, phase_id, evt_queue, enc_queue, config, display_idx=1, fullscreen=True,
+                 easy_threshold=15.0):
         self.phase_id = str(phase_id)
         self.evt_q = evt_queue
         self.enc_q = enc_queue
 
-        cfg = PHASE_CONFIG.get(self.phase_id)
+        cfg = config.get(self.phase_id)
 
         self.enabled = cfg is not None
         self.bidirectional = bool(cfg.get('bidirectional')) if cfg else False
@@ -241,52 +271,8 @@ class BCI:
         self.fullscreen = bool(fullscreen)
         self.easy_threshold = easy_threshold
 
-        self._evt_q_internal = Queue()
-        self._blackout_evt = threading.Event()
-        self._blackout_timer = None
-        self._evt_forward_thread = None
-
         self._stop_evt = threading.Event()
         self._thread = None
-
-    def _forward_events(self):
-        while not self._stop_evt.is_set():
-            try:
-                ts, evt = self.evt_q.get(timeout=0.5)
-            except Empty:
-                continue
-            except Exception:
-                continue
-
-            e = str(evt).strip().lower()
-
-            if e == "cue":
-                self._blackout_evt.clear()
-                t = self._blackout_timer
-                self._blackout_timer = None
-
-                if t is not None:
-                    try:
-                        t.cancel()
-                    except Exception:
-                        pass
-            elif e in {"hit", "miss"}:
-                t = self._blackout_timer
-
-                if t is not None:
-                    try:
-                        t.cancel()
-                    except Exception:
-                        pass
-                
-                self._blackout_timer = threading.Timer(1.0, self._blackout_evt.set)
-                self._blackout_timer.daemon = True
-                self._blackout_timer.start()
-            
-            try:
-                self._evt_q_internal.put_nowait((ts, evt))
-            except Exception:
-                pass
 
     def start(self):
         if not self.enabled:
@@ -296,10 +282,6 @@ class BCI:
             return True
         
         self._stop_evt.clear()
-
-        if not self._evt_forward_thread or not self.evt_forward_thread.is_alive():
-            self._evt_forward_thread = threading.Thread(target=self._forward_events, daemon=True)
-            self._evt_forward_thread.start()
 
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
@@ -319,16 +301,6 @@ class BCI:
         self._stop_evt.set()
 
         try:
-            self._blackout_evt.clear()
-            t = self._blackout_timer
-            self._blackout_timer = None
-
-            if t is not None:
-                t.cancel()
-        except Exception:
-            pass
-
-        try:
             if pg.get_init():
                 pg.event.post(pg.event.Event(pg.QUIT))
         except Exception:
@@ -342,149 +314,9 @@ class BCI:
     
     def _run(self):
         cursor_fcn(threshold=self.threshold,
-                   evt_queue=self._evt_q_internal,
+                   evt_queue=self.evt_q,
                    enc_queue=self.enc_q,
                    display_idx=self.display_idx,
                    fullscreen=self.fullscreen,
                    easy_threshold=self.easy_threshold,
-                   stop_evt=self._stop_evt,
-                   blackout_evt=self._blackout_evt)
-
-
-# ---------------------------
-# TOP LEVEL (TESTING)
-# ---------------------------
-KEY_SPEED = 50.0
-TRIAL_MS = 30_000
-
-
-def _choose_alignment(phase_id, trial_n):
-    cfg = PHASE_CONFIG.get(str(phase_id))
-    if not cfg:
-        return "B"
-    
-    if cfg.get('bidirectional', False):
-        return "B"
-    
-    return "L" if (trial_n % 2 == 1) else "R"
-
-
-def _choose_is_easy(trial_n, K):
-    if trial_n <= 20:
-        return ((trial_n - 1) % 5) == 0
-    
-    K = max(1, int(K))
-    return ((trial_n - 21) % K) == 0
-
-
-def _driver(evt_q, enc_q, phase_id, threshold, easy_threshold, cursor, stop_evt):
-    deg = 0.0
-    trial_n = 0
-    last_frame_ms = int(time.time() * 1000)
-
-    def _now_ms():
-        return int(time.time() * 1000)
-    
-    def _send_evt(evt):
-        try:
-            evt_q.put_nowait((time.time(), evt))
-        except Exception:
-            pass
-    
-    def _send_enc(enc):
-        try:
-            enc_q.put_nowait((time.time(), enc))
-        except Exception:
-            pass
-
-    while not stop_evt.is_set():
-        trial_n += 1
-        is_easy = _choose_is_easy(trial_n, K=5)
-        alignment = _choose_alignment(str(phase_id), trial_n)
-
-        try:
-            cursor.update_config(is_easy, alignment)
-        except Exception:
-            pass
-
-        _send_evt('cue')
-        trial_start_ms = _now_ms()
-
-        while not stop_evt.is_set():
-            keys = pg.key.get_pressed() if pg.get_init() else None
-
-            now = _now_ms()
-            dt = max(0.0, (now - last_frame_ms) / 1000.0)
-            last_frame_ms = now
-
-            if keys:
-                dx = 0.0
-
-                if keys[pg.K_LEFT]:
-                    dx -= KEY_SPEED * dt
-                if keys[pg.K_RIGHT]:
-                    dx += KEY_SPEED * dt
-                
-                if dx != 0.0:
-                    deg = max(MIN_DEG, min(MAX_DEG, deg + dx))
-            
-            _send_enc(deg)
-
-            T = float(easy_threshold) if bool(is_easy) else float(threshold)
-            elapsed = now - trial_start_ms
-            hit = abs(deg) >= abs(T)
-            timeout = elapsed >= TRIAL_MS
-
-            if hit or timeout:
-                time.sleep(1.0)
-                _send_evt('hit' if hit else 'miss')
-                time.sleep((DELAY_MS / 1000.0) + 0.05)
-
-                deg = 0.0
-                break
-
-            time.sleep(0.003)
-
-
-def run_as_main(phase_id="3", fullscreen=False, display_idx=None, easy_threshold=15.0):
-    from queue import Queue
-
-    evt_q = Queue()
-    enc_q = Queue()
-    stop_evt = threading.Event()
-
-    cursor = BCI(phase_id=str(phase_id),
-                 evt_queue=evt_q,
-                 enc_queue=enc_q,
-                 display_idx=display_idx,
-                 fullscreen=fullscreen,
-                 easy_threshold=easy_threshold)
-    
-    if not cursor.enabled:
-        raise RuntimeError(f'Phase {phase_id!r} not configured for BCI (no threshold set)')
-    
-    cursor.start()
-
-    driver = threading.Thread(
-        target=_driver,
-        args=(evt_q, enc_q, str(phase_id), float(cursor.threshold), float(cursor.easy_threshold), cursor, stop_evt),
-        daemon=True
-        )
-    driver.start()
-
-    try:
-        while cursor._thread and cursor._thread.is_alive():
-            time.sleep(0.05)
-    except KeyboardInterrupt:
-        pass
-    finally:
-        stop_evt.set()
-
-        try:
-            cursor.stop(timeout=2.0)
-        except Exception:
-            pass
-
-
-if __name__ == '__main__':
-    run_as_main(phase_id="4", fullscreen=False, display_idx=1, easy_threshold=15.0)
+                   stop_evt=self._stop_evt)
