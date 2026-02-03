@@ -141,7 +141,7 @@ static void applyPhaseDefaults(int phase_id) {
         trial_T = SECONDS(30);
         delay_T = SECONDS(3);
     } else {
-        session_T = MINUTES(2);
+        session_T = MINUTES(45);
         trial_T = SECONDS(30);
         delay_T = SECONDS(3);
     }
