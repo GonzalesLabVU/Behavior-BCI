@@ -1549,23 +1549,74 @@ def send_email(session_data):
 # ---------------------------
 # EXIT
 # ---------------------------
-def is_early_exit(trial_stack, N, t_start, min_duration=20*60):
-    if t_start is None:
+def is_early_exit(evt, index, end_ms, min_duration=20*60):
+    if end_ms is None:
         return False
     
-    now_ms = _ts_to_ms(_get_ts())
-    if now_ms is None:
-        return False
+    try:
+        ts_list = evt.get('timestamps', []) if isinstance(evt, dict) else []
+        vals_list = evt.get('values', []) if isinstance(evt, dict) else []
 
-    elapsed_s = max(0.0, (now_ms - int(t_start)) / 1000.0)
-    if elapsed_s < min_duration:
-        return False
+        t0_ms = None
 
-    if len(trial_stack) < N:
+        for ts, val in zip(ts_list, vals_list):
+            if val == "cue":
+                t0_ms = _ts_to_ms(ts)
+                break
+    except Exception:
+        t0_ms = None
+
+    if t0_ms is None:
         return False
     
-    n_hits = sum(1 for o in trial_stack[:N] if o == "hit")
-    return n_hits < (N // 4)
+    prev_t0 = getattr(is_early_exit, '_t0_ms', None)
+    if prev_t0 is None or int(prev_t0) != int(t0_ms):
+        setattr(is_early_exit, '_t0_ms', int(t0_ms))
+        setattr(is_early_exit, '_buf', deque(maxlen=11))
+    
+    buf = getattr(is_early_exit, '_buf')
+
+    dt_ms = int(end_ms) - int(t0_ms)
+    if dt_ms < 0:
+        dt_ms += 24 * 3600 * 1000
+    
+    elapsed_s = max(0.0, dt_ms / 1000.0)
+    
+    x = max(0.0, dt_ms / 60000.0)
+    try:
+        y = int(index)
+    except Exception:
+        return False
+    
+    buf.append((x, y))
+
+    if len(buf) < 11:
+        return False
+    
+    rates = []
+    prev = None
+
+    for curr in buf:
+        if prev is None:
+            prev = curr
+            continue
+
+        x1, y1 = prev
+        x2, y2 = curr
+
+        dx = float(x2) - float(x1)
+        dy = float(y2) - float(y1)
+
+        rates.append(float('inf') if dx <= 0.0 else (dy / dx))
+        prev = curr
+    
+    if len(rates) != 10:
+        return False
+    
+    if elapsed_s < float(min_duration):
+        return False
+    
+    return sum(1 for r in rates if r < 4.0) > 5
 
 
 def cleanup(link, msg, timeout=2.0):
@@ -2194,24 +2245,26 @@ def main(link, session_data, cursor, sim):
 
                     show_trial_info(trial_dt, n_hit, n_miss, p)
 
+                    early_exit = is_early_exit(session_data.evt, trial_n, end_ms)
+
                     if do_calibration:
                         trial_stack.insert(0, p)
                         if len(trial_stack) > N:
                             trial_stack.pop()
                         
-                        if calibrated:
-                            if len(trial_stack) >= N and is_early_exit(trial_stack, N, session_data.meta['t_start']):
-                                cleanup(link, 'Terminated by early exit')
-                                session_data.meta['aborted'] = True
-                                break
-                        else:
+                        if not calibrated:
                             if len(trial_stack) >= N:
                                 K, N, calibration_hits = update_easy_rate(session_data, trial_stack)
-                                
+
                                 session_data.meta['K2'] = K
                                 calibrated = True
+
                                 print(f'\nCalibration finished [hits={calibration_hits}/20, K={K}, N={N}]\n', flush=True)
                                 show_trial_header()
+                        else:
+                            if early_exit:
+                                cleanup(link, 'Terminated by early exit')
+                                break
                     
                     if cursor is not None:
                         next_trial_n = trial_n + 1
