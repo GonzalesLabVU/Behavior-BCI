@@ -1546,7 +1546,7 @@ def send_email(session_data):
 # ---------------------------
 # EXIT
 # ---------------------------
-def is_early_exit(evt, index, end_ms, min_duration=20*60, min_trials=100):
+def is_early_exit(evt, index, end_ms, min_duration=20*60, min_trials=150):
     if end_ms is None:
         return False
     
@@ -1616,7 +1616,7 @@ def is_early_exit(evt, index, end_ms, min_duration=20*60, min_trials=100):
     if index < min_trials:
         return False
     
-    return sum(1 for r in rates if r < 4.0) > 5
+    return sum(1 for r in rates if r < 4.0) > 7
 
 
 def cleanup(link, msg, timeout=2.0):
