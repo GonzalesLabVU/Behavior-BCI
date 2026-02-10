@@ -15,7 +15,7 @@ from datetime import datetime
 from pathlib import Path
 from queue import Queue, Empty
 from collections import deque
-from threading import Thread, Event, Lock
+from threading import Thread, Event
 
 import serial
 import serial.tools.list_ports
@@ -55,8 +55,6 @@ load_dotenv(SCRIPT_DIR / ".env")
 BAUDRATE = 1_000_000
 EARLY_END_STRING = "E"
 SESSION_END_STRING = "S"
-SIM_HIT_STRING = "H"
-SIM_MISS_STRING = "M"
 
 PHASE_CONFIG = {
     '3': {'threshold': 30.0, 'side': 'B', 'reverse': False},
@@ -76,7 +74,6 @@ SIDE_STREAK = 0
 
 EVT_QUEUE: "Queue[tuple[str, str]]" = Queue()
 ENC_QUEUE: "Queue[tuple[str, object]]" = Queue()
-SIM_QUEUE: "Queue[tuple[str, float]]" = Queue()
 EXC_STACK: "deque[dict[str, object]]" = deque()
 
 
@@ -1549,7 +1546,7 @@ def send_email(session_data):
 # ---------------------------
 # EXIT
 # ---------------------------
-def is_early_exit(evt, index, end_ms, min_duration=20*60):
+def is_early_exit(evt, index, end_ms, min_duration=20*60, min_trials=100):
     if end_ms is None:
         return False
     
@@ -1616,6 +1613,9 @@ def is_early_exit(evt, index, end_ms, min_duration=20*60):
     if elapsed_s < float(min_duration):
         return False
     
+    if index < min_trials:
+        return False
+    
     return sum(1 for r in rates if r < 4.0) > 5
 
 
@@ -1640,260 +1640,6 @@ def cleanup(link, msg, timeout=2.0):
         print(f'{msg}', flush=True)
     finally:
         link.close()
-
-
-# ---------------------------
-# SIMULATION
-# ---------------------------
-SIM_ENABLED = Event()
-SIM_ENABLED.set()
-
-
-class Simulator(Thread):
-    def __init__(self, arbiter, phase, enc_queue, sim_queue, rate=75.0, poll_dt=0.01):
-        super().__init__(daemon=True)
-
-        self.arbiter = arbiter
-        self.phase = str(phase)
-        self.enc_q = enc_queue
-        self.sim_q = sim_queue
-        
-        self.rate = float(rate)
-        self.dt = float(poll_dt)
-
-        self._running = True
-        self._lock = Lock()
-
-        self._sim_stream = 0.0
-        self._enc_stream = 0.0
-
-        self._enc_pos = None
-        self._enc_init_pos = None
-
-        self._net_pos = 0.0
-
-        self._side = "B"
-        self._threshold = 0.0
-        self._easy_threshold = 15.0
-
-        self._cue_delay_s = 1.5
-        self._enable_s = float("inf")
-
-        self._outcome_sent = False
-        self._clamp_pos = None
-        self._retry_s = 0.5
-        self._last_send_s = 0.0
-    
-    def _update_enc(self):
-        if self._enc_pos is None or self._enc_init_pos is None:
-            self._enc_stream = 0.0
-        else:
-            self._enc_stream = float(self._enc_pos) - float(self._enc_init_pos)
-    
-    def _update_net(self):
-        self._net_pos = float(self._sim_stream) + float(self._enc_stream)
-
-        if self._clamp_pos is not None:
-            self._sim_stream = float(self._clamp_pos) - float(self._enc_stream)
-            self._net_pos = float(self._clamp_pos)
-        
-        return float(self._net_pos)
-    
-    def _hit_reached(self, pos):
-        th = float(self._threshold)
-
-        match self._side:
-            case "B":
-                return abs(pos) >= th
-            case "R":
-                return pos >= +th
-            case "L":
-                return pos <= -th
-        
-        return False
-
-    def _miss_reached(self, pos):
-        th = float(self._threshold)
-
-        match self._side:
-            case "B":
-                return False
-            case "R":
-                return pos <= -th
-            case "L":
-                return pos >= +th
-        
-        return False
-    
-    def _clamp_to_pos(self, pos):
-        th = float(self._threshold)
-        s = self._side
-
-        if s == "R":
-            return +th
-        if s == "L":
-            return -th
-        
-        if pos >= +th:
-            return +th
-        if pos <= -th:
-            return -th
-        
-        return max(-th, min(+th, float(pos)))
-    
-    def _input_enabled(self):
-        return SIM_ENABLED.is_set() and time.monotonic() >= self._enable_s
-    
-    def _send_enabled(self):
-        return self._input_enabled() and (not self._outcome_sent)
-    
-    def stop(self):
-        self._running = False
-
-    def update_trial(self, is_easy, side):
-        with self._lock:
-            self._side = str(side or "B")
-
-            try:
-                if is_easy:
-                    self._threshold = self._easy_threshold
-                else:
-                    self._threshold = PHASE_CONFIG.get(self.phase).get('threshold', 0.0)
-            except Exception:
-                self._threshold = 0.0
-    
-    def on_cue(self):
-        with self._lock:
-            self._enc_pos = None
-            self._enc_init_pos = None
-
-            self._sim_stream = 0.0
-            self._enc_stream = 0.0
-            self._net_pos = 0.0
-
-            self._outcome_sent = False
-            self._clamp_pos = None
-
-            self._enable_s = time.monotonic() + self._cue_delay_s
-            self._last_send_s = 0.0
-    
-    def update_from_enc(self, pos):
-        try:
-            pos = float(pos)
-        except Exception:
-            return self.get_pos()
-
-        with self._lock:
-            if pos == 0.0:
-                self._enc_pos = 0.0
-                self._enc_init_pos = 0.0
-                self._sim_stream = 0.0
-                self._enc_stream = 0.0
-                self._net_pos = 0.0
-                self._clamp_pos = None
-                return 0.0
-            
-            self._enc_pos = pos
-            if self._enc_init_pos is None:
-                self._enc_init_pos = pos
-
-            self._update_enc()
-            return self._update_net()
-    
-    def get_pos(self):
-        with self._lock:
-            return float(self._net_pos)
-        
-    def is_hit(self):
-        with self._lock:
-            if not self._send_enabled():
-                return False
-            
-            return self._hit_reached(self._net_pos)
-    
-    def is_miss(self):
-        with self._lock:
-            if not self._send_enabled():
-                return False
-            
-            return self._miss_reached(self._net_pos)
-
-    def get_outcome(self):
-        if self.is_hit():
-            return "hit"
-        if self.is_miss():
-            return "miss"
-        
-        return None
-
-    def can_send(self):
-        with self._lock:
-            now_s = time.time()
-            return (now_s - self._last_send_s) >= self._retry_s
-    
-    def log_send(self):
-        with self._lock:
-            self._last_send_s = time.time()
-    
-    def confirm_send(self):
-        with self._lock:
-            if self._outcome_sent:
-                return
-            
-            clamp_pos = self._clamp_to_pos(self._net_pos)
-            self._clamp_pos = float(clamp_pos)
-            self._outcome_sent = True
-
-            self._update_enc()
-            self._update_net()
-    
-    def run(self):
-        while self._running:
-            input_enabled = self._input_enabled()
-            delta = 0.0
-
-            if input_enabled:
-                try:
-                    if keyboard.is_pressed('right'):
-                        delta = +self.rate * self.dt
-                    elif keyboard.is_pressed('left'):
-                        delta = -self.rate * self.dt
-                except Exception as e:
-                    cache_exc(e, 'Simulator.run')
-            
-            if delta != 0.0 and input_enabled and self.arbiter.kb_enabled():
-                with self._lock:
-                    if not self._outcome_sent:
-                        self._sim_stream += float(delta)
-                        net_pos = self._update_net()
-                    else:
-                        net_pos = float(self._net_pos)
-                
-                try:
-                    self.enc_q.put(("SIM", net_pos))
-                except Exception:
-                    pass
-                    
-                try:
-                    self.sim_q.put(("SIM", net_pos))
-                except Exception:
-                    pass
-            
-            time.sleep(self.dt)
-
-
-class InputArbiter:
-    def __init__(self, kb_lockout_s=0.5):
-        self.last_enc_pos = None
-        self.kb_disabled_until = 0.0
-        self.kb_lockout_s = kb_lockout_s
-    
-    def update_enc(self, pos):
-        self.last_enc_pos = pos
-        self.kb_disabled_until = time.time() + self.kb_lockout_s
-    
-    def kb_enabled(self):
-        return time.time() >= self.kb_disabled_until
 
 
 # ---------------------------
@@ -2093,17 +1839,12 @@ def setup():
             cursor.update_config(easy, side)
             cursor.start()
 
-        arbiter = InputArbiter()
-        
-        sim = Simulator(arbiter, phase_id, ENC_QUEUE, SIM_QUEUE)
-        sim.update_trial(easy, side)
-
         session_data = SessionData(animal_id, str(phase_id), _get_date())
         session_data.meta['workbook_id'] = workbook_id
 
         log_trial_config(session_data, trial_n=1, type=easy, side=side)
 
-        return link, session_data, cursor, sim
+        return link, session_data, cursor
     except Exception as e:
         cache_exc(e, 'setup')
 
@@ -2122,7 +1863,7 @@ def setup():
         raise
 
 
-def main(link, session_data, cursor, sim):
+def main(link, session_data, cursor):
     do_calibration = str(session_data.meta["phase"]) not in {"1", "2"}
 
     K = 5
@@ -2141,38 +1882,6 @@ def main(link, session_data, cursor, sim):
         typ, ts, payload = link.msg_q.get(timeout=timeout)
         return typ, ts, payload
 
-    sim.start()
-
-    def _send_sim_outcome():
-        outcome = sim.get_outcome()
-        if outcome is None:
-            return
-        
-        if not sim.can_send():
-            return
-        
-        sim.log_send()
-
-        try:
-            if outcome == "hit":
-                link.send_and_wait(SIM_HIT_STRING, timeout=2.0)
-            else:
-                link.send_and_wait(SIM_MISS_STRING, timeout=2.0)
-            
-            sim.confirm_send()
-        except Exception as e:
-            cache_exc(e, 'main._send_sim_outcome')
-
-    def _drain_sim_queue(max_items=50):
-        for _ in range(max_items):
-            try:
-                src, net = SIM_QUEUE.get_nowait()
-            except Empty:
-                break
-
-            if src in {"SIM", "WHEEL"}:
-                _send_sim_outcome()
-
     started = False
 
     try:
@@ -2183,13 +1892,11 @@ def main(link, session_data, cursor, sim):
             try:
                 typ, ts, payload = _get_msg(timeout=0.05)
             except Empty:
-                _drain_sim_queue()
-                _send_sim_outcome()
                 continue
 
             if not started:
                 started = True
-                session_data.meta["t_start"] = _ts_to_ms(_get_ts())
+                session_data.meta["t_start"] = _ts_to_ms(ts)
 
                 print(f"\nSession started at {datetime.now().strftime('%I:%M %p')}\n", flush=True)
                 show_trial_header()
@@ -2217,10 +1924,7 @@ def main(link, session_data, cursor, sim):
 
                 if p == 'cue':
                     session_data.add_evt(ts, p)
-                    sim.on_cue()
-
-                    _send_sim_outcome()
-
+                    
                     trial_n += 1
                     last_outcome = None
                     trial_start_ms = _ts_to_ms(ts)
@@ -2274,7 +1978,6 @@ def main(link, session_data, cursor, sim):
                         link.send_and_wait(f"{next_trial_n} {'1' if next_easy else '0'}")
                         log_trial_config(session_data, trial_n=next_trial_n, type=next_easy, side=next_side)
 
-                        sim.update_trial(next_easy, next_side)
                         cursor.update_config(next_easy, next_side)
 
                 if p in {"hit", "lick"}:
@@ -2285,24 +1988,14 @@ def main(link, session_data, cursor, sim):
                 
                 try:
                     pos = float(p)
-
-                    net = sim.update_from_enc(pos)
-                    sim.arbiter.update_enc(pos)
-
-                    session_data.add_enc(ts, str(net))
-
-                    ENC_QUEUE.put_nowait(("WHEEL", net))
+                    session_data.add_enc(ts, str(pos))
 
                     try:
-                        SIM_QUEUE.put_nowait(("WHEEL", net))
+                        ENC_QUEUE.put_nowait(("WHEEL", pos))
                     except Exception:
                         pass
-
-                    _send_sim_outcome()
                 except Exception:
                     pass
-            
-            _drain_sim_queue()
     except KeyboardInterrupt:
         session_data.meta["aborted"] = True
         cleanup(link, "Terminated by KeyboardInterrupt")
@@ -2310,8 +2003,6 @@ def main(link, session_data, cursor, sim):
     except Exception as e:
         cache_exc(e, 'main')
     finally:
-        sim.stop()
-
         if session_data.meta["t_start"] is None:
             session_data.meta["t_start"] = _ts_to_ms(_get_ts())
 
@@ -2336,13 +2027,13 @@ if __name__ == "__main__":
     run_exc = None
 
     try:
-        link, session_data, cursor, sim = setup()
+        link, session_data, cursor = setup()
 
         if session_data is not None:
             animal_id_for_log = session_data.meta.get("animal", "UNKNOWN")
             phase_id_for_log = session_data.meta.get("phase", "0")
 
-        main(link, session_data, cursor, sim)
+        main(link, session_data, cursor)
     except BaseException as e:
         run_exc = e
         cache_exc(e, '__main__')
