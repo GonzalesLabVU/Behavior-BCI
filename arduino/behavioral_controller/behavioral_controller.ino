@@ -231,6 +231,7 @@ static void waitForHandshake() {
     bool have_side = false;
     bool have_reverse = false;
     bool have_trial = false;
+    bool have_phase = false;
 
     session_cfg.phase = 3;
 
@@ -272,14 +273,27 @@ static void waitForHandshake() {
                 if (strncmp(line, "threshold", 9) == 0) have_threshold = true;
                 if (strncmp(line, "side", 4) == 0) have_side = true;
                 if (strncmp(line, "reverse", 7) == 0) have_reverse = true;
+                if (strncmp(line, "phase", 5) == 0) have_phase = true;
 
                 logger.ack();
             }
         }
     
     check_done:
-        if (have_engage && have_release && have_pulse && have_threshold && have_side && have_reverse && have_trial) {
+        bool trial_required = (session_cfg.phase != 1 && session_cfg.phase != 2);
+
+        if (have_engage && have_release && have_pulse &&
+            have_threshold && have_side && have_reverse && have_phase &&
+            (!trial_required || have_trial)) {
             applyPhaseDefaults(session_cfg.phase);
+
+            if (!have_trial) {
+                trial_cfg.trial_n = 1;
+                trial_cfg.easy = false;
+                trial_cfg.side = session_cfg.side;
+                trial_cfg.pending = false;
+            }
+
             return;
         }
     }
