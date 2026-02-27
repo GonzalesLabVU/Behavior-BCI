@@ -431,6 +431,10 @@ def _require_env(name):
     return v
 
 
+def _cohort_tokens(map_key):
+    return [t.strip() for t in str(map_key).split('_') if t.strip()]
+
+
 def load_animal_map(path=ANIMAL_MAP_PATH):
     with open(path, 'r', encoding='utf-8') as f:
         data = json.load(f)
@@ -446,7 +450,8 @@ def load_animal_map(path=ANIMAL_MAP_PATH):
 
 
 def validate_animal(animal_id, animal_map):
-    if not any(animal_id in key for key in animal_map.keys()):
+    animal_id = str(animal_id).strip()
+    if not any(animal_id in _cohort_tokens(key) for key in animal_map.keys()):
         raise ValueError('Animal not found in animal_map.json')
 
 
@@ -782,15 +787,18 @@ def _align_cells(wb, ws, r1, c1, r2, c2):
 
 
 def get_workbook_id(animal_id, animal_map):
+    animal_id = str(animal_id).strip()
+
     try:
-        map_key = next(key for key in animal_map.keys() if animal_id in key)
+        map_key = next(key for key in animal_map.keys()
+                       if animal_id in _cohort_tokens(key))
     except StopIteration:
-        raise ValueError(f'No cohort mapping found for Animal {animal_id!r}')
+        raise ValueError(f'No cohort mapping found for animal {animal_id!r}')
     
     cohort_name = animal_map[map_key]
-    env_var = f'{cohort_name}_ID'
-
-    return _require_env(env_var)
+    wb_id = f'{cohort_name}_ID'
+    
+    return _require_env(wb_id)
 
 
 def get_client_id():
