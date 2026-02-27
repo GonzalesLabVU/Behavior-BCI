@@ -516,6 +516,10 @@ void run_phase_1() {
             spout.pulse();
             logger.write("hit");
 
+            phase_timer.reset();
+            phase_timer.init(delay_T);
+            phase_timer.start();
+
             phase_state = PhaseState::TRIAL;
 
             break;
@@ -523,11 +527,22 @@ void run_phase_1() {
         
         case PhaseState::TRIAL: {
             if (session_timer.isRunning()) {
+                if (!phase_timer.started()) {
+                    phase_timer.init(delay_T);
+                    phase_timer.start();
+                }
+
                 lick.sampleFiltered();
                 if (lick.justTouched()) {
                     logger.write("lick");
+                    phase_timer.reset();
 
-                    phase_state = PhaseState::DELAY;
+                    phase_state = PhaseState::HIT;
+                }
+                else if (!phase_timer.isRunning()) {
+                    phase_timer.reset();
+
+                    phase_state = PhaseState::HIT;
                 }
 
                 spout.poll();
@@ -542,31 +557,7 @@ void run_phase_1() {
         }
         
         case PhaseState::DELAY: {
-            if (session_timer.isRunning()) {
-                // entry
-                if (!phase_timer.started()) {
-                    phase_timer.init(delay_T);
-                    phase_timer.start();
-                }
-                // active
-                else {
-                    if (phase_timer.isRunning()) {
-                        lick.sampleFiltered();
-
-                        if (lick.justTouched()) {
-                            logger.write("lick");
-                        }
-                    }
-                    else {
-                        phase_timer.reset();
-
-                        phase_state = PhaseState::HIT;
-                    }
-                }
-            }
-            else {
-                session_state = SessionState::CLEANUP;
-            }
+            phase_state = PhaseState::TRIAL;
 
             break;
         }
