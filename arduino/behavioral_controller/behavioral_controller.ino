@@ -73,7 +73,7 @@ Logger logger;
 // TRIAL CONFIG
 // ---------------------------
 struct SessionConfig {
-    int phase = 3;
+    int phase = 0;
     float engage_ms = 0.0f;
     float release_ms = 0.0f;
     float pulse_ms = 0.0f;
@@ -132,7 +132,11 @@ static bool isSideChar(char c) {
 }
 
 static void applyPhaseDefaults(int phase_id) {
-    if (phase_id == 1) {
+    if (phase_id == 0) {
+        session_T = MINUTES(20);
+        trial_T = SECONDS(30);
+        delay_T = SECONDS(3);
+    } else if (phase_id == 1) {
         session_T = MINUTES(10);
         trial_T = SECONDS(0);
         delay_T = SECONDS(5);
@@ -214,7 +218,7 @@ static bool parseKeyValue(char* line) {
     }
     if (strcmp(key, "phase") == 0) {
         long v = strtol(val, nullptr, 10);
-        if (v < 1 || v > 99) return false;
+        if (v < 0 || v > 99) return false;
 
         session_cfg.phase = (int)v;
         return true;
@@ -233,7 +237,7 @@ static void waitForHandshake() {
     bool have_trial = false;
     bool have_phase = false;
 
-    session_cfg.phase = 3;
+    session_cfg.phase = 0;
 
     char line[96];
 
@@ -423,6 +427,7 @@ static void checkInactivity(float current_disp) {
 // ---------------------------
 // TOP LEVEL
 // ---------------------------
+void run_phase_0();
 void run_phase_1();
 void run_phase_2();
 void run_phase_3_plus();
@@ -471,6 +476,7 @@ void loop() {
     switch (session_state) {
         case SessionState::MAIN: {
             switch (session_cfg.phase) {
+                case 0: run_phase_0(); break;
                 case 1: run_phase_1(); break;
                 case 2: run_phase_2(); break;
                 default: run_phase_3_plus(); break;
@@ -510,6 +516,96 @@ void loop() {
 }
 
 // phase logic functions
+
+void run_phase_0() {
+    switch (phase_state) {
+        case PhaseState::IDLE: {
+            if (!session_initialized) {
+                session_initialized = true;
+
+                session_timer.init(session_T);
+                session_timer.start();
+
+                phase_state = PhaseState::CUE;
+            }
+
+            break;
+        }
+
+        case PhaseState::CUE: {
+            if (!phase_timer.started()) {
+                phase_timer.init(tone_T);
+                phase_timer.start();
+
+                logger.write("cue");
+            }
+            else {
+                if (!phase_timer.isRunning()) {
+                    phase_timer.reset();
+
+                    phase_state = PhaseState::TRIAL;
+                }
+            }
+
+            break;
+        }
+
+        case PhaseState::TRIAL: {
+            if (!phase_timer.started()) {
+                phase_timer.init(trial_T);
+                phase_timer.start();
+            }
+            else {
+                if (!phase_timer.isRunning()) {
+                    phase_timer.reset();
+
+                    phase_state = PhaseState::HIT;
+                }
+            }
+
+            break;
+        }
+
+        case PhaseState::HIT: {
+            if (!phase_timer.started()) {
+                phase_timer.init(tone_T);
+                phase_timer.start();
+
+                logger.write("hit");
+            }
+            else {
+                if (!phase_timer.isRunning()) {
+                    phase_timer.reset();
+
+                    phase_state = PhaseState::DELAY;
+                }
+            }
+
+            break;
+        }
+
+        case PhaseState::DELAY: {
+            if (session_timer.isRunning()) {
+                if (!phase_timer.started()) {
+                    phase_timer.init(delay_T);
+                    phase_timer.start();
+                }
+                else {
+                    if (!phase_timer.isRunning()) {
+                        phase_timer.reset();
+
+                        phase_state = PhaseState::CUE;
+                    }
+                }
+            }
+            else {
+                session_state = SessionState::CLEANUP;
+            }
+
+            break;
+        }
+    }
+}
 
 void run_phase_1() {
     switch (phase_state) {
