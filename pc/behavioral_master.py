@@ -11,15 +11,18 @@ import uuid
 import json
 import functools
 import inspect
+from itertools import zip_longest
 from datetime import datetime
 from pathlib import Path
 from queue import Queue, Empty
 from collections import deque
+import threading
 from threading import Thread, Event
 
 import serial
 import serial.tools.list_ports
 from cursor_utils import BCI, ABORT_EVT
+from TCPClient import PrairieClient
 
 import gspread
 from gspread.utils import rowcol_to_a1
@@ -34,6 +37,9 @@ from email.message import EmailMessage
 import subprocess
 import shutil
 import tempfile
+# from dataclasses import dataclass
+# from collections.abc import Hashable, Callable
+# from typing import Dict, Any
 
 
 # ---------------------------
@@ -46,7 +52,7 @@ warnings.filterwarnings(
     message="pkg_resources is deprecated as an API.*",
 )
 
-SCRIPT_DIR = Path(__file__).resolve().parent
+SCRIPT_DIR = Path.cwd()
 ANIMAL_MAP_PATH = SCRIPT_DIR / "animal_map.json"
 ERROR_LOG_PATH = SCRIPT_DIR / "errors.log"
 
@@ -57,15 +63,10 @@ EARLY_END_STRING = "E"
 SESSION_END_STRING = "S"
 
 PHASE_CONFIG = {
-    '3': {'threshold': 30.0, 'side': 'B', 'reverse': False},
-    '4': {'threshold': 60.0, 'side': 'B', 'reverse': False},
-    '5': {'threshold': 90.0, 'side': 'B', 'reverse': False},
+    '2': {'threshold': 15.0, 'side': 'B', 'reverse': False},
 
-    '6': {'threshold': 30.0, 'side': 'L', 'reverse': False},
-    '7': {'threshold': 30.0, 'side': 'R', 'reverse': False},
-
-    '8': {'threshold': 30.0, 'side': 'L', 'reverse': True},
-    '9': {'threshold': 30.0, 'side': 'R', 'reverse': True}
+    '3': {'threshold': 15.0, 'side': 'B', 'reverse': False},
+    '4': {'threshold': 15.0, 'side': 'L', 'reverse': False}
     }
 
 MAX_STREAK = 4
@@ -465,6 +466,10 @@ def validate_resources():
         raise FileNotFoundError('credentials.json not found in the script directory')
 
 
+def is_affirmative(text):
+    return str(text).strip().lower() in {"y", "yes"}
+
+
 # ---------------------------
 # SERIAL INTERFACE
 # ---------------------------
@@ -500,7 +505,7 @@ def update_easy_rate(session_data, trial_stack):
 class ArduinoLink:
     def __init__(self, ser):
         self.ser = ser
-        self.active = ser.is_open
+        self.active = ser is not None and ser.is_open
         self.stop_evt = Event()
         self.ack_evt = Event()
         self.msg_q: "Queue[tuple[str, str, object]]" = Queue()
@@ -566,6 +571,9 @@ class ArduinoLink:
             pass
 
     def send_and_wait(self, text, timeout=5.0):
+        if not self.active:
+            return
+        
         self.ack_evt.clear()
         self.ser.write((text.strip() + "\n").encode("utf-8"))
         self.ser.flush()
@@ -574,6 +582,9 @@ class ArduinoLink:
             raise TimeoutError(f"No ACK after sending: {text!r}")
 
     def send(self, text):
+        if not self.active:
+            return
+        
         self.ser.write((text.strip() + "\n").encode("utf-8"))
         self.ser.flush()
 
@@ -590,6 +601,7 @@ class SessionData:
             "t_start": None,
             "t_stop": None,
             "duration_sec": None,
+            "imaging_active": False,
             "K1": 5,
             "K2": None,
             "easy_trials": [],
@@ -603,6 +615,7 @@ class SessionData:
 
         self.evt = {"timestamps": [], "values": []}
         self.enc = {"timestamps": [], "values": []}
+        self.img = {"start_ts": [], "stop_ts": []}
         self.raw = {
             "evt": {"timestamps": [], "values": []},
             "cap": {"timestamps": [], "values": []}
@@ -634,6 +647,7 @@ class SessionData:
             return (
                 bool(self.evt["timestamps"]) or
                 bool(self.enc["timestamps"]) or
+                bool(self.img['start_ts']) or
                 bool(self.raw["evt"]["timestamps"]) or
                 bool(self.raw["cap"]["timestamps"])
                 )
@@ -643,6 +657,8 @@ class SessionData:
                 return bool(self.evt['timestamps'])
             case "enc":
                 return bool(self.enc['timestamps'])
+            case "img":
+                return bool(self.img['start_ts'])
             case "raw":
                 return bool(self.raw['cap']['timestamps'])
         
@@ -685,6 +701,7 @@ class SessionData:
             'meta': _json_safe(meta_out),
             'evt': _json_safe(self.evt),
             'enc': _json_safe(self.enc),
+            'img': _json_safe(self.img),
             'raw': _json_safe(self.raw)
             }
 
@@ -757,6 +774,20 @@ def _build_meta_rows(session_data):
                     out.append(["", val])
         else:
             out.append([key, "" if value is None else value])
+    
+    return out
+
+
+def _build_img_rows(session_data):
+    starts = session_data.img.get('start_ts') or []
+    stops = session_data.img.get('stop_ts') or []
+
+    out = []
+    for t1, t2 in zip_longest(starts, stops, fillvalue=None):
+        if t1 is not None:
+            out.append([str(t1), 'start'])
+        if t2 is not None:
+            out.append([str(t2), 'stop'])
     
     return out
 
@@ -1260,17 +1291,30 @@ def save_data(session_data):
         wb = API_CLIENT.open_by_key(workbook_id)
         lock.wb = wb
 
-        for dtype, sheet_name in (('evt', 'Event'), ('enc', 'Encoder'), ('meta', 'Metadata')):
-            if dtype == 'meta':
-                data_rows = _build_meta_rows(session_data)
-                data = data_rows
-                n_rows = len(data_rows)
-                label = 'metadata'
-            else:
-                d = getattr(session_data, dtype)
-                n_rows= len(d['timestamps'])
-                data = [[ts, val] for ts, val in zip(d['timestamps'], d['values'])]
-                label = sheet_name.lower()
+        sheet_map = (
+            ("evt", "Event"),
+            ("enc", "Encoder"),
+            ("img", "Imaging"),
+            ("meta", "Metadata")
+            )
+
+        for dtype, sheet_name in sheet_map:
+            match dtype:
+                case "meta":
+                    data_rows = _build_meta_rows(session_data)
+                    data = data_rows
+                    n_rows = len(data_rows)
+                    label = 'metadata'
+                case "img":
+                    data_rows = _build_img_rows(session_data)
+                    data = data_rows
+                    n_rows = len(data_rows)
+                    label = 'imaging'
+                case _:
+                    d = getattr(session_data, dtype)
+                    n_rows = len(d['timestamps'])
+                    data = [[ts, val] for ts, val in zip(d['timestamps'], d['values'])]
+                    label = sheet_name.lower()
 
             if n_rows == 0:
                 continue
@@ -1653,99 +1697,36 @@ def cleanup(link, msg, timeout=2.0):
 # ---------------------------
 # TOP LEVEL
 # ---------------------------
-def plot_raw(filename):
-    import matplotlib.pyplot as plt
-
-    path = Path(filename)
-    with path.open('r', encoding='utf-8') as file:
-        obj = json.load(file)
-    
-    if not isinstance(obj, dict):
-        raise ValueError('JSON file must be an object/dict')
-    
-    meta = obj.get('meta', {})
-    data = obj.get('data', None)
-    if not isinstance(data, dict):
-        raise ValueError("Missing or invalid 'data' object'")
-
-    ts_list = data.get('timestamps', None)
-    vals_list = data.get('values', None)
-    if not isinstance(ts_list, list) or not isinstance(vals_list, list):
-        raise ValueError("Expected 'data.timestamps' and 'data.values' to be lists")
-    
-    if len(ts_list) != len(vals_list):
-        raise ValueError(f'Length mismatch: {len(ts_list)} timstamps vs {len(vals_list)} values')
-    
-    if len(ts_list) == 0:
-        raise ValueError('Empty timeseries')
-    
-    def _parse_time(s):
-        try:
-            return datetime.strptime(s, '%H:%M:%S.%f')
-        except ValueError as e:
-            raise ValueError(f'Bad timestamp format: {s!r} (expected HH:MM:SS.sss)') from e
-        
-    t_0 = _parse_time(ts_list[0])
-    prev_t = t_0
-    day_offset_s = 0.0
-
-    times = []
-    values = []
-
-    for t, v in zip(ts_list, vals_list):
-        t_i = _parse_time(t)
-
-        if t_i < prev_t:
-            day_offset_s += 24.0 * 3600.0
-
-        sec = (t_i - t_0).total_seconds() + day_offset_s
-        times.append(sec)
-        values.append(float(v))
-
-        prev_t = t_i
-    
-    _, ax = plt.subplots()
-
-    ax.plot(times, values)
-    ax.set_xlabel('Time [s]')
-    ax.set_ylabel('Raw Value')
-
-    parts = []
-
-    if isinstance(meta, dict):
-        if meta.get('animal') is not None:
-            parts.append(f"Animal={meta.get('animal')}")
-        if meta.get('phase') is not None:
-            parts.append(f"Phase={meta.get('phase')}")
-        if meta.get('date') is not None:
-            parts.append(f"Date={meta.get('date')}")
-    
-    title = "|".join(parts) if parts else path.name
-    ax.set_title(title)
-
-    if ax is not None and ax.figure is not None:
-        plt.show()
-
-
 def setup():
     port = find_arduino_port()
-    if not port:
-        raise RuntimeError("No Arduino detected")
+    arduino_available = bool(port)
     
     animal_id = "DEV"
     phase_id = "3"
 
     ser = None
     link = None
+    client = None
 
     try:
-        ser = serial.Serial(port, BAUDRATE, timeout=0.05)
-        time.sleep(2)
+        if arduino_available:
+            try:
+                ser = serial.Serial(port, BAUDRATE, timeout=0.05)
+                time.sleep(2)
 
-        if not ser.is_open:
-            raise RuntimeError(f"{port} port is not open after initialization")
-        
-        print(f"Connected to {port} port\n", flush=True)
+                if not ser.is_open:
+                    arduino_available = False
+                    print(f'[WARNING] {port} port is not open after initialization (continuing without Arduino)\n',
+                          flush=True)
+                else:
+                    print(f"Connected to {port} port\n", flush=True)
+            except Exception as serial_exc:
+                arduino_available = False
+                ser = None
+                print(f'[WARNING] Could not open Arduino port: {serial_exc}\n', flush=True)
+        else:
+            print('[WARNING] No Arduino detected', flush=True)
+
         try:
             print("Animal ID:  ", end="", flush=True)
 
@@ -1776,7 +1757,7 @@ def setup():
             validate_animal(animal_id, animal_map)
             workbook_id = get_workbook_id(animal_id, animal_map)
 
-        valid_phases = {"1", "2"} | set(PHASE_CONFIG.keys())
+        valid_phases = {"0", "1"} | set(PHASE_CONFIG.keys())
 
         while True:
             try:
@@ -1790,6 +1771,24 @@ def setup():
 
             print("Please enter a valid phase", flush=True)
 
+        if not arduino_available and phase_id != "0":
+            raise RuntimeError(f'No Arduino detected (required for phase {phase_id})')
+        
+        imaging_active = False
+        if int(phase_id) >= 2:
+            try:
+                imaging_raw = input('Imaging active? [y/N]:  ')
+            except KeyboardInterrupt:
+                print('\nTerminated by KeyboardInterrupt')
+                raise
+
+            imaging_active = is_affirmative(imaging_raw)
+        
+        client = PrairieClient() if imaging_active else None
+        if client is not None:
+            if not client.configure():
+                raise RuntimeError('Server unable to complete CONFIG process execution')
+        
         def _safe_float(var):
             v = _require_env(var).strip()
 
@@ -1799,14 +1798,17 @@ def setup():
             return float(v)
 
         link = ArduinoLink(ser)
-        link.start()
+        try:
+            link.start()
+        except Exception:
+            pass
 
         engage_ms = _safe_float("BRAKE_ENGAGE_MS")
         release_ms = _safe_float("BRAKE_RELEASE_MS")
         pulse_ms = _safe_float("SPOUT_PULSE_MS")
 
         cfg = PHASE_CONFIG.get(str(phase_id))
-        if cfg is None and str(phase_id) not in {"1", "2"}:
+        if cfg is None and str(phase_id) not in {"0", "1"}:
             raise ValueError(f'No PHASE_CONFIG entry for phase_id={phase_id}')
         
         threshold = float(cfg.get('threshold', 0.0)) if cfg else 0.0
@@ -1814,14 +1816,13 @@ def setup():
         reverse = bool(cfg.get('reverse', False)) if cfg else False
 
         try:
-            if link.active:
-                link.send_and_wait(f"engage {engage_ms:.4f}")
-                link.send_and_wait(f"release {release_ms:.4f}")
-                link.send_and_wait(f"pulse {pulse_ms:.4f}")
-                link.send_and_wait(f"threshold {threshold:.4f}")
-                link.send_and_wait(f"side {side}")
-                link.send_and_wait(f"reverse {'1' if reverse else '0'}")
-                link.send_and_wait(f"phase {phase_id}")
+            link.send_and_wait(f"engage {engage_ms:.4f}")
+            link.send_and_wait(f"release {release_ms:.4f}")
+            link.send_and_wait(f"pulse {pulse_ms:.4f}")
+            link.send_and_wait(f"threshold {threshold:.4f}")
+            link.send_and_wait(f"side {side}")
+            link.send_and_wait(f"reverse {'1' if reverse else '0'}")
+            link.send_and_wait(f"phase {phase_id}")
         except Exception as e:
             link.close()
             raise RuntimeError(f'Failed during initial Arduino handshake: {e}') from e
@@ -1837,22 +1838,24 @@ def setup():
             except Exception as e:
                 print(f'[ERROR] Unhandled exception during initial phase hand-off: {e}')
 
-            cursor = BCI(phase_id=phase_id,
-                         evt_queue=EVT_QUEUE,
-                         enc_queue=ENC_QUEUE,
-                         config=PHASE_CONFIG,
-                         display_idx=1,
-                         fullscreen=False,
-                         easy_threshold=15.0)
-            cursor.update_config(easy, side)
-            cursor.start()
+            if str(phase_id) not in {"0", "1", "2", "3"}:
+                cursor = BCI(phase_id=phase_id,
+                            evt_queue=EVT_QUEUE,
+                            enc_queue=ENC_QUEUE,
+                            config=PHASE_CONFIG,
+                            display_idx=1,
+                            fullscreen=False,
+                            easy_threshold=15.0)
+                cursor.update_config(easy, side)
+                cursor.start()
 
         session_data = SessionData(animal_id, str(phase_id), _get_date())
         session_data.meta['workbook_id'] = workbook_id
+        session_data.meta['imaging_active'] = bool(client is not None)
 
         log_trial_config(session_data, trial_n=1, type=easy, side=side)
 
-        return link, session_data, cursor
+        return link, session_data, cursor, client
     except Exception as e:
         cache_exc(e, 'setup')
 
@@ -1871,8 +1874,17 @@ def setup():
         raise
 
 
-def main(link, session_data, cursor):
-    do_calibration = str(session_data.meta["phase"]) not in {"1", "2"}
+def main(link, session_data, cursor, client=None):
+    do_calibration = str(session_data.meta["phase"]) not in {"0", "1"}
+    imaging_active = (bool(session_data.meta.get('imaging_active', False))
+                      and (client is not None))
+
+    if not link.active and str(session_data.meta['phase']) == "0":
+        session_data.meta['t_start'] = _ts_to_ms(_get_ts())
+        session_data.meta['t_stop'] = _ts_to_ms(_get_ts())
+        session_data.meta['duration_sec'] = 0
+
+        return
 
     K = 5
     N = 20
@@ -1894,7 +1906,7 @@ def main(link, session_data, cursor):
 
     try:
         while link.ser and link.ser.is_open:
-            if ABORT_EVT.is_set():
+            if cursor is not None and ABORT_EVT.is_set():
                 raise KeyboardInterrupt
 
             try:
@@ -1932,6 +1944,9 @@ def main(link, session_data, cursor):
 
                 if p == 'cue':
                     session_data.add_evt(ts, p)
+
+                    if imaging_active:
+                        client.start()
                     
                     trial_n += 1
                     last_outcome = None
@@ -1939,6 +1954,9 @@ def main(link, session_data, cursor):
                 
                 if p in {'hit', 'miss'}:
                     session_data.add_evt(ts, p)
+
+                    if imaging_active:
+                        client.stop()
 
                     if last_outcome == p:
                         continue
@@ -1978,15 +1996,16 @@ def main(link, session_data, cursor):
                                 cleanup(link, 'Terminated by early exit')
                                 break
                     
-                    if cursor is not None:
+                    if str(session_data.meta['phase']) not in {"0", "1"}:
                         next_trial_n = trial_n + 1
                         next_easy = get_easy(next_trial_n, K)
-                        next_side = PHASE_CONFIG[session_data.meta['phase']]['side']
+                        next_side = PHASE_CONFIG[str(session_data.meta['phase'])]['side']
 
-                        link.send_and_wait(f"{next_trial_n} {'1' if next_easy else '0'}")
+                        link.send_and_wait(f'{next_trial_n} {"1" if next_easy else "0"}')
                         log_trial_config(session_data, trial_n=next_trial_n, type=next_easy, side=next_side)
 
-                        cursor.update_config(next_easy, next_side)
+                        if cursor is not None:
+                            cursor.update_config(next_easy, next_side)
 
                 if p in {"hit", "lick"}:
                     session_data.add_raw_evt(ts, p)
@@ -2021,6 +2040,9 @@ def main(link, session_data, cursor):
         dt = 0 if (t0 is None or t1 is None) else max(0, (t1 - t0) // 1000)
         session_data.meta["duration_sec"] = int(dt)
 
+        if client is not None:
+            client.stop()
+
 
 if __name__ == "__main__":
     cmd_run('cls')
@@ -2028,6 +2050,7 @@ if __name__ == "__main__":
     link = None
     session_data = None
     cursor = None
+    prairie_host = None
 
     animal_id_for_log = "UNKNOWN"
     phase_id_for_log = "0"
@@ -2035,19 +2058,30 @@ if __name__ == "__main__":
     run_exc = None
 
     try:
-        link, session_data, cursor = setup()
+        link, session_data, cursor, prairie_host = setup()
 
         if session_data is not None:
             animal_id_for_log = session_data.meta.get("animal", "UNKNOWN")
             phase_id_for_log = session_data.meta.get("phase", "0")
 
-        main(link, session_data, cursor)
+        main(link, session_data, cursor, prairie_host)
     except BaseException as e:
         run_exc = e
         cache_exc(e, '__main__')
     finally:
         print_summary(session_data)
         run_info = (animal_id_for_log, phase_id_for_log)
+
+        if prairie_host is not None:
+            try:
+                prairie_host.finish()
+
+                if session_data is not None:
+                    session_data.img['start_ts'] = list(getattr(prairie_host, 'start_ts', []) or [])
+                    session_data.img['stop_ts'] = list(getattr(prairie_host, 'stop_ts', []) or [])
+            except Exception as e:
+                cache_exc(e, '__main__.prairie_finish')
+                log_and_commit(*run_info, e)
 
         if cursor is not None:
             try:
