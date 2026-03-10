@@ -37,9 +37,6 @@ from email.message import EmailMessage
 import subprocess
 import shutil
 import tempfile
-# from dataclasses import dataclass
-# from collections.abc import Hashable, Callable
-# from typing import Dict, Any
 
 
 # ---------------------------
@@ -63,10 +60,9 @@ EARLY_END_STRING = "E"
 SESSION_END_STRING = "S"
 
 PHASE_CONFIG = {
-    '2': {'threshold': 15.0, 'side': 'B', 'reverse': False},
-
-    '3': {'threshold': 15.0, 'side': 'B', 'reverse': False},
-    '4': {'threshold': 15.0, 'side': 'L', 'reverse': False}
+    '2': {'threshold': 15.0, 'side': 'B', 'reverse': False}, # free lick + wheel
+    '3': {'threshold': 15.0, 'side': 'B', 'reverse': False}, # free lick + wheel + reward tone
+    '4': {'threshold': 15.0, 'side': 'L', 'reverse': False} # normal wheel trial
     }
 
 MAX_STREAK = 4
@@ -452,8 +448,11 @@ def load_animal_map(path=ANIMAL_MAP_PATH):
 
 def validate_animal(animal_id, animal_map):
     animal_id = str(animal_id).strip()
+
     if not any(animal_id in _cohort_tokens(key) for key in animal_map.keys()):
-        raise ValueError('Animal not found in animal_map.json')
+        # raise ValueError('Animal not found in animal_map.json')
+        return False
+    return True
 
 
 def validate_resources():
@@ -1727,34 +1726,42 @@ def setup():
         else:
             print('[WARNING] No Arduino detected', flush=True)
 
-        try:
-            print("Animal ID:  ", end="", flush=True)
+        animal_map = load_animal_map()
 
-            animal_raw = sys.stdin.readline()
-            if animal_raw == "":
-                raise EOFError
-            
-            animal_raw = animal_raw.rstrip("\n").upper()
+        try:
+            while True:
+                print("\nAnimal ID:  ", end="", flush=True)
+
+                animal_raw = sys.stdin.readline()
+                if animal_raw == "":
+                    raise EOFError
+                
+                animal_raw = animal_raw.rstrip("\n").upper()
+
+                if not animal_raw:
+                    sys.stdout.write('\x1b[1A')
+                    sys.stdout.write('\x1b[2K')
+                    sys.stdout.write('Animal ID:  DEV\n')
+                    sys.stdout.flush()
+                    
+                    animal_id = "DEV"
+                else:
+                    if not validate_animal(animal_raw, animal_map):
+                        print(animal_id)
+                        print('Please enter a valid animal')
+                        continue
+                    
+                    animal_id = animal_raw
+                
+                break
         except KeyboardInterrupt:
             print('\nTerminated by KeyboardInterrupt')
             raise
-
-        if not animal_raw:
-            sys.stdout.write('\x1b[1A')
-            sys.stdout.write('\x1b[2K')
-            sys.stdout.write('Animal ID:  DEV\n')
-            sys.stdout.flush()
-            
-            animal_id = "DEV"
-        else:
-            animal_id = animal_raw
         
         workbook_id = None
 
         if animal_id != "DEV":
             validate_resources()
-            animal_map = load_animal_map()
-            validate_animal(animal_id, animal_map)
             workbook_id = get_workbook_id(animal_id, animal_map)
 
         valid_phases = {"0", "1"} | set(PHASE_CONFIG.keys())
@@ -1765,11 +1772,11 @@ def setup():
             except KeyboardInterrupt:
                 print('\nTerminated by KeyboardInterrupt')
                 raise
-            
+    
             if phase_id in valid_phases:
                 break
 
-            print("Please enter a valid phase", flush=True)
+            print("Please enter a valid phase\n", flush=True)
 
         if not arduino_available and phase_id != "0":
             raise RuntimeError(f'No Arduino detected (required for phase {phase_id})')
@@ -1777,14 +1784,21 @@ def setup():
         imaging_active = False
         if int(phase_id) >= 2:
             try:
-                imaging_raw = input('Imaging active? [y/N]:  ')
+                imaging_raw = input('\nImaging active? [y/N]:  ')
             except KeyboardInterrupt:
                 print('\nTerminated by KeyboardInterrupt')
                 raise
 
             imaging_active = is_affirmative(imaging_raw)
         
-        client = PrairieClient() if imaging_active else None
+        try:
+            client = PrairieClient() if imaging_active else None
+        except ConnectionRefusedError:
+            print('\n[WARNING] Could not connect to server (either ethernet is disconnected or TCPServer.exe is not running)')
+
+            client = None
+            exit(0)
+
         if client is not None:
             if not client.configure():
                 raise RuntimeError('Server unable to complete CONFIG process execution')
@@ -1874,7 +1888,7 @@ def setup():
         raise
 
 
-def main(link, session_data, cursor, client=None):
+def main(link, session_data, cursor, client=None, verbose=False):
     do_calibration = str(session_data.meta["phase"]) not in {"0", "1"}
     imaging_active = (bool(session_data.meta.get('imaging_active', False))
                       and (client is not None))
@@ -1898,8 +1912,11 @@ def main(link, session_data, cursor, client=None):
     trial_dt = 0.0
     recent_outcomes = deque()
 
-    def _get_msg(timeout=0.05):
+    def _get_msg(timeout=0.05, verbose=verbose):
         typ, ts, payload = link.msg_q.get(timeout=timeout)
+        if verbose:
+            print(f'[{ts} | {typ}] {payload}')
+
         return typ, ts, payload
 
     started = False
@@ -2025,7 +2042,7 @@ def main(link, session_data, cursor, client=None):
                     pass
     except KeyboardInterrupt:
         session_data.meta["aborted"] = True
-        cleanup(link, "Terminated by KeyboardInterrupt")
+        cleanup(link, "\nTerminated by KeyboardInterrupt")
         raise
     except Exception as e:
         cache_exc(e, 'main')
@@ -2064,7 +2081,11 @@ if __name__ == "__main__":
             animal_id_for_log = session_data.meta.get("animal", "UNKNOWN")
             phase_id_for_log = session_data.meta.get("phase", "0")
 
-        main(link, session_data, cursor, prairie_host)
+        main(link, session_data, cursor, prairie_host, verbose=False)
+    except SystemExit as e:
+        pass
+    except KeyboardInterrupt as e:
+        pass
     except BaseException as e:
         run_exc = e
         cache_exc(e, '__main__')
