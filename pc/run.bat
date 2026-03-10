@@ -106,6 +106,7 @@ if /i "%DO_UPDATE%"=="Y" (
 
     echo Downloading latest file versions...
     call :pullFile "https://github.com/GonzalesLabVU/Behavior-BCI/blob/main/pc/behavioral_master.py" || call :kill "pullFile subroutine failed for behavioral_master.py"
+    call :pullFile "https://github.com/GonzalesLabVU/Behavior-BCI/blob/main/pc/TCPClient.py" || call :kill "pullFile failed for TCPClient.py"
     call :pullFile "https://github.com/GonzalesLabVU/Behavior-BCI/blob/main/pc/cursor_utils.py" || call :kill "pullFile failed for cursor_utils.py"
     call :pullFile "https://github.com/GonzalesLabVU/Behavior-BCI/blob/main/pc/plot_utils.py" || call :kill "pullFile failed for plot_utils.py"
     call :pullFile "https://github.com/GonzalesLabVU/Behavior-BCI/blob/main/pc/config/animal_map.json" || call :kill "pullFile failed for animal_map.json"
