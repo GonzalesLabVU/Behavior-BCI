@@ -537,7 +537,7 @@ class PrairieServer:
                 finally:
                     with self._lock:
                         self.state = "IDLE"
-                print('[SERVER] CONFIG')
+                print('\n[SERVER] CONFIG')
                 return None
 
             case "START":
@@ -632,7 +632,7 @@ class PrairieServer:
                     pass
 
 
-def main(verbose=True):
+def main(verbose=False):
     root   = tk.Tk()
     root.withdraw()
     server = None
@@ -693,4 +693,4 @@ if __name__ == "__main__":
     if WINDOWS:
         os.system('cls')
 
-    main(verbose=True)
+    main(verbose=False)

@@ -36,7 +36,7 @@ def _dump(tag, b, verbose=False):
 
 
 class PrairieClient:
-    def __init__(self, verbose=True):
+    def __init__(self, verbose=False):
         self.verbose = verbose
         
         self.start_ts = []
