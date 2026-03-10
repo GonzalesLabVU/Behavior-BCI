@@ -145,7 +145,7 @@ static void applyPhaseDefaults(int phase_id) {
         trial_T = SECONDS(30);
         delay_T = SECONDS(3);
     } else if (phase_id == 3) {
-        session_T = MINUTES(20);
+        session_T = MINUTES(1); //
         trial_T = SECONDS(30);
         delay_T = SECONDS(3);
     } else {
@@ -1024,6 +1024,7 @@ void run_phase_3() {
             // entry
             if (!phase_timer.started()) {
                 logger.write("miss");
+                speaker.miss();
 
                 phase_timer.init(tone_T);
                 phase_timer.start();
