@@ -145,7 +145,7 @@ static void applyPhaseDefaults(int phase_id) {
         trial_T = SECONDS(30);
         delay_T = SECONDS(3);
     } else if (phase_id == 3) {
-        session_T = MINUTES(1); //
+        session_T = MINUTES(20);
         trial_T = SECONDS(30);
         delay_T = SECONDS(3);
     } else {
@@ -477,6 +477,7 @@ void setup() {
 
 void loop() {
     drainSerial();
+    logger.ack();
 
     switch (session_state) {
         case SessionState::MAIN: {
