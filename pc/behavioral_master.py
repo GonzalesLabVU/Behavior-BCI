@@ -16,7 +16,6 @@ from datetime import datetime
 from pathlib import Path
 from queue import Queue, Empty
 from collections import deque
-import threading
 from threading import Thread, Event
 
 import serial
@@ -283,7 +282,7 @@ def log_error(animal_id, phase_id, exc):
             body.append(f'  {type(exc).__name__}: {exc!r}')
         
         with open(ERROR_LOG_PATH, 'a', encoding='utf-8') as f:
-            for line in header + hline + body:
+            for line in hline + header + hline + body:
                 f.write(line + '\n')
             
             f.write('\n')
@@ -572,7 +571,7 @@ class ArduinoLink:
     def send_and_wait(self, text, timeout=5.0):
         if not self.active:
             return
-        
+
         self.ack_evt.clear()
         self.ser.write((text.strip() + "\n").encode("utf-8"))
         self.ser.flush()
@@ -1784,7 +1783,7 @@ def setup():
         imaging_active = False
         if int(phase_id) >= 2:
             try:
-                imaging_raw = input('\nImaging active? [y/N]:  ')
+                imaging_raw = input('Imaging active? [y/N]:  ')
             except KeyboardInterrupt:
                 print('\nTerminated by KeyboardInterrupt')
                 raise
@@ -2018,6 +2017,8 @@ def main(link, session_data, cursor, client=None, verbose=False):
                         next_easy = get_easy(next_trial_n, K)
                         next_side = PHASE_CONFIG[str(session_data.meta['phase'])]['side']
 
+
+                        time.sleep(0.05)
                         link.send_and_wait(f'{next_trial_n} {"1" if next_easy else "0"}')
                         log_trial_config(session_data, trial_n=next_trial_n, type=next_easy, side=next_side)
 
