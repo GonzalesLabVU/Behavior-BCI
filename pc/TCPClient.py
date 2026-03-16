@@ -10,7 +10,6 @@ import types
 import queue
 
 CLIENT_IP = "192.168.2.1"
-CLIENT_PORT = 5006
 SERVER_IP = "192.168.2.2"
 SERVER_PORT = 5005
 
@@ -57,7 +56,7 @@ class PrairieClient:
         self._sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._sock.settimeout(RECV_TIMEOUT)
-        self._sock.bind((CLIENT_IP, CLIENT_PORT))
+        self._sock.bind((CLIENT_IP, 0))
         self._sock.connect((SERVER_IP, SERVER_PORT))
 
         self._rfile = self._sock.makefile('rb')
