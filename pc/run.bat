@@ -11,9 +11,11 @@ cd /d "%SCRIPT_DIR%"
 
 call :sleep
 
+echo.
 set "DO_UPDATE=N"
 set /p "DO_UPDATE=Update local files? [y/N]: "
 if "%DO_UPDATE%"=="" set "DO_UPDATE=N"
+echo.
 
 if /i "%DO_UPDATE%"=="Y" (
     set "CONFIRM=N"
@@ -130,10 +132,11 @@ echo Searching for Arduino...
 set "ARDUINO_CLI=arduino-cli"
 set "FQBN=arduino:avr:mega"
 call :detectPort || echo [WARNING] No Arduino detected
+call :uploadSketch "behavioral_controller" || call :kill "Arduino compile/upload failed"
 
-if /i "%DO_UPDATE%"=="Y" (
-    call :uploadSketch "behavioral_controller" || call :kill "Arduino upload failed"
-)
+rem if /i "%DO_UPDATE%"=="Y" (
+rem     call :uploadSketch "behavioral_controller" || call :kill "Arduino upload failed"
+rem )
 
 call :sleep
 
@@ -369,7 +372,7 @@ rem -----------------------------------
     )
 
     echo Uploading sketch...
-    "%ARDUINO_CLI%" upload -p "%PORT%" --fqbn "%FQBN%" "%ABS_SKETCH_DIR%" >nul 2>&1
+    "%ARDUINO_CLI%" upload --port "%PORT%" --fqbn "%FQBN%" "%ABS_SKETCH_DIR%" >nul 2>&1
     if errorlevel 1 (
         echo [ERROR] Sketch upload failed
         endlocal & exit /b 1
