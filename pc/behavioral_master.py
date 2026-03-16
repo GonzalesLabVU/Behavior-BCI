@@ -1669,7 +1669,7 @@ def is_early_exit(evt, index, end_ms, min_duration=20*60, min_trials=150):
     return sum(1 for r in rates if r < 4.0) > 7
 
 
-def cleanup(link, msg, timeout=2.0):
+def cleanup(link, msg, timeout=30.0):
     try:
         try:
             link.send(EARLY_END_STRING)
@@ -1851,7 +1851,7 @@ def setup():
             except Exception as e:
                 print(f'[ERROR] Unhandled exception during initial phase hand-off: {e}')
 
-            if str(phase_id) not in {"0", "1", "2", "3"}:
+            if int(phase_id) >= 4:
                 cursor = BCI(phase_id=phase_id,
                             evt_queue=EVT_QUEUE,
                             enc_queue=ENC_QUEUE,
@@ -1888,7 +1888,7 @@ def setup():
 
 
 def main(link, session_data, cursor, client=None, verbose=False):
-    do_calibration = str(session_data.meta["phase"]) not in {"0", "1"}
+    do_calibration = int(session_data.meta['phase']) >= 4
     imaging_active = (bool(session_data.meta.get('imaging_active', False))
                       and (client is not None))
 
@@ -1991,7 +1991,10 @@ def main(link, session_data, cursor, client=None, verbose=False):
 
                     show_trial_info(trial_dt, n_hit, n_miss, p)
 
-                    early_exit = is_early_exit(session_data.evt, trial_n, end_ms)
+                    if int(session_data.meta['phase']) >= 4:
+                        early_exit = is_early_exit(session_data.evt, trial_n, end_ms)
+                    else:
+                        early_exit = False
 
                     if do_calibration:
                         trial_stack.insert(0, p)
@@ -2012,11 +2015,10 @@ def main(link, session_data, cursor, client=None, verbose=False):
                                 cleanup(link, 'Terminated by early exit')
                                 break
                     
-                    if str(session_data.meta['phase']) not in {"0", "1"}:
+                    if int(session_data.meta['phase']) >= 4:
                         next_trial_n = trial_n + 1
                         next_easy = get_easy(next_trial_n, K)
                         next_side = PHASE_CONFIG[str(session_data.meta['phase'])]['side']
-
 
                         time.sleep(0.05)
                         link.send_and_wait(f'{next_trial_n} {"1" if next_easy else "0"}')
