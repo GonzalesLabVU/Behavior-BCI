@@ -65,7 +65,8 @@ RESTART_STRING = "R"
 PHASE_CONFIG = {
     '2': {'threshold': 15.0, 'side': 'B', 'reverse': False}, # free lick + wheel
     '3': {'threshold': 15.0, 'side': 'B', 'reverse': False}, # free lick + wheel + reward tone
-    '4': {'threshold': 15.0, 'side': 'L', 'reverse': False} # normal wheel trial
+    '4': {'threshold': 15.0, 'side': 'L', 'reverse': False}, # easy wheel trial
+    '5': {'threshold': 30.0, 'side': 'L', 'reverse': False}
     }
 
 MAX_STREAK = 4
@@ -163,7 +164,7 @@ def show_trial_info(dt, n_hit, n_miss, outcome):
     n_total = n_hit + n_miss
     trial_str = n_total
 
-    elapsed_str = f'{(dt - 1.0):.2f} s'
+    elapsed_str = f'{(dt - 1.5):.2f} s'
     
     col_w = [len(label) + (2 * pad) for label, pad in zip(INFO_CFG['labels'], INFO_CFG['label_pads'])]
 
@@ -1637,8 +1638,8 @@ def send_email(session_data):
 # ---------------------------
 # EXIT
 # ---------------------------
-@pad_verbose_output
-def is_early_exit(evt, index, end_ms, min_duration=1*60, min_trials=1):
+# @pad_verbose_output
+def is_early_exit(evt, index, end_ms, min_duration=20*60, min_trials=150):
     width = 5
 
     if VERBOSE:
@@ -1728,13 +1729,10 @@ def is_early_exit(evt, index, end_ms, min_duration=1*60, min_trials=1):
         prev_xy = curr_xy
     
     if VERBOSE:
-        print(f'is_early_exit  |  {"len(rates)":<{width}} = {len(rates)}')
-        
         rates_str = "[" + ", ".join(f'{r:.1f}' for r in rates) + "]"
         print(f'is_early_exit  |  {"rates":<{width}} = {rates_str}')
     
-    # return sum(1 for r in rates if r < 4.0) >= 5
-    return sum(1 for r in rates if r < 10.0) >= 5
+    return sum(1 for r in rates if r < 4.0) >= 5
 
 
 def cleanup(link, msg, timeout=30.0):
@@ -1775,6 +1773,7 @@ def setup():
     client = None
 
     try:
+        # try to find Arduino
         if arduino_available:
             try:
                 ser = serial.Serial(port, BAUDRATE, timeout=0.05)
@@ -1793,6 +1792,7 @@ def setup():
         else:
             print('\n[WARNING] No Arduino detected (continuing without Arduino)', flush=True)
 
+        # ask for animal ID
         animal_map = load_animal_map()
 
         try:
@@ -1834,6 +1834,7 @@ def setup():
             global VERBOSE
             VERBOSE = True
 
+        # ask for phase ID
         valid_phases = {"0", "1"} | set(PHASE_CONFIG.keys())
 
         while True:
@@ -1848,32 +1849,9 @@ def setup():
 
             print("Please enter a valid phase\n", flush=True)
 
+        # establish Arduino connection
         if not arduino_available and phase_id != "0":
             raise RuntimeError(f'No Arduino detected (required for phase {phase_id})')
-        
-        imaging_active = False
-        if int(phase_id) >= 2:
-            try:
-                imaging_raw = input('\nImaging active? [y/N]:  ')
-            except KeyboardInterrupt:
-                print('\nTerminated by KeyboardInterrupt')
-                raise
-
-            imaging_active = is_affirmative(imaging_raw)
-        
-        print('\nInitializing resources...')
-        
-        try:
-            client = PrairieClient() if imaging_active else None
-        except ConnectionRefusedError:
-            print('\n[WARNING] Could not connect to server (ethernet cable is disconnected or TCPServer.exe is not running)')
-
-            client = None
-            exit(0)
-
-        if client is not None:
-            if not client.configure():
-                raise RuntimeError('Server unable to complete CONFIG process execution')
         
         def _safe_float(var):
             v = _require_env(var).strip()
@@ -1913,8 +1891,9 @@ def setup():
             link.close()
             raise RuntimeError(f'[ERROR] Failed during initial Arduino handshake: {e}') from e
         
+        # ask for spout flush (restart if True)
         try:
-            flush_spout = input('\nOpen spout for 10 seconds? [y/N]:  ')
+            flush_spout = input('\nFlush spout for 10 seconds? (WARNING: This requires a restart) [y/N]:  ')
         except KeyboardInterrupt:
             print('\nTerminated by KeyboardInterrupt')
             raise
@@ -1959,6 +1938,32 @@ def setup():
                         raise payload
                     raise RuntimeError(f'ArduinoLink reader error during flush: {payload!r}')
 
+        # TCP connection
+        imaging_active = False
+        if int(phase_id) >= 2:
+            try:
+                imaging_raw = input('\nImaging active? [y/N]:  ')
+            except KeyboardInterrupt:
+                print('\nTerminated by KeyboardInterrupt')
+                raise
+
+            imaging_active = is_affirmative(imaging_raw)
+        
+        print('\nInitializing resources...')
+        
+        try:
+            client = PrairieClient() if imaging_active else None
+        except ConnectionRefusedError:
+            print('\n[WARNING] Could not connect to server (ethernet cable is disconnected or TCPServer.exe is not running)')
+
+            client = None
+            exit(0)
+
+        if client is not None:
+            if not client.configure():
+                raise RuntimeError('Server unable to complete CONFIG process execution')
+
+        # BCI setup
         easy = False
         cursor = None
 
@@ -1966,6 +1971,8 @@ def setup():
             easy = get_easy(phase=int(phase_id), trial_n=1, K=5)
             
             try:
+                print('Running session...\n', flush=True)
+                link.send_and_wait("start 1")
                 link.send_and_wait(f"1 {'1' if easy else '0'}")
             except Exception as e:
                 raise RuntimeError(f'[ERROR] Unhandled exception during initial phase hand-off: {e}') from e
@@ -1981,13 +1988,13 @@ def setup():
                 cursor.update_config(easy, side)
                 cursor.start()
 
+        # session data
         session_data = SessionData(animal_id, str(phase_id), _get_date())
         session_data.meta['workbook_id'] = workbook_id
         session_data.meta['imaging_active'] = bool(client is not None)
 
         log_trial_config(session_data, trial_n=1, type=easy, side=side)
 
-        print('Running session...\n', flush=True)
         return link, session_data, cursor, client
     except Exception as e:
         cache_exc(e, 'setup')
@@ -2008,7 +2015,7 @@ def setup():
 
 
 def main(link, session_data, cursor, client=None):
-    do_calibration = int(session_data.meta['phase']) >= 4
+    do_calibration = int(session_data.meta['phase']) > 4
     imaging_active = (bool(session_data.meta.get('imaging_active', False))
                       and (client is not None))
 
