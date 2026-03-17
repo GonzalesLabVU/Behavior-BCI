@@ -477,7 +477,6 @@ void setup() {
 
 void loop() {
     drainSerial();
-    logger.ack();
 
     switch (session_state) {
         case SessionState::MAIN: {
