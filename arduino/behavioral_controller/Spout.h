@@ -17,7 +17,6 @@ class Spout {
     private:
         static constexpr uint8_t PULSE_PIN = 5;
         static constexpr uint8_t FORCE_PIN = 4;
-        static constexpr unsigned long INIT_DUR = 5000;
 
         unsigned long pulse_dur_us_ = 0;
         unsigned long last_pulse_ms_ = 0;

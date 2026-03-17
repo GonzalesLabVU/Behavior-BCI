@@ -14,17 +14,6 @@ void Spout::init(unsigned long pulse_dur_us) {
     last_pulse_ms_ = 0;
     forced_ = false;
     prev_forced_ = (digitalRead(FORCE_PIN) == HIGH);
-    
-    unsigned long t_start = millis();
-    while ((millis() - t_start) < INIT_DUR) {
-        if (digitalRead(FORCE_PIN) == HIGH) {
-            pulse();
-            delay(200);
-
-            t_start = millis();
-            last_pulse_ms_ = t_start;
-        }
-    }
 }
 
 void Spout::poll() {
