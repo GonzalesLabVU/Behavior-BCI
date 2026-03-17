@@ -150,12 +150,9 @@ static void applyPhaseDefaults(int phase_id) {
         trial_T = SECONDS(30);
         delay_T = SECONDS(3);
     } else {
-        // session_T = MINUTES(30);
-        // trial_T = SECONDS(30);
-        // delay_T = SECONDS(3);
-        session_T = MINUTES(5);
-        trial_T = SECONDS(3);
-        delay_T = SECONDS(1);
+        session_T = MINUTES(30);
+        trial_T = SECONDS(30);
+        delay_T = SECONDS(3);
     }
 }
 
@@ -238,6 +235,9 @@ static bool parseKeyValue(char* line) {
         session_cfg.flush = (v == 1);
         return true;
     }
+    if (strcmp(key, "start") == 0) {
+        return true;
+    }
 
     return false;
 }
@@ -252,6 +252,7 @@ static void waitForHandshake() {
     bool have_trial = false;
     bool have_phase = false;
     bool have_flush = false;
+    bool have_start = false;
 
     session_cfg.phase = 0;
 
@@ -295,6 +296,7 @@ static void waitForHandshake() {
                 if (strncmp(line, "reverse", 7) == 0) have_reverse = true;
                 if (strncmp(line, "phase", 5) == 0) have_phase = true;
                 if (strncmp(line, "flush", 5) == 0) have_flush = true;
+                if (strncmp(line, "start", 5) == 0) have_start = true;
 
                 logger.ack();
             }
@@ -305,7 +307,7 @@ static void waitForHandshake() {
 
         if (have_engage && have_release && have_pulse &&
             have_threshold && have_side && have_reverse && have_phase &&
-            have_flush && (!trial_required || have_trial)) {
+            have_flush && have_start && (!trial_required || have_trial)) {
 
             applyPhaseDefaults(session_cfg.phase);
 
@@ -471,7 +473,8 @@ void setup() {
     brake.init(engage_us, release_us);
     brake.engage();
 
-    speaker.init();
+    String side = (session_cfg.side == 'R') ? "R" : "L";
+    speaker.init(side);
 
     spout.init(pulse_us);
 

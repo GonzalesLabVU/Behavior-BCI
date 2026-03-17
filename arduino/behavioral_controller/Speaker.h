@@ -7,7 +7,7 @@ class Speaker {
     public:
         Speaker();
 
-        void init();
+        void init(const String& side);
         void cue();
         void hit();
         void miss();
@@ -15,15 +15,18 @@ class Speaker {
     
     private:
         static constexpr uint8_t SPEAKER_PIN = 33;
-        static constexpr unsigned int CUE_FREQ_HZ = 1000;
-        static constexpr unsigned int HIT_FREQ_HZ = 4000;
-        static constexpr unsigned int MISS_FREQ_HZ_MIN = 1000;
-        static constexpr unsigned int MISS_FREQ_HZ_MAX = 4000;
+        static constexpr unsigned int LEFT_CUE_HZ = 2500;
+        static constexpr unsigned int RIGHT_CUE_HZ = 6400;
+        static constexpr unsigned int HIT_HZ = 4000;
+        static constexpr unsigned int MISS_HZ_MIN = 1000;
+        static constexpr unsigned int MISS_HZ_MAX = 4000;
         static constexpr unsigned long MISS_STEP_US_MIN = 100;
         static constexpr unsigned long MISS_STEP_US_MAX = 200;
         static constexpr unsigned long TONE_MS = 1000;
 
         enum Mode : uint8_t { IDLE, CUE, HIT, MISS };
+
+        String side_;
 
         static Speaker* instance_;
 

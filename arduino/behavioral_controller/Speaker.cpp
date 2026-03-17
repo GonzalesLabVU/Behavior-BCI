@@ -6,6 +6,7 @@ void TIMER2_COMPA_vect_func();
 
 Speaker::Speaker():
     mode_(IDLE),
+    side_("L"),
     pin_state_(false),
     ocr_val_(124),
     half_us_(500),
@@ -15,11 +16,17 @@ Speaker::Speaker():
     since_step_us_(0)
 {}
 
-void Speaker::init() {
+void Speaker::init(const String& side) {
     pinMode(SPEAKER_PIN, OUTPUT);
 
     drivePin_(false);
     stopTimer2_();
+
+    if (side == "R") {
+        side_ = "R";
+    } else {
+        side_ = "L";
+    }
 
     mode_ = IDLE;
     instance_ = this;
@@ -33,7 +40,8 @@ void Speaker::cue() {
 
     if (!can_start) return;
 
-    startTone_(CUE, CUE_FREQ_HZ, TONE_MS);
+    unsigned int freq_hz = (side_ == "R") ? RIGHT_CUE_HZ : LEFT_CUE_HZ;
+    startTone_(CUE, freq_hz, TONE_MS);
 }
 
 void Speaker::hit() {
@@ -54,7 +62,7 @@ void Speaker::hit() {
 
     interrupts();
 
-    startTone_(HIT, HIT_FREQ_HZ, TONE_MS);
+    startTone_(HIT, HIT_HZ, TONE_MS);
 }
 
 void Speaker::miss() {
@@ -111,7 +119,7 @@ void Speaker::startMiss_(unsigned long duration_ms) {
     mode_ = MISS;
 
     uint32_t r = xorshift32_(rng_);
-    unsigned f0 = MISS_FREQ_HZ_MIN + (r % (MISS_FREQ_HZ_MAX - MISS_FREQ_HZ_MIN + 1));
+    unsigned f0 = MISS_HZ_MIN + (r % (MISS_HZ_MAX - MISS_HZ_MIN + 1));
 
     updateForFreq_(f0);
 
@@ -175,7 +183,7 @@ void Speaker::onTick_() {
     since_step_us_ += half_us_;
 
     if (mode_ == MISS && since_step_us_ >= step_us_) {
-        unsigned f = MISS_FREQ_HZ_MIN + (xorshift32_(rng_) % (MISS_FREQ_HZ_MAX - MISS_FREQ_HZ_MIN + 1));
+        unsigned f = MISS_HZ_MIN + (xorshift32_(rng_) % (MISS_HZ_MAX - MISS_HZ_MIN + 1));
         updateForFreq_(f);
 
         OCR2A = ocr_val_;
