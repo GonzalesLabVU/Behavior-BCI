@@ -14,6 +14,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <ctype.h>
+#include <avr/wdt.h>
 
 // ---------------------------
 // CONVERSION HANDLES
@@ -228,18 +229,71 @@ static bool parseKeyValue(char* line) {
         session_cfg.phase = (int)v;
         return true;
     }
-    if (strcmp(key, "flush") == 0) {
-        long v = strtol(val, nullptr, 10);
-        if (!(v == 0 || v == 1)) return false;
-
-        session_cfg.flush = (v == 1);
-        return true;
-    }
-    if (strcmp(key, "start") == 0) {
-        return true;
-    }
 
     return false;
+}
+
+static bool parseFlushLine(char* line) {
+    char* key = strtok(line, " \t");
+    char* val = strtok(nullptr, " \t");
+    char* extra = strtok(nullptr, " \t");
+
+    if (!key || !val || extra) return false;
+    if (strcmp(key, "flush") != 0) return false;
+
+    char* end = nullptr;
+    long v = strtol(val, &end, 10);
+
+    if (!end || *end != '\0') return false;
+    if (!(v == 0 || v == 1)) return false;
+
+    session_cfg.flush = (v == 1);
+    return true;
+}
+
+void parseFlushCommand() {
+    char line[96];
+
+    for (;;) {
+        if (readLine(line, sizeof(line)) && parseFlushLine(line)) {
+            logger.ack();
+            return;
+        }
+
+        delay(10);
+    }
+}
+
+static bool parseStartLine(char* line) {
+    char* key = strtok(line, " \t");
+    char* val = strtok(nullptr, " \t");
+    char* extra = strtok(nullptr, " \t");
+
+    if (!key || !val || extra) return false;
+    if (strcmp(key, "start") != 0) return false;
+
+    char* end = nullptr;
+    long v = strtol(val, &end, 10);
+
+    if (!end || *end != '\0') return false;
+    if (!(v == 0 || v == 1)) return false;
+
+    return true;
+}
+
+void parseStartCommand() {
+    char line[96];
+
+    for (;;) {
+        if (readLine(line, sizeof(line)) && parseStartLine(line)) {
+            logger.ack();
+            return;
+        }
+
+        delay(10);
+    }
+
+    logger.ack();
 }
 
 static void waitForHandshake() {
@@ -251,8 +305,6 @@ static void waitForHandshake() {
     bool have_reverse = false;
     bool have_trial = false;
     bool have_phase = false;
-    bool have_flush = false;
-    bool have_start = false;
 
     session_cfg.phase = 0;
 
@@ -295,8 +347,6 @@ static void waitForHandshake() {
                 if (strncmp(line, "side", 4) == 0) have_side = true;
                 if (strncmp(line, "reverse", 7) == 0) have_reverse = true;
                 if (strncmp(line, "phase", 5) == 0) have_phase = true;
-                if (strncmp(line, "flush", 5) == 0) have_flush = true;
-                if (strncmp(line, "start", 5) == 0) have_start = true;
 
                 logger.ack();
             }
@@ -307,7 +357,7 @@ static void waitForHandshake() {
 
         if (have_engage && have_release && have_pulse &&
             have_threshold && have_side && have_reverse && have_phase &&
-            have_flush && have_start && (!trial_required || have_trial)) {
+            (!trial_required || have_trial)) {
 
             applyPhaseDefaults(session_cfg.phase);
 
@@ -454,13 +504,28 @@ void run_phase_3();
 void run_phase_4_plus();
 
 void setup() {
+    MCUSR = 0;
+    wdt_disable();
+
     pinMode(POWER_EN, OUTPUT);
     digitalWrite(POWER_EN, LOW);
 
     Serial.begin(BAUDRATE);
     randomSeed(analogRead(SEED_PIN));
 
-    while (!Serial) {}
+    parseFlushCommand();
+
+    if (session_cfg.flush) {
+        spout.init(1);
+        spout.flush(10000);
+
+        logger.write("R");
+        Serial.flush();
+
+        wdt_enable(WDTO_15MS);
+        while (1) {}
+    }
+
     waitForHandshake();
 
     unsigned long engage_us = (unsigned long)(session_cfg.engage_ms * 1000.0f);
@@ -468,7 +533,7 @@ void setup() {
     unsigned long pulse_us = (unsigned long)(session_cfg.pulse_ms * 1000.0f);
 
     digitalWrite(POWER_EN, HIGH);
-    delay(200);
+    delay(100);
 
     brake.init(engage_us, release_us);
     brake.engage();
@@ -478,16 +543,9 @@ void setup() {
 
     spout.init(pulse_us);
 
-    if (session_cfg.flush) {
-        spout.flush(10000);
-        logger.write("R");
-
-        for (;;) { delay(1000); }
-    } else {
-        for (int i = 0; i < 5; i++) {
-            spout.pulse();
-            delay(200);
-        }
+    for (int i = 0; i < 5; i++) {
+        spout.pulse();
+        delay(500);
     }
 
     lick.init(RAW_FLAG);
@@ -495,7 +553,7 @@ void setup() {
 
     wheel.init(easy_threshold, session_cfg.threshold, trial_cfg.side, session_cfg.reverse);
 
-    delay(2500);
+    parseStartCommand();
 
     raw_timer.init(sample_T);
     raw_timer.start();
