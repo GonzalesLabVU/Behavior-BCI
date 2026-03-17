@@ -212,7 +212,8 @@ class PrairieClient:
         self.stop_ts = [str(v) for v in stop_ts]
 
         self._finished = True
-
+    
+    def disconnect(self):
         self._net_stop.set()
         self._q.put(None)
 
@@ -261,3 +262,5 @@ if __name__ == "__main__":
     finally:
         client.finish()
         print('[CLIENT] FINISH')
+
+        client.disconnect()

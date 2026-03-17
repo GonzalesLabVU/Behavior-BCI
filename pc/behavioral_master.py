@@ -1737,12 +1737,12 @@ def is_early_exit(evt, index, end_ms, min_duration=20*60, min_trials=150):
     return sum(1 for r in rates if r < 4.0) >= 5
 
 
-def cleanup(link, msg, timeout=30.0):
+def cleanup(link, client, msg, timeout=30.0):
     try:
         try:
             link.send(EARLY_STRING)
-        except Exception:
-            pass
+        except Exception as e:
+            cache_exc(e, 'cleanup.link')
 
         deadline = time.time() + timeout
         while time.time() < deadline:
@@ -1755,9 +1755,26 @@ def cleanup(link, msg, timeout=30.0):
             except Empty:
                 pass
         
+        if client is not None:
+            try:
+                client.stop()
+            except Exception as e:
+                cache_exc(e, 'cleanup.client_stop')
+            
+            try:
+                client.finish()
+            except Exception as e:
+                cache_exc(e, 'cleanup.client_finish')
+        
         print(f'{msg}', flush=True)
     finally:
         link.close()
+
+        if client is not None:
+            try:
+                client.disconnect()
+            except Exception as e:
+                cache_exc(e, 'cleanup.client_disconnect')
 
 
 # ---------------------------
@@ -2437,7 +2454,7 @@ def main(link, session_data, cursor, client=None):
                                 print(f'is_early_exit --> {early_exit}\n', flush=True)
 
                             if early_exit:
-                                cleanup(link, 'Terminated by early exit')
+                                cleanup(link, client, 'Terminated by early exit')
                                 break
 
                         next_trial_n = trial_n + 1
@@ -2469,7 +2486,7 @@ def main(link, session_data, cursor, client=None):
                     pass
     except KeyboardInterrupt:
         session_data.meta["aborted"] = True
-        cleanup(link, "\nTerminated by KeyboardInterrupt")
+        cleanup(link, client, "\nTerminated by KeyboardInterrupt")
         raise
     except Exception as e:
         cache_exc(e, 'main')
