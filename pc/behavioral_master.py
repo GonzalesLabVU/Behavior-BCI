@@ -746,7 +746,9 @@ class SessionData:
 
     @property
     def is_finished(self):
-        return (self.meta['t_start'] is not None) and (self.meta['t_stop'] is not None)
+        return (self.meta['t_start'] is not None and
+                self.meta['t_stop'] is not None and
+                not self.meta['aborted'])
 
 
 def get_easy(phase, trial_n, K):
@@ -2570,7 +2572,7 @@ if __name__ == "__main__":
                     cache_exc(e, '__main__.send_email')
                     log_and_commit(*run_info, e)
         
-        if session_data is not None and session_data.any_data():
+        if session_data is not None and session_data.any_data() and not session_data.meta['aborted']:
             if session_data.meta.get('animal', None) not in {None, "DEV"}:
                 try:
                     save_choice = input("\nSave current session? [Y/n]:  ").strip().lower()
