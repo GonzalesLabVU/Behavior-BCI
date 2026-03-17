@@ -4,7 +4,7 @@ Logger::Logger() {}
 
 void Logger::write(const String& data) {
     if (data.length() > 0) {
-        if (data == "S") {
+        if ((data == "S") || (data == "R")) {
             Serial.println(data);
         } else {
             Serial.println("[EVT] " + data);
