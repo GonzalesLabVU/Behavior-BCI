@@ -100,7 +100,7 @@ void Lick::config_(bool read_raw) {
     writeReg_(ELECTRODE_CONFIG, 0x09);
 
     // warm-up period to let baseline settle
-    delay(2500);
+    delay(200);
 }
 
 static void isort16(uint16_t* a, uint16_t len) {
