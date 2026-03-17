@@ -516,11 +516,17 @@ void setup() {
     parseFlushCommand();
 
     if (session_cfg.flush) {
+        digitalWrite(POWER_EN, HIGH);
+        delay(100);
+
         spout.init(1);
         spout.flush(10000);
 
         logger.write("R");
         Serial.flush();
+
+        delay(100);
+        digitalWrite(POWER_EN, LOW);
 
         wdt_enable(WDTO_15MS);
         while (1) {}
