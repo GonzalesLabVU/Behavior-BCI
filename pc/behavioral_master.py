@@ -4,6 +4,7 @@ import warnings
 import traceback
 
 import keyboard
+import math
 import random
 import time
 import socket
@@ -11,6 +12,8 @@ import uuid
 import json
 import functools
 import inspect
+import io
+from functools import wraps
 from itertools import zip_longest
 from datetime import datetime
 from pathlib import Path
@@ -55,8 +58,9 @@ ERROR_LOG_PATH = SCRIPT_DIR / "errors.log"
 load_dotenv(SCRIPT_DIR / ".env")
 
 BAUDRATE = 1_000_000
-EARLY_END_STRING = "E"
-SESSION_END_STRING = "S"
+EARLY_STRING = "E"
+FINISH_STRING = "S"
+RESTART_STRING = "R"
 
 PHASE_CONFIG = {
     '2': {'threshold': 15.0, 'side': 'B', 'reverse': False}, # free lick + wheel
@@ -71,6 +75,8 @@ SIDE_STREAK = 0
 EVT_QUEUE: "Queue[tuple[str, str]]" = Queue()
 ENC_QUEUE: "Queue[tuple[str, object]]" = Queue()
 EXC_STACK: "deque[dict[str, object]]" = deque()
+
+VERBOSE = False
 
 
 # ---------------------------
@@ -106,6 +112,26 @@ def _now():
     return int(time.time())
 
 
+def pad_verbose_output(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        original_stdout = sys.stdout
+        buffer = io.StringIO()
+        sys.stdout = buffer
+        try:
+            return func(*args, **kwargs)
+        finally:
+            sys.stdout = original_stdout
+            output = buffer.getvalue()
+            if output:
+                output = output.rstrip("\n")
+                print()
+                print(output)
+                print()
+
+    return wrapper
+
+
 # ---------------------------
 # TRIAL INFO
 # ---------------------------
@@ -137,7 +163,7 @@ def show_trial_info(dt, n_hit, n_miss, outcome):
     n_total = n_hit + n_miss
     trial_str = n_total
 
-    elapsed_str = f'{dt:.2f} s'
+    elapsed_str = f'{(dt - 1.0):.2f} s'
     
     col_w = [len(label) + (2 * pad) for label, pad in zip(INFO_CFG['labels'], INFO_CFG['label_pads'])]
 
@@ -524,13 +550,20 @@ class ArduinoLink:
                 if not line:
                     continue
 
+                if VERBOSE:
+                    print(f'ArduinoLink._reader_loop  |  {line}', flush=True)
+
                 if line == "A":
                     self.ack_evt.set()
                     continue
 
                 ts = _get_ts()
 
-                if line == SESSION_END_STRING:
+                if line == RESTART_STRING:
+                    self.msg_q.put(("RESTART", ts, None))
+                    continue
+
+                if line == FINISH_STRING:
                     self.msg_q.put(("END", ts, None))
                     continue
 
@@ -548,7 +581,6 @@ class ArduinoLink:
                     payload = line.split("]", 1)[1].strip()
                     self.msg_q.put(("RAW", ts, payload))
                     continue
-
         except Exception as e:
             try:
                 self.msg_q.put(("ERR", _get_ts(), e))
@@ -571,6 +603,9 @@ class ArduinoLink:
     def send_and_wait(self, text, timeout=5.0):
         if not self.active:
             return
+        
+        if VERBOSE:
+            print(f'ArduinoLink.send_and_wait  |  {text}', flush=True)
 
         self.ack_evt.clear()
         self.ser.write((text.strip() + "\n").encode("utf-8"))
@@ -582,6 +617,9 @@ class ArduinoLink:
     def send(self, text):
         if not self.active:
             return
+        
+        if VERBOSE:
+            print(f'ArduinoLink.send  |  {text}', flush=True)
         
         self.ser.write((text.strip() + "\n").encode("utf-8"))
         self.ser.flush()
@@ -708,7 +746,10 @@ class SessionData:
         return (self.meta['t_start'] is not None) and (self.meta['t_stop'] is not None)
 
 
-def get_easy(trial_n, K):
+def get_easy(phase, trial_n, K):
+    if phase < 5:
+        return True
+
     if trial_n <= 20:
         return ((trial_n - 1) % 5) == 0
 
@@ -1596,15 +1637,26 @@ def send_email(session_data):
 # ---------------------------
 # EXIT
 # ---------------------------
-def is_early_exit(evt, index, end_ms, min_duration=20*60, min_trials=150):
-    if end_ms is None:
-        return False
+@pad_verbose_output
+def is_early_exit(evt, index, end_ms, min_duration=1*60, min_trials=1):
+    width = 5
+
+    if VERBOSE:
+        print(f'is_early_exit  |  {"index":<{width}} = {index}')
     
+    buf = getattr(is_early_exit, '_buf', None)
+    if buf is None:
+        buf = deque(maxlen=11)
+        setattr(is_early_exit, '_buf', buf)
+    
+    new_xy = (None, None)
+
+    t0_ms = None
+    elapsed_s = None
+
     try:
         ts_list = evt.get('timestamps', []) if isinstance(evt, dict) else []
         vals_list = evt.get('values', []) if isinstance(evt, dict) else []
-
-        t0_ms = None
 
         for ts, val in zip(ts_list, vals_list):
             if val == "cue":
@@ -1612,67 +1664,83 @@ def is_early_exit(evt, index, end_ms, min_duration=20*60, min_trials=150):
                 break
     except Exception:
         t0_ms = None
-
-    if t0_ms is None:
-        return False
     
     prev_t0 = getattr(is_early_exit, '_t0_ms', None)
-    if prev_t0 is None or int(prev_t0) != int(t0_ms):
-        setattr(is_early_exit, '_t0_ms', int(t0_ms))
-        setattr(is_early_exit, '_buf', deque(maxlen=11))
-    
-    buf = getattr(is_early_exit, '_buf')
+    curr_t0 = int(t0_ms) if t0_ms is not None else None
 
-    dt_ms = int(end_ms) - int(t0_ms)
-    if dt_ms < 0:
-        dt_ms += 24 * 3600 * 1000
+    if curr_t0 is not None and (prev_t0 is None or prev_t0 != curr_t0):
+        setattr(is_early_exit, '_t0_ms', curr_t0)
+
+        buf = deque(maxlen=11)
+        setattr(is_early_exit, '_buf', buf)
     
-    elapsed_s = max(0.0, dt_ms / 1000.0)
+    if t0_ms is not None:
+        try:
+            dt_ms = int(end_ms) - int(t0_ms)
+            if dt_ms < 0:
+                dt_ms += 24 * 3600 * 1000
+            
+            elapsed_s = max(0.0, dt_ms / 1000.0)
+
+            if VERBOSE:
+                print(f'is_early_exit  |  {"elapsed_s":<{width}} = {elapsed_s:.2f}')
+            
+            x = max(0.0, dt_ms / 60000.0)
+            y = int(index)
+
+            new_xy = (x, y) if int(index) >= min_trials else (None, None)
+        except Exception:
+            new_xy = (None, None)
     
-    x = max(0.0, dt_ms / 60000.0)
-    try:
-        y = int(index)
-    except Exception:
+    buf.append(new_xy)
+
+    if VERBOSE:
+        print(f'is_early_exit  |  {"len(buf)":<{width}} = {len(buf)}')
+
+    exit_valid = not (index < min_trials
+                      or t0_ms is None
+                      or new_xy == (None, None)
+                      or len(buf) < 11
+                      or elapsed_s < float(min_duration))
+
+    if not exit_valid:
         return False
     
-    buf.append((x, y))
-
+    buf = [xy for xy in buf if None not in xy]
     if len(buf) < 11:
         return False
     
     rates = []
-    prev = None
-
-    for curr in buf:
-        if prev is None:
-            prev = curr
+    prev_xy = None
+    
+    for curr_xy in buf[-11:]:
+        if prev_xy is None:
+            prev_xy = curr_xy
             continue
 
-        x1, y1 = prev
-        x2, y2 = curr
+        x1, y1 = prev_xy
+        x2, y2 = curr_xy
 
         dx = float(x2) - float(x1)
         dy = float(y2) - float(y1)
 
         rates.append(float('inf') if dx <= 0.0 else (dy / dx))
-        prev = curr
+        prev_xy = curr_xy
     
-    if len(rates) != 10:
-        return False
+    if VERBOSE:
+        print(f'is_early_exit  |  {"len(rates)":<{width}} = {len(rates)}')
+        
+        rates_str = "[" + ", ".join(f'{r:.1f}' for r in rates) + "]"
+        print(f'is_early_exit  |  {"rates":<{width}} = {rates_str}')
     
-    if elapsed_s < float(min_duration):
-        return False
-    
-    if index < min_trials:
-        return False
-    
-    return sum(1 for r in rates if r < 4.0) > 7
+    # return sum(1 for r in rates if r < 4.0) >= 5
+    return sum(1 for r in rates if r < 10.0) >= 5
 
 
 def cleanup(link, msg, timeout=30.0):
     try:
         try:
-            link.send(EARLY_END_STRING)
+            link.send(EARLY_STRING)
         except Exception:
             pass
 
@@ -1714,22 +1782,22 @@ def setup():
 
                 if not ser.is_open:
                     arduino_available = False
-                    print(f'[WARNING] {port} port is not open after initialization (continuing without Arduino)\n',
+                    print(f'\n[WARNING] {port} port is not open after initialization (continuing without Arduino)',
                           flush=True)
                 else:
-                    print(f"Connected to {port} port\n", flush=True)
-            except Exception as serial_exc:
+                    print(f"\nConnected to {port} port", flush=True)
+            except Exception as e2:
                 arduino_available = False
                 ser = None
-                print(f'[WARNING] Could not open Arduino port: {serial_exc}\n', flush=True)
+                print(f'\n[WARNING] Could not open Arduino port: {e2}', flush=True)
         else:
-            print('[WARNING] No Arduino detected', flush=True)
+            print('\n[WARNING] No Arduino detected (continuing without Arduino)', flush=True)
 
         animal_map = load_animal_map()
 
         try:
             while True:
-                print("\nAnimal ID:  ", end="", flush=True)
+                print("\n\nAnimal ID:  ", end="", flush=True)
 
                 animal_raw = sys.stdin.readline()
                 if animal_raw == "":
@@ -1762,6 +1830,9 @@ def setup():
         if animal_id != "DEV":
             validate_resources()
             workbook_id = get_workbook_id(animal_id, animal_map)
+        else:
+            global VERBOSE
+            VERBOSE = True
 
         valid_phases = {"0", "1"} | set(PHASE_CONFIG.keys())
 
@@ -1783,17 +1854,19 @@ def setup():
         imaging_active = False
         if int(phase_id) >= 2:
             try:
-                imaging_raw = input('Imaging active? [y/N]:  ')
+                imaging_raw = input('\nImaging active? [y/N]:  ')
             except KeyboardInterrupt:
                 print('\nTerminated by KeyboardInterrupt')
                 raise
 
             imaging_active = is_affirmative(imaging_raw)
         
+        print('\nInitializing resources...')
+        
         try:
             client = PrairieClient() if imaging_active else None
         except ConnectionRefusedError:
-            print('\n[WARNING] Could not connect to server (either ethernet is disconnected or TCPServer.exe is not running)')
+            print('\n[WARNING] Could not connect to server (ethernet cable is disconnected or TCPServer.exe is not running)')
 
             client = None
             exit(0)
@@ -1838,18 +1911,64 @@ def setup():
             link.send_and_wait(f"phase {phase_id}")
         except Exception as e:
             link.close()
-            raise RuntimeError(f'Failed during initial Arduino handshake: {e}') from e
+            raise RuntimeError(f'[ERROR] Failed during initial Arduino handshake: {e}') from e
+        
+        try:
+            flush_spout = input('\nOpen spout for 10 seconds? [y/N]:  ')
+        except KeyboardInterrupt:
+            print('\nTerminated by KeyboardInterrupt')
+            raise
+
+        flush_spout = is_affirmative(flush_spout)
+
+        if cfg:
+            dummy_easy = get_easy(phase=int(phase_id), trial_n=1, K=5)
+            try:
+                link.send_and_wait(f"1 {'1' if dummy_easy else '0'}")
+            except Exception as e:
+                link.close()
+                raise RuntimeError(f'[ERROR] Failed during pre-flush trial config handshake: {e}') from e
+
+        try:
+            link.send_and_wait(f"flush {'1' if flush_spout else '0'}")
+        except Exception as e:
+            link.close()
+            raise RuntimeError(f'[ERROR] Failed during spout flush handshake: {e}') from e
+
+        if flush_spout:
+            print()
+            deadline = time.time() + 10.5
+
+            while True:
+                remaining = math.floor(deadline - time.time())
+                if remaining > 0:
+                    print(f'\rFlushing...{remaining}s ', end="", flush=True)
+
+                try:
+                    typ, _, payload = link.msg_q.get(timeout=1.0)
+                except Empty:
+                    continue
+
+                if typ == "RESTART":
+                    print('\rFlushing...Done', flush=True)
+                    link.close()
+                    raise SystemExit(0)
+
+                if typ == "ERR":
+                    if isinstance(payload, BaseException):
+                        raise payload
+                    raise RuntimeError(f'ArduinoLink reader error during flush: {payload!r}')
 
         easy = False
         cursor = None
 
-        if cfg:
-            easy = get_easy(trial_n=1, K=5)
+        if cfg and not flush_spout:
+            easy = get_easy(phase=int(phase_id), trial_n=1, K=5)
             
             try:
                 link.send_and_wait(f"1 {'1' if easy else '0'}")
             except Exception as e:
-                print(f'[ERROR] Unhandled exception during initial phase hand-off: {e}')
+                raise RuntimeError(f'[ERROR] Unhandled exception during initial phase hand-off: {e}') from e
 
             if int(phase_id) >= 4:
                 cursor = BCI(phase_id=phase_id,
@@ -1868,6 +1987,7 @@ def setup():
 
         log_trial_config(session_data, trial_n=1, type=easy, side=side)
 
+        print('Running session...\n', flush=True)
         return link, session_data, cursor, client
     except Exception as e:
         cache_exc(e, 'setup')
@@ -1887,7 +2007,7 @@ def setup():
         raise
 
 
-def main(link, session_data, cursor, client=None, verbose=False):
+def main(link, session_data, cursor, client=None):
     do_calibration = int(session_data.meta['phase']) >= 4
     imaging_active = (bool(session_data.meta.get('imaging_active', False))
                       and (client is not None))
@@ -1902,6 +2022,7 @@ def main(link, session_data, cursor, client=None, verbose=False):
     K = 5
     N = 20
     trial_n = 0
+    phase_id = str(session_data.meta['phase'])
 
     trial_stack = []
     calibrated = not do_calibration
@@ -1911,10 +2032,8 @@ def main(link, session_data, cursor, client=None, verbose=False):
     trial_dt = 0.0
     recent_outcomes = deque()
 
-    def _get_msg(timeout=0.05, verbose=verbose):
+    def _get_msg(timeout=0.05):
         typ, ts, payload = link.msg_q.get(timeout=timeout)
-        if verbose:
-            print(f'[{ts} | {typ}] {payload}')
 
         return typ, ts, payload
 
@@ -1991,11 +2110,6 @@ def main(link, session_data, cursor, client=None, verbose=False):
 
                     show_trial_info(trial_dt, n_hit, n_miss, p)
 
-                    if int(session_data.meta['phase']) >= 4:
-                        early_exit = is_early_exit(session_data.evt, trial_n, end_ms)
-                    else:
-                        early_exit = False
-
                     if do_calibration:
                         trial_stack.insert(0, p)
                         if len(trial_stack) > N:
@@ -2010,22 +2124,27 @@ def main(link, session_data, cursor, client=None, verbose=False):
 
                                 print(f'\nCalibration finished [hits={calibration_hits}/20, K={K}, N={N}]\n', flush=True)
                                 show_trial_header()
-                        else:
+
+                    if int(phase_id) >= 4:
+                        if calibrated:
+                            early_exit = is_early_exit(session_data.evt, trial_n, end_ms)
+                            if VERBOSE:
+                                print(f'is_early_exit --> {early_exit}\n', flush=True)
+
                             if early_exit:
                                 cleanup(link, 'Terminated by early exit')
                                 break
-                    
-                    if int(session_data.meta['phase']) >= 4:
+
                         next_trial_n = trial_n + 1
-                        next_easy = get_easy(next_trial_n, K)
-                        next_side = PHASE_CONFIG[str(session_data.meta['phase'])]['side']
+                        next_easy = get_easy(int(phase_id), next_trial_n, K)
+                        next_side = PHASE_CONFIG[phase_id]['side']
 
                         time.sleep(0.05)
                         link.send_and_wait(f'{next_trial_n} {"1" if next_easy else "0"}')
                         log_trial_config(session_data, trial_n=next_trial_n, type=next_easy, side=next_side)
 
                         if cursor is not None:
-                            cursor.update_config(next_easy, next_side)
+                            cursor.update_config(next_easy, next_side)                        
 
                 if p in {"hit", "lick"}:
                     session_data.add_raw_evt(ts, p)
@@ -2084,7 +2203,7 @@ if __name__ == "__main__":
             animal_id_for_log = session_data.meta.get("animal", "UNKNOWN")
             phase_id_for_log = session_data.meta.get("phase", "0")
 
-        main(link, session_data, cursor, prairie_host, verbose=False)
+        main(link, session_data, cursor, prairie_host)
     except SystemExit as e:
         pass
     except KeyboardInterrupt as e:
