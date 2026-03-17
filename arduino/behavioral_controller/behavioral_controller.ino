@@ -462,7 +462,7 @@ void setup() {
     spout.init(pulse_us);
 
     lick.init(RAW_FLAG);
-    lick.calibrate();
+    // lick.calibrate();
 
     wheel.init(easy_threshold, session_cfg.threshold, trial_cfg.side, session_cfg.reverse);
 
