@@ -474,6 +474,8 @@ static void checkInactivity(float current_disp) {
 
         if (!inactivity_timer.isRunning() && (remaining_ms > tone_T)) {
             speaker.cue();
+            logger.write("r_cue");
+            
             cue_active = true;
             inactivity_timer.init(tone_T);
             inactivity_timer.start();
