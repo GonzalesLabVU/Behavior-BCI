@@ -746,9 +746,7 @@ class SessionData:
 
     @property
     def is_finished(self):
-        return (self.meta['t_start'] is not None and
-                self.meta['t_stop'] is not None and
-                not self.meta['aborted'])
+        return (self.meta['t_start'] is not None) and (self.meta['t_stop'] is not None)
 
 
 def get_easy(phase, trial_n, K):
@@ -1739,12 +1737,12 @@ def is_early_exit(evt, index, end_ms, min_duration=20*60, min_trials=150):
     return sum(1 for r in rates if r < 4.0) >= 5
 
 
-def cleanup(link, client, msg, timeout=30.0):
+def cleanup(link, msg, timeout=30.0):
     try:
         try:
             link.send(EARLY_STRING)
-        except Exception as e:
-            cache_exc(e, 'cleanup.link')
+        except Exception:
+            pass
 
         deadline = time.time() + timeout
         while time.time() < deadline:
@@ -1757,26 +1755,9 @@ def cleanup(link, client, msg, timeout=30.0):
             except Empty:
                 pass
         
-        if client is not None:
-            try:
-                client.stop()
-            except Exception as e:
-                cache_exc(e, 'cleanup.client_stop')
-            
-            try:
-                client.finish()
-            except Exception as e:
-                cache_exc(e, 'cleanup.client_finish')
-        
         print(f'{msg}', flush=True)
     finally:
         link.close()
-
-        if client is not None:
-            try:
-                client.disconnect()
-            except Exception as e:
-                cache_exc(e, 'cleanup.client_disconnect')
 
 
 # ---------------------------
@@ -1998,259 +1979,6 @@ def _cursor_connect(phase_id, side):
     return cursor, easy
 
 
-# def setup():
-#     port = find_arduino_port()
-#     arduino_available = bool(port)
-    
-#     animal_id = "DEV"
-#     phase_id = "3"
-
-#     ser = None
-#     link = None
-#     client = None
-
-#     try:
-#         # try to find Arduino
-#         if arduino_available:
-#             try:
-#                 ser = serial.Serial(port, BAUDRATE, timeout=0.05)
-#                 time.sleep(2)
-
-#                 if not ser.is_open:
-#                     arduino_available = False
-#                     print(f'\n[WARNING] {port} port is not open after initialization (continuing without Arduino)',
-#                           flush=True)
-#                 else:
-#                     print(f"\nConnected to {port} port", flush=True)
-#             except Exception as e2:
-#                 arduino_available = False
-#                 ser = None
-#                 print(f'\n[WARNING] Could not open Arduino port: {e2}', flush=True)
-#         else:
-#             print('\n[WARNING] No Arduino detected (continuing without Arduino)', flush=True)
-
-#         # ask for animal ID
-#         animal_map = load_animal_map()
-
-#         try:
-#             while True:
-#                 print("\n\nAnimal ID:  ", end="", flush=True)
-
-#                 animal_raw = sys.stdin.readline()
-#                 if animal_raw == "":
-#                     raise EOFError
-                
-#                 animal_raw = animal_raw.rstrip("\n").upper()
-
-#                 if not animal_raw:
-#                     sys.stdout.write('\x1b[1A')
-#                     sys.stdout.write('\x1b[2K')
-#                     sys.stdout.write('Animal ID:  DEV\n')
-#                     sys.stdout.flush()
-                    
-#                     animal_id = "DEV"
-#                 else:
-#                     if not validate_animal(animal_raw, animal_map):
-#                         print(animal_id)
-#                         print('Please enter a valid animal')
-#                         continue
-                    
-#                     animal_id = animal_raw
-                
-#                 break
-#         except KeyboardInterrupt:
-#             print('\nTerminated by KeyboardInterrupt')
-#             raise
-        
-#         workbook_id = None
-
-#         if animal_id != "DEV":
-#             validate_resources()
-#             workbook_id = get_workbook_id(animal_id, animal_map)
-#         else:
-#             global VERBOSE
-#             VERBOSE = True
-
-#         # ask for phase ID
-#         valid_phases = {"0", "1"} | set(PHASE_CONFIG.keys())
-
-#         while True:
-#             try:
-#                 phase_id = input("Training Phase:  ").strip()
-#             except KeyboardInterrupt:
-#                 print('\nTerminated by KeyboardInterrupt')
-#                 raise
-    
-#             if phase_id in valid_phases:
-#                 break
-
-#             print("Please enter a valid phase\n", flush=True)
-
-#         # establish Arduino connection
-#         if not arduino_available and phase_id != "0":
-#             raise RuntimeError(f'No Arduino detected (required for phase {phase_id})')
-        
-#         def _safe_float(var):
-#             v = _require_env(var).strip()
-
-#             if (len(v) >= 2) and ((v[0] == v[-1]) and v[0] in {"'", '"'}):
-#                 v = v[1:-1].strip()
-            
-#             return float(v)
-
-#         link = ArduinoLink(ser)
-#         try:
-#             link.start()
-#         except Exception:
-#             pass
-
-#         engage_ms = _safe_float("BRAKE_ENGAGE_MS")
-#         release_ms = _safe_float("BRAKE_RELEASE_MS")
-#         pulse_ms = _safe_float("SPOUT_PULSE_MS")
-
-#         cfg = PHASE_CONFIG.get(str(phase_id))
-#         if cfg is None and str(phase_id) not in {"0", "1"}:
-#             raise ValueError(f'No PHASE_CONFIG entry for phase_id={phase_id}')
-        
-#         threshold = float(cfg.get('threshold', 0.0)) if cfg else 0.0
-#         side = str(cfg.get('side', 'B')).upper() if cfg else "B"
-#         reverse = bool(cfg.get('reverse', False)) if cfg else False
-
-#         try:
-#             link.send_and_wait(f"engage {engage_ms:.4f}")
-#             link.send_and_wait(f"release {release_ms:.4f}")
-#             link.send_and_wait(f"pulse {pulse_ms:.4f}")
-#             link.send_and_wait(f"threshold {threshold:.4f}")
-#             link.send_and_wait(f"side {side}")
-#             link.send_and_wait(f"reverse {'1' if reverse else '0'}")
-#             link.send_and_wait(f"phase {phase_id}")
-#         except Exception as e:
-#             link.close()
-#             raise RuntimeError(f'[ERROR] Failed during initial Arduino handshake: {e}') from e
-        
-#         # ask for spout flush (restart if True)
-#         try:
-#             flush_spout = input('\nFlush spout for 10 seconds? (WARNING: This requires a restart) [y/N]:  ')
-#         except KeyboardInterrupt:
-#             print('\nTerminated by KeyboardInterrupt')
-#             raise
-
-#         flush_spout = is_affirmative(flush_spout)
-
-#         if cfg:
-#             dummy_easy = get_easy(phase=int(phase_id), trial_n=1, K=5)
-#             try:
-#                 link.send_and_wait(f"1 {'1' if dummy_easy else '0'}")
-#             except Exception as e:
-#                 link.close()
-#                 raise RuntimeError(f'[ERROR] Failed during pre-flush trial config handshake: {e}') from e
-
-#         try:
-#             link.send_and_wait(f"flush {'1' if flush_spout else '0'}")
-#         except Exception as e:
-#             link.close()
-#             raise RuntimeError(f'[ERROR] Failed during spout flush handshake: {e}') from e
-
-#         if flush_spout:
-#             print()
-#             deadline = time.time() + 10.5
-
-#             while True:
-#                 remaining = math.floor(deadline - time.time())
-#                 if remaining > 0:
-#                     print(f'\rFlushing...{remaining}s ', end="", flush=True)
-
-#                 try:
-#                     typ, _, payload = link.msg_q.get(timeout=1.0)
-#                 except Empty:
-#                     continue
-
-#                 if typ == "RESTART":
-#                     print('\rFlushing...Done', flush=True)
-#                     link.close()
-#                     raise SystemExit(0)
-
-#                 if typ == "ERR":
-#                     if isinstance(payload, BaseException):
-#                         raise payload
-#                     raise RuntimeError(f'ArduinoLink reader error during flush: {payload!r}')
-
-#         # TCP connection
-#         imaging_active = False
-#         if int(phase_id) >= 2:
-#             try:
-#                 imaging_raw = input('\nImaging active? [y/N]:  ')
-#             except KeyboardInterrupt:
-#                 print('\nTerminated by KeyboardInterrupt')
-#                 raise
-
-#             imaging_active = is_affirmative(imaging_raw)
-        
-#         print('\nInitializing resources...')
-        
-#         try:
-#             client = PrairieClient() if imaging_active else None
-#         except ConnectionRefusedError:
-#             print('\n[WARNING] Could not connect to server (ethernet cable is disconnected or TCPServer.exe is not running)')
-
-#             client = None
-#             exit(0)
-
-#         if client is not None:
-#             if not client.configure():
-#                 raise RuntimeError('Server unable to complete CONFIG process execution')
-
-#         # BCI setup
-#         easy = False
-#         cursor = None
-
-#         if cfg and not flush_spout:
-#             easy = get_easy(phase=int(phase_id), trial_n=1, K=5)
-            
-#             try:
-#                 print('Running session...\n', flush=True)
-#                 link.send_and_wait("start 1")
-#                 link.send_and_wait(f"1 {'1' if easy else '0'}")
-#             except Exception as e:
-#                 raise RuntimeError(f'[ERROR] Unhandled exception during initial phase hand-off: {e}') from e
-
-#             if int(phase_id) >= 4:
-#                 cursor = BCI(phase_id=phase_id,
-#                             evt_queue=EVT_QUEUE,
-#                             enc_queue=ENC_QUEUE,
-#                             config=PHASE_CONFIG,
-#                             display_idx=1,
-#                             fullscreen=False,
-#                             easy_threshold=15.0)
-#                 cursor.update_config(easy, side)
-#                 cursor.start()
-
-#         # session data
-#         session_data = SessionData(animal_id, str(phase_id), _get_date())
-#         session_data.meta['workbook_id'] = workbook_id
-#         session_data.meta['imaging_active'] = bool(client is not None)
-
-#         log_trial_config(session_data, trial_n=1, type=easy, side=side)
-
-#         return link, session_data, cursor, client
-#     except Exception as e:
-#         cache_exc(e, 'setup')
-
-#         if link is not None:
-#             try:
-#                 link.close()
-#             except Exception as close_exc:
-#                 cache_exc(close_exc, 'setup.cleanup')
-        
-#         if ser is not None:
-#             try:
-#                 ser.close()
-#             except Exception as close_exc:
-#                 cache_exc(close_exc, 'setup.cleanup')
-        
-#         raise
-
-
 def setup():
     ser = None
     link = None
@@ -2362,11 +2090,15 @@ def main(link, session_data, cursor, client=None):
         return typ, ts, payload
 
     started = False
+    first_trial = True
 
     try:
         while link.ser and link.ser.is_open:
             if cursor is not None and ABORT_EVT.is_set():
                 raise KeyboardInterrupt
+
+            if imaging_active:
+                client.raise_pending_error()
 
             try:
                 typ, ts, payload = _get_msg(timeout=0.05)
@@ -2404,22 +2136,30 @@ def main(link, session_data, cursor, client=None):
                 if p == 'cue':
                     session_data.add_evt(ts, p)
 
-                    if imaging_active:
-                        client.start()
+                    if imaging_active and first_trial:
+                        if not client.start():
+                            raise RuntimeError('Initial START command failed')
+                        first_trial = False
                     
                     trial_n += 1
                     last_outcome = None
                     trial_start_ms = _ts_to_ms(ts)
                 
-                if p in {'hit', 'miss'}:
+                if p == 'r_cue':
                     session_data.add_evt(ts, p)
-
-                    if imaging_active:
-                        client.stop()
-
+                
+                if p in {'hit', 'miss'}:
                     if last_outcome == p:
                         continue
                     last_outcome = p
+
+                    session_data.add_evt(ts, p)
+
+                    if imaging_active:
+                        stop_ok = client.stop_after(delay_s=1.0)
+                        start_ok = client.start_after(delay_s=3.0)
+                        if not (stop_ok and start_ok):
+                            raise RuntimeError('Failed to schedule imaging restart')
 
                     end_ms = _ts_to_ms(ts)
                     if trial_start_ms is None or end_ms is None:
@@ -2456,7 +2196,12 @@ def main(link, session_data, cursor, client=None):
                                 print(f'is_early_exit --> {early_exit}\n', flush=True)
 
                             if early_exit:
-                                cleanup(link, client, 'Terminated by early exit')
+                                if imaging_active:
+                                    client.stop()
+                                    time.sleep(1)
+                                    client.finish()
+
+                                cleanup(link, 'Terminated by early exit')
                                 break
 
                         next_trial_n = trial_n + 1
@@ -2488,7 +2233,7 @@ def main(link, session_data, cursor, client=None):
                     pass
     except KeyboardInterrupt:
         session_data.meta["aborted"] = True
-        cleanup(link, client, "\nTerminated by KeyboardInterrupt")
+        cleanup(link, "\nTerminated by KeyboardInterrupt")
         raise
     except Exception as e:
         cache_exc(e, 'main')
@@ -2572,7 +2317,7 @@ if __name__ == "__main__":
                     cache_exc(e, '__main__.send_email')
                     log_and_commit(*run_info, e)
         
-        if session_data is not None and session_data.any_data() and not session_data.meta['aborted']:
+        if session_data is not None and session_data.any_data():
             if session_data.meta.get('animal', None) not in {None, "DEV"}:
                 try:
                     save_choice = input("\nSave current session? [Y/n]:  ").strip().lower()
