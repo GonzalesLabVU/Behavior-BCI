@@ -67,8 +67,7 @@ PHASE_CONFIG = {
     '3': {'threshold': 15.0, 'side': 'B', 'reverse': False}, # free lick + wheel + reward tone
     '4': {'threshold': 15.0, 'side': 'L', 'reverse': False}, # easy wheel trial (left target)
     '5': {'threshold': 30.0, 'side': 'L', 'reverse': False}, # normal wheel trial  (left target)
-    '6': {'threshold': 15.0, 'side': 'R', 'reverse': False}, # easy wheel trial (right target)
-    '7': {'threshold': 30.0, 'side': 'R', 'reverse': False} # normal wheel trial (right target)
+    '6': {'threshold': 60.0, 'side': 'L', 'reverse': False}, # hard wheel trial (left target)
     }
 
 MAX_STREAK = 4
