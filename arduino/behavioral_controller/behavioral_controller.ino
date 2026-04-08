@@ -522,7 +522,7 @@ void setup() {
         delay(100);
 
         spout.init(1);
-        spout.flush(10000);
+        spout.flush(5000);
 
         logger.write("R");
         Serial.flush();
