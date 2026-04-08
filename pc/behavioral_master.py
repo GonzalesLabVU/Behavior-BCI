@@ -1861,7 +1861,7 @@ def _get_settings(phase_id):
 
 
 def _prompt_flush():
-    flush_raw = input('\nFlush spout for 10 seconds? [y/N]:  ')
+    flush_raw = input('\nFlush spout for 5 seconds? [y/N]:  ')
     flush_choice = is_affirmative(flush_raw)
 
     if flush_choice:
@@ -1919,7 +1919,7 @@ def _send_config(link, phase_id, params):
 
 def _wait_for_restart(link):
     print()
-    deadline = time.time() + 10.5
+    deadline = time.time() + 5.5
 
     while True:
         remaining = math.floor(deadline - time.time())
