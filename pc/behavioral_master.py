@@ -24,6 +24,7 @@ from threading import Thread, Event
 import serial
 import serial.tools.list_ports
 from cursor_utils import BCI, ABORT_EVT
+from redis_utils import add_entry, remove_entry
 from TCPClient import PrairieClient
 
 import gspread
@@ -1979,6 +1980,11 @@ def _cursor_connect(phase_id, side):
     return cursor, easy
 
 
+def _redis_init():
+    client_id = str(os.getenv("CLIENT_ID"))
+    add_entry(f"client:{client_id}:id", client_id)
+
+
 def setup():
     ser = None
     link = None
@@ -2040,6 +2046,8 @@ def setup():
         print('Running session...\n', flush=True)
         _send_start(link)
 
+        _redis_init()
+
         return link, session_data, cursor, client
     except Exception as e:
         cache_exc(e, 'setup')
@@ -2096,9 +2104,6 @@ def main(link, session_data, cursor, client=None):
         while link.ser and link.ser.is_open:
             if cursor is not None and ABORT_EVT.is_set():
                 raise KeyboardInterrupt
-
-            if imaging_active:
-                client.raise_pending_error()
 
             try:
                 typ, ts, payload = _get_msg(timeout=0.05)
@@ -2250,6 +2255,9 @@ def main(link, session_data, cursor, client=None):
 
         if client is not None:
             client.stop()
+
+        client_id = str(os.getenv("CLIENT_ID"))
+        remove_entry(f"client:{client_id}:id")
 
 
 if __name__ == "__main__":
