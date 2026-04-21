@@ -1984,6 +1984,27 @@ def _redis_init():
     client_id = str(os.getenv("CLIENT_ID"))
     add_entry(f"client:{client_id}:id", client_id)
 
+    remove_entry(f"client:{client_id}:state")
+    add_entry(f"client:{client_id}:state", "running")
+
+
+def _redis_deinit():
+    client_id = str(os.getenv("CLIENT_ID"))
+    remove_entry(f"client:{client_id}:state")
+    add_entry(f"client:{client_id}:state", "finished")
+
+    original_read_key = keyboard.read_key
+
+    def _read_key_and_set_idle(*args, **kwargs):
+        try:
+            return original_read_key(*args, **kwargs)
+        finally:
+            remove_entry(f"client:{client_id}:state")
+            add_entry(f"client:{client_id}:state", "idle")
+            keyboard.read_key = original_read_key
+
+    keyboard.read_key = _read_key_and_set_idle
+
 
 def setup():
     ser = None
@@ -2256,8 +2277,7 @@ def main(link, session_data, cursor, client=None):
         if client is not None:
             client.stop()
 
-        client_id = str(os.getenv("CLIENT_ID"))
-        remove_entry(f"client:{client_id}:id")
+        _redis_deinit()
 
 
 if __name__ == "__main__":
