@@ -1982,7 +1982,6 @@ def _cursor_connect(phase_id, side):
 
 def _redis_init():
     client_id = str(os.getenv("CLIENT_ID"))
-    add_entry(f"client:{client_id}:id", client_id)
 
     remove_entry(f"client:{client_id}:state")
     add_entry(f"client:{client_id}:state", "running")
