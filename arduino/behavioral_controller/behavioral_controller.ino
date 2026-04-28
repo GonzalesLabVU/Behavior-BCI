@@ -140,7 +140,7 @@ static void applyPhaseDefaults(int phase_id) {
         delay_T = SECONDS(3);
     } else if (phase_id == 1) {
         session_T = MINUTES(10);
-        trial_T = SECONDS(0);
+        trial_T = SECONDS(5);
         delay_T = SECONDS(3);
     } else if (phase_id == 2) {
         session_T = MINUTES(20);
@@ -655,7 +655,14 @@ void run_phase_0() {
                 phase_timer.start();
             }
             else {
-                if (!phase_timer.isRunning()) {
+                if (phase_timer.isRunning()) {
+                    lick.sampleFiltered();
+
+                    if (lick.justTouched()) {
+                        logger.write("lick");
+                    }
+                }
+                else {
                     phase_timer.reset();
 
                     phase_state = PhaseState::HIT;
@@ -722,14 +729,35 @@ void run_phase_1() {
         }
         
         case PhaseState::HIT: {
-            spout.pulse();
-            logger.write("hit");
+            // entry
+            if (!phase_timer.started()) {
+                logger.write("hit");
 
-            phase_timer.reset();
-            phase_timer.init(delay_T);
-            phase_timer.start();
+                phase_timer.init(tone_T);
+                phase_timer.start();
+            }
+            // active
+            else {
+                // running
+                if (phase_timer.isRunning()) {
+                    lick.sampleFiltered();
+                    if (lick.justTouched()) {
+                        logger.write("lick");
+                    }
 
-            phase_state = PhaseState::TRIAL;
+                    if ((phase_timer.timeElapsed() >= (tone_T >> 1)) && !reward_given) {
+                        spout.pulse();
+                        reward_given = true;
+                    }
+                // exit
+                } else {
+                    phase_timer.reset();
+                    reward_given = false;
+
+                    // HIT -> DELAY
+                    phase_state = PhaseState::DELAY;
+                }
+            }
 
             break;
         }
@@ -737,7 +765,7 @@ void run_phase_1() {
         case PhaseState::TRIAL: {
             if (session_timer.isRunning()) {
                 if (!phase_timer.started()) {
-                    phase_timer.init(delay_T);
+                    phase_timer.init(trial_T);
                     phase_timer.start();
                 }
 
@@ -1305,10 +1333,6 @@ void run_phase_4_plus() {
                     if (lick.justTouched()) {
                         logger.write("lick");
                     }
-
-                    // if (phase_timer.timeElapsed() >= (tone_T >> 3)) {
-                    //     brake.engage();
-                    // }
 
                     if ((phase_timer.timeElapsed() >= (tone_T >> 1)) && !reward_given) {
                         spout.pulse();
