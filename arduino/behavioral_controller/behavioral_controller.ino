@@ -616,8 +616,6 @@ void loop() {
     }
 }
 
-// phase logic functions
-
 void run_phase_0() {
     switch (phase_state) {
         case PhaseState::IDLE: {
