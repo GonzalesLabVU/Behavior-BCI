@@ -2032,7 +2032,7 @@ def setup():
 
         phase_id = _prompt_phase()
 
-        if not arduino_found and phase_id != "0":
+        if not arduino_found:
             raise RuntimeError(f'No Arduino detected (required for phase {phase_id})')
 
         imaging_active = _prompt_imaging()
@@ -2091,13 +2091,6 @@ def main(link, session_data, cursor, client=None):
     do_calibration = int(session_data.meta['phase']) > 4
     imaging_active = (bool(session_data.meta.get('imaging_active', False))
                       and (client is not None))
-
-    if not link.active and str(session_data.meta['phase']) == "0":
-        session_data.meta['t_start'] = _ts_to_ms(_get_ts())
-        session_data.meta['t_stop'] = _ts_to_ms(_get_ts())
-        session_data.meta['duration_sec'] = 0
-
-        return
 
     K = 5
     N = 20
