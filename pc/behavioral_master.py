@@ -15,7 +15,7 @@ import inspect
 import io
 from functools import wraps
 from itertools import zip_longest
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from queue import Queue, Empty
 from collections import deque
@@ -64,8 +64,8 @@ FINISH_STRING = "S"
 RESTART_STRING = "R"
 
 PHASE_CONFIG = {
-    '2': {'threshold': 15.0, 'side': 'B', 'reverse': False}, # free lick + wheel
-    '3': {'threshold': 15.0, 'side': 'B', 'reverse': False}, # free lick + wheel + reward tone
+    '2': {'threshold': 15.0, 'side': 'B', 'reverse': False}, # wheel association
+    '3': {'threshold': 15.0, 'side': 'B', 'reverse': False}, # tone association
     '4': {'threshold': 15.0, 'side': 'L', 'reverse': False}, # easy wheel
     '5': {'threshold': 30.0, 'side': 'L', 'reverse': False}, # normal wheel
     '6': {'threshold': 60.0, 'side': 'L', 'reverse': False}, # harder wheel
@@ -776,6 +776,8 @@ LOCK_LEASE_S = 180
 LOCK_RESET_S = 60
 LOCK_TIMEOUT_S = 300
 
+VALID_SESSION_S = 5 * 60
+
 LOCK_TAG = "------ LOCK ------"
 LOCK_TAG_RANGE = "A1"
 LOCK_META_RANGE = "A2:D2"
@@ -796,6 +798,7 @@ def _build_meta_rows(session_data):
 
     meta_pairs = [
         ('client', client_id),
+        ('duration_sec', session_data.meta.get('duration_sec', None)),
         ('K1', session_data.meta.get('K1', 5)),
         ('K2', session_data.meta.get('K2', None)),
         ('easy_trials', easy_trials),
@@ -858,6 +861,100 @@ def _align_cells(wb, ws, r1, c1, r2, c2):
         }
     
     wb.batch_update(req)
+
+
+def _valid_phases():
+    return {"0", "1"} | set(PHASE_CONFIG.keys())
+
+
+def _get_existing_session_duration(ws, start_col):
+    try:
+        vals = ws.get(f"{rowcol_to_a1(4, start_col)}:{rowcol_to_a1(ws.row_count, start_col + 1)}")
+    except Exception:
+        return None
+
+    pending_key = None
+
+    for row in vals:
+        key = str(row[0]).strip() if len(row) > 0 else ""
+        val = row[1] if len(row) > 1 else ""
+
+        if key:
+            pending_key = key
+
+        if pending_key == "duration_sec":
+            try:
+                return float(val)
+            except Exception:
+                return None
+
+    return None
+
+
+def _find_existing_session_block(wb, session_data):
+    def _norm(x):
+        return (x or "").strip()
+
+    target_d = _norm(session_data.meta.get("date", ""))
+    target_a = _norm(f"Animal {session_data.meta.get('animal', '')}")
+    target_p = _norm(f"Phase {session_data.meta.get('phase', '')}")
+
+    try:
+        ws = wb.worksheet("Metadata")
+    except Exception:
+        return None
+
+    max_col = len(ws.row_values(2))
+    if max_col <= 0:
+        return None
+
+    header_rng = f"A1:{rowcol_to_a1(2, max_col)}"
+    header = ws.get(header_rng)
+    row1 = header[0] if len(header) > 0 else []
+    row2 = header[1] if len(header) > 1 else []
+
+    for c in range(1, max_col + 1, 2):
+        d_val = _norm(row1[c-1] if (c - 1) < len(row1) else "")
+        a_val = _norm(row2[c-1] if (c - 1) < len(row2) else "")
+        p_val = _norm(row2[c] if c < len(row2) else "")
+
+        if (d_val == target_d) and (a_val == target_a) and (p_val == target_p):
+            return {
+                "worksheet": ws,
+                "start_col": c,
+                "duration_sec": _get_existing_session_duration(ws, c)
+                }
+
+    return None
+
+
+def _prompt_correct_meta(session_data):
+    animal_map = load_animal_map()
+
+    while True:
+        raw = input("Enter the correct animal/phase to use for this session:  ").strip().upper()
+        if not raw:
+            continue
+
+        if raw.isdigit():
+            if raw in _valid_phases():
+                session_data.meta['phase'] = raw
+                return True
+
+            print("Please enter a valid phase")
+            continue
+
+        if raw.isalnum():
+            if validate_animal(raw, animal_map):
+                session_data.meta['animal'] = raw
+                session_data.meta['workbook_id'] = _resolve_workbook(raw, animal_map)
+
+                return True
+
+            print("Please enter a valid animal")
+            continue
+
+        print("Please enter a valid animal/phase")
 
 
 def get_workbook_id(animal_id, animal_map):
@@ -1258,6 +1355,63 @@ class FileLock:
         raise last_e
 
 
+def resolve_save_protocol(session_data):
+    session_data.overwrite_confirmed = False
+
+    while True:
+        workbook_id = session_data.meta.get("workbook_id")
+        if not workbook_id:
+            session_data.overwrite_confirmed = True
+            return True
+
+        wb = API_CLIENT.open_by_key(workbook_id)
+        existing = _find_existing_session_block(wb, session_data)
+        if existing is None:
+            session_data.overwrite_confirmed = True
+            return True
+
+        prev_duration = existing.get("duration_sec")
+        curr_duration = float(session_data.meta.get("duration_sec") or 0)
+
+        auto_overwrite = (prev_duration is not None
+                          and prev_duration < VALID_SESSION_S
+                          and curr_duration > VALID_SESSION_S)
+        if auto_overwrite:
+            session_data.overwrite_confirmed = True
+            return True
+
+        valid_duplicate = (prev_duration is not None
+                      and prev_duration >= VALID_SESSION_S
+                      and curr_duration >= VALID_SESSION_S)
+        if valid_duplicate:
+            overwrite_raw = input("A training session has already been recorded today for this animal/phase.  "
+                                  "Do you want to overwrite the earlier session with this session's data? [y/N]:  ")
+            if is_affirmative(overwrite_raw):
+                session_data.overwrite_confirmed = True
+                return True
+
+            exit_raw = input("Exit this session without saving? [y/N]:  ")
+            if is_affirmative(exit_raw):
+                session_data.overwrite_confirmed = False
+                return False
+
+            _prompt_correct_meta(session_data)
+            continue
+
+        overwrite_raw = input("A training session has already been recorded today for this animal/phase.  "
+                              "Do you want to overwrite the earlier session with this session's data? [y/N]:  ")
+        if is_affirmative(overwrite_raw):
+            session_data.overwrite_confirmed = True
+            return True
+
+        exit_raw = input("Exit this session without saving? [y/N]:  ")
+        if is_affirmative(exit_raw):
+            session_data.overwrite_confirmed = False
+            return False
+
+        _prompt_correct_meta(session_data)
+
+
 def save_data(session_data):
     workbook_id = session_data.meta.get("workbook_id")
 
@@ -1379,6 +1533,9 @@ def save_data(session_data):
             lock.reset()
 
             start_col, overwrite = _find_cols(ws)
+            if overwrite and not getattr(session_data, "overwrite_confirmed", False):
+                raise RuntimeError("Refusing to overwrite existing session data without save-protocol confirmation")
+
             needed_cols = start_col + 1
 
             if ws.col_count < needed_cols:
@@ -1835,7 +1992,7 @@ def _resolve_workbook(animal_id, animal_map):
 
 
 def _prompt_phase():
-    valid_phases = {"0", "1"} | set(PHASE_CONFIG.keys())
+    valid_phases = _valid_phases()
 
     while True:
         phase_id = input('Training Phase:  ').strip()
@@ -1980,17 +2137,42 @@ def _cursor_connect(phase_id, side):
     return cursor, easy
 
 
-def _redis_init():
-    client_id = str(os.getenv("CLIENT_ID"))
+def _utc_iso():
+    return datetime.now(timezone.utc).isoformat(timespec='seconds').replace('+00:00', 'Z')
 
-    remove_entry(f"client:{client_id}:state")
-    add_entry(f"client:{client_id}:state", "running")
+
+def _redis_write(key, value):
+    remove_entry(key)
+    add_entry(key, str(value))
+
+
+def _redis_session_key(client_id, field):
+    return f"client:{client_id}:session:{field}"
+
+
+def _redis_clear_session(client_id):
+    for field in ("animal", "phase", "start_utc", "stop_utc"):
+        remove_entry(_redis_session_key(client_id, field))
+
+
+def _redis_init(session_data):
+    client_id = str(os.getenv("CLIENT_ID"))
+    start_utc = _utc_iso()
+
+    _redis_clear_session(client_id)
+
+    _redis_write(_redis_session_key(client_id, "animal"), session_data.meta.get("animal", ""))
+    _redis_write(_redis_session_key(client_id, "phase"), session_data.meta.get("phase", ""))
+    _redis_write(_redis_session_key(client_id, "start_utc"), start_utc)
+
+    _redis_write(f"client:{client_id}:state", "running")
 
 
 def _redis_deinit():
     client_id = str(os.getenv("CLIENT_ID"))
-    remove_entry(f"client:{client_id}:state")
-    add_entry(f"client:{client_id}:state", "finished")
+
+    _redis_write(_redis_session_key(client_id, "stop_utc"), _utc_iso())
+    _redis_write(f"client:{client_id}:state", "finished")
 
     original_read_key = keyboard.read_key
 
@@ -1998,10 +2180,11 @@ def _redis_deinit():
         try:
             return original_read_key(*args, **kwargs)
         finally:
-            remove_entry(f"client:{client_id}:state")
-            add_entry(f"client:{client_id}:state", "idle")
-            keyboard.read_key = original_read_key
+            _redis_write(f"client:{client_id}:state", "idle")
+            _redis_clear_session(client_id)
 
+            keyboard.read_key = original_read_key
+    
     keyboard.read_key = _read_key_and_set_idle
 
 
@@ -2066,7 +2249,7 @@ def setup():
         print('Running session...\n', flush=True)
         _send_start(link)
 
-        _redis_init()
+        _redis_init(session_data)
 
         return link, session_data, cursor, client
     except Exception as e:
@@ -2344,11 +2527,14 @@ if __name__ == "__main__":
                     cmd_run('echo.')
                     
                     if save_choice in {"", "y", "yes"}:
-                        save_raw(session_data)
+                        if resolve_save_protocol(session_data):
+                            save_raw(session_data)
 
-                        ok = safe_save(session_data)
-                        if not ok:
-                            print("[WARNING] Google Sheets save failed (local fallback used instead)", flush=True)
+                            ok = safe_save(session_data)
+                            if not ok:
+                                print("[WARNING] Google Sheets save failed (local fallback used instead)", flush=True)
+                        else:
+                            print("Session exited without saving", flush=True)
                 except Exception as e:
                     cache_exc(e, '__main__.safe_save')
 
