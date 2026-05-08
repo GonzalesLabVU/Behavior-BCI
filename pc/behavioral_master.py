@@ -59,6 +59,8 @@ ERROR_LOG_PATH = SCRIPT_DIR / "errors.log"
 load_dotenv(SCRIPT_DIR / ".env")
 
 BAUDRATE = 1_000_000
+EPHYS_START_STRING = "R1"
+EPHYS_STOP_STRING = "R2"
 EARLY_STRING = "E"
 FINISH_STRING = "S"
 RESTART_STRING = "R"
@@ -642,6 +644,7 @@ class SessionData:
             "t_stop": None,
             "duration_sec": None,
             "imaging_active": False,
+            "ephys_active": False,
             "K1": 5,
             "K2": None,
             "easy_trials": [],
@@ -2034,6 +2037,12 @@ def _prompt_imaging():
     return is_affirmative(imaging_raw)
 
 
+def _prompt_ephys():
+    ephys_raw = input("Ephys active? [y/N]:  ")
+
+    return is_affirmative(ephys_raw)
+
+
 def _get_arduino(ser):
     link = ArduinoLink(ser)
 
@@ -2219,6 +2228,7 @@ def setup():
             raise RuntimeError(f'No Arduino detected (required for phase {phase_id})')
 
         imaging_active = _prompt_imaging()
+        ephys_active = _prompt_ephys()
 
         print('\nInitializing resources...', flush=True)
 
@@ -2241,13 +2251,18 @@ def setup():
                 raise RuntimeError(f'[ERROR] Failed during initial trial config handshake: {e}') from e
         
         session_data = SessionData(animal_id, str(phase_id), _get_date())
+
         session_data.meta['workbook_id'] = workbook_id
         session_data.meta['imaging_active'] = bool(client is not None)
+        session_data.meta['ephys_active'] = bool(ephys_active)
 
         log_trial_config(session_data, trial_n=1, type=easy, side=side)
 
         print('Running session...\n', flush=True)
         _send_start(link)
+
+        if ephys_active:
+            link.send_and_wait(EPHYS_START_STRING)
 
         _redis_init(session_data)
 
@@ -2274,6 +2289,7 @@ def main(link, session_data, cursor, client=None):
     do_calibration = int(session_data.meta['phase']) > 4
     imaging_active = (bool(session_data.meta.get('imaging_active', False))
                       and (client is not None))
+    ephys_active = bool(session_data.meta.get('ephys_active', False))
 
     K = 5
     N = 20
@@ -2448,6 +2464,12 @@ def main(link, session_data, cursor, client=None):
         t1 = session_data.meta['t_stop']
         dt = 0 if (t0 is None or t1 is None) else max(0, (t1 - t0) // 1000)
         session_data.meta["duration_sec"] = int(dt)
+
+        if ephys_active:
+            try:
+                link.send_and_wait(EPHYS_STOP_STRING)
+            except Exception as e:
+                cache_exc(e, 'main.ephys_stop')
 
         if client is not None:
             client.stop()
