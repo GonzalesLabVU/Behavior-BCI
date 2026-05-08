@@ -41,6 +41,7 @@ constexpr float DEGREES(T d) { return static_cast<float>(d); }
 #define RAW_FLAG false
 #define SEED_PIN A0
 #define POWER_EN 7
+#define EPHYS_TTL 22
 
 static constexpr uint32_t RAW_HZ = 100;
 static constexpr uint32_t RAW_US = 1000000UL / RAW_HZ;
@@ -320,6 +321,9 @@ static void waitForHandshake() {
             return;
         }
 
+        // TTL output state
+        if (handleTTLCommand(line)) continue;
+
         // trial config settings
         {
             char tmp[96];
@@ -423,6 +427,24 @@ static void drainSerial() {
     }
 }
 
+static bool handleTTLCommand(const char* line) {
+    if (strcmp(line, "R1") == 0) {
+        digitalWrite(EPHYS_TTL, HIGH);
+        logger.ack();
+
+        return true;
+    }
+
+    if (strcmp(line, "R2") == 0) {
+        digitalWrite(EPHYS_TTL, LOW);
+        logger.ack();
+
+        return true;
+    }
+
+    return false;
+}
+
 // ---------------------------
 // DATA HELPERS
 // ---------------------------
@@ -511,6 +533,9 @@ void setup() {
 
     pinMode(POWER_EN, OUTPUT);
     digitalWrite(POWER_EN, LOW);
+
+    pinMode(EPHYS_TTL, OUTPUT);
+    digitalWrite(EPHYS_TTL, LOW);
 
     Serial.begin(BAUDRATE);
     randomSeed(analogRead(SEED_PIN));
@@ -802,7 +827,7 @@ void run_phase_1() {
 }
 
 void run_phase_2() {
-    switch (phase_state) {        
+    switch (phase_state) {
         case PhaseState::IDLE: {
             if (!session_initialized) {
                 brake.release();
@@ -816,7 +841,7 @@ void run_phase_2() {
 
             break;
         }
-        
+
         case PhaseState::CUE: {
             // entry
             if (!phase_timer.started()) {
@@ -844,7 +869,7 @@ void run_phase_2() {
 
             break;
         }
-        
+
         case PhaseState::TRIAL: {
             // entry
             if (!phase_timer.started()) {
@@ -967,7 +992,7 @@ void run_phase_2() {
 
             break;
         }
-        
+
         case PhaseState::DELAY: {
             if (session_timer.isRunning()) {
                 // entry
