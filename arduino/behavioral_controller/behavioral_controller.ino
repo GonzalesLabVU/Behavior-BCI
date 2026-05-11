@@ -321,9 +321,6 @@ static void waitForHandshake() {
             return;
         }
 
-        // TTL output state
-        if (handleTTLCommand(line)) continue;
-
         // trial config settings
         {
             char tmp[96];
@@ -427,7 +424,21 @@ static void drainSerial() {
     }
 }
 
-static bool handleTTLCommand(const char* line) {
+static bool handleTTLCommand() {
+    if (!Serial.available()) return false;
+
+    if (Serial.peek() != 'R') return false;
+
+    char line[8];
+    size_t n = Serial.readBytesUntil('\n', line, sizeof(line) - 1);
+    if (n == 0) return false;
+
+    line[n] = '\0';
+
+    while (n && (line[n-1] == '\r' || line[n-1] == ' ' || line[n-1] == '\t')) {
+        line[--n] = '\0';
+    }
+
     if (strcmp(line, "R1") == 0) {
         digitalWrite(EPHYS_TTL, HIGH);
         logger.ack();
@@ -438,6 +449,8 @@ static bool handleTTLCommand(const char* line) {
     if (strcmp(line, "R2") == 0) {
         digitalWrite(EPHYS_TTL, LOW);
         logger.ack();
+
+        session_state = SessionState::CLEANUP;
 
         return true;
     }
@@ -586,6 +599,7 @@ void setup() {
 
     wheel.init(easy_threshold, session_cfg.threshold, trial_cfg.side, session_cfg.reverse);
 
+    handleTTLCommand();
     parseStartCommand();
 
     raw_timer.init(sample_T);
@@ -597,6 +611,7 @@ void setup() {
 
 void loop() {
     drainSerial();
+    handleTTLCommand();
 
     switch (session_state) {
         case SessionState::MAIN: {
