@@ -378,6 +378,19 @@ static void drainSerial() {
     char line[96];
 
     while (readLine(line, sizeof(line))) {
+        // TTL triggering
+        if (strcmp(line, "R1") == 0) {
+            digitalWrite(EPHYS_TTL, HIGH);
+            logger.ack();
+            continue;
+        }
+
+        if (strcmp(line, "R2") == 0) {
+            digitalWrite(EPHYS_TTL, LOW);
+            logger.ack();
+            continue;
+        }
+
         // control override messages
         if (strcmp(line, "E") == 0) {
             session_state = SessionState::CLEANUP;
@@ -449,8 +462,6 @@ static bool handleTTLCommand() {
     if (strcmp(line, "R2") == 0) {
         digitalWrite(EPHYS_TTL, LOW);
         logger.ack();
-
-        session_state = SessionState::CLEANUP;
 
         return true;
     }
@@ -641,7 +652,9 @@ void loop() {
         }
 
         case SessionState::CLEANUP: {
+            digitalWrite(EPHYS_TTL, LOW);
             logger.write("S");
+
             brake.engage();
 
             phase_timer.reset();
