@@ -2197,6 +2197,20 @@ def _redis_deinit():
     keyboard.read_key = _read_key_and_set_idle
 
 
+def _ephys_safe_stop(link, session_data):
+    if not session_data.meta.get("ephys_active", False):
+        return
+
+    if session_data.meta.get("_ephys_stopped", False):
+        return
+
+    try:
+        link.send_and_wait(EPHYS_STOP_STRING, timeout=2.0)
+        session_data.meta['_ephys_stopped'] = True
+    except Exception as e:
+        cache_exc(e, 'main.ephys_stop')
+
+
 def setup():
     ser = None
     link = None
@@ -2337,6 +2351,9 @@ def main(link, session_data, cursor, client=None):
                 raise RuntimeError(f"\nArduinoLink reader error: {payload!r}")
 
             if typ == "END":
+                if ephys_active:
+                    session_data.meta['_ephys_stopped'] = True
+
                 break
 
             if typ == "RAW":
@@ -2418,6 +2435,8 @@ def main(link, session_data, cursor, client=None):
                                     time.sleep(1)
                                     client.finish()
 
+                                _ephys_safe_stop(link, session_data)
+
                                 cleanup(link, 'Terminated by early exit')
                                 break
 
@@ -2451,12 +2470,7 @@ def main(link, session_data, cursor, client=None):
     except KeyboardInterrupt:
         session_data.meta["aborted"] = True
 
-        if ephys_active:
-            try:
-                link.send_and_wait(EPHYS_STOP_STRING)
-            except Exception as e:
-                cache_exc(e, 'main.ephys_stop')
-
+        _ephys_safe_stop(link, session_data)
         cleanup(link, "\nTerminated by KeyboardInterrupt")
         raise
     except Exception as e:
@@ -2472,11 +2486,7 @@ def main(link, session_data, cursor, client=None):
         dt = 0 if (t0 is None or t1 is None) else max(0, (t1 - t0) // 1000)
         session_data.meta["duration_sec"] = int(dt)
 
-        if ephys_active:
-            try:
-                link.send_and_wait(EPHYS_STOP_STRING)
-            except Exception as e:
-                cache_exc(e, 'main.ephys_stop')
+        _ephys_safe_stop(link, session_data)
 
         if client is not None:
             client.stop()
