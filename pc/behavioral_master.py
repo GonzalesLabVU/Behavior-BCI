@@ -2258,11 +2258,11 @@ def setup():
 
         log_trial_config(session_data, trial_n=1, type=easy, side=side)
 
-        print('Running session...\n', flush=True)
-        _send_start(link)
-
         if ephys_active:
             link.send_and_wait(EPHYS_START_STRING)
+
+        print('Running session...\n', flush=True)
+        _send_start(link)
 
         _redis_init(session_data)
 
@@ -2450,6 +2450,13 @@ def main(link, session_data, cursor, client=None):
                     pass
     except KeyboardInterrupt:
         session_data.meta["aborted"] = True
+
+        if ephys_active:
+            try:
+                link.send_and_wait(EPHYS_STOP_STRING)
+            except Exception as e:
+                cache_exc(e, 'main.ephys_stop')
+
         cleanup(link, "\nTerminated by KeyboardInterrupt")
         raise
     except Exception as e:
