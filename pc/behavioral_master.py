@@ -19,7 +19,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from queue import Queue, Empty
 from collections import deque
-from threading import Thread, Event
+from threading import Thread, Event, Lock
 
 import serial
 import serial.tools.list_ports
@@ -538,6 +538,7 @@ class ArduinoLink:
         self.active = ser is not None and ser.is_open
         self.stop_evt = Event()
         self.ack_evt = Event()
+        self.write_lock = Lock()
         self.msg_q: "Queue[tuple[str, str, object]]" = Queue()
         self._reader = Thread(target=self._reader_loop, daemon=True)
 
@@ -608,27 +609,61 @@ class ArduinoLink:
 
     def send_and_wait(self, text, timeout=5.0):
         if not self.active:
-            return
+            return True
         
-        if VERBOSE:
-            print(f'ArduinoLink.send_and_wait  |  {text}', flush=True)
+        with self.write_lock:
+            if VERBOSE:
+                print(f'ArduinoLink.send_and_wait  |  {text}', flush=True)
 
-        self.ack_evt.clear()
-        self.ser.write((text.strip() + "\n").encode("utf-8"))
-        self.ser.flush()
+            self.ack_evt.clear()
+            self.ser.write((text.strip() + "\n").encode("utf-8"))
+            self.ser.flush()
 
-        if not self.ack_evt.wait(timeout=timeout):
-            raise TimeoutError(f"No ACK after sending: {text!r}")
+            if not self.ack_evt.wait(timeout=timeout):
+                raise TimeoutError(f'No ACK after sending: {text!r}')
+
+        return True
 
     def send(self, text):
         if not self.active:
-            return
+            return True
         
-        if VERBOSE:
-            print(f'ArduinoLink.send  |  {text}', flush=True)
-        
-        self.ser.write((text.strip() + "\n").encode("utf-8"))
-        self.ser.flush()
+        with self.write_lock:
+            if VERBOSE:
+                print(f'ArduinoLink.send  |  {text}', flush=True)
+            
+            self.ser.write((text.strip() + "\n").encode("utf-8"))
+            self.ser.flush()
+
+        return True
+
+
+class TTLController:
+    def __init__(self, link):
+        self.link = link
+
+    def _send_after(self, cmd, delay_s=0.0, timeout=5.0):
+        def worker():
+            if delay_s > 0:
+                time.sleep(float(delay_s))
+
+            self.link.send_and_wait(cmd, timeout=timeout)
+
+        Thread(target=worker, daemon=True).start()
+
+        return True
+
+    def start(self, timeout=5.0):
+        self.link.send_and_wait(EPHYS_START_STRING, timeout=timeout)
+
+    def stop(self, timeout=5.0):
+        self.link.send_and_wait(EPHYS_STOP_STRING, timeout=timeout)
+
+    def start_after(self, delay_s=0.0, timeout=5.0):
+        return self._send_after("img_start", delay_s=delay_s, timeout=timeout)
+    
+    def stop_after(self, delay_s=0.0, timeout=5.0):
+        return self._send_after("img_stop", delay_s=delay_s, timeout=timeout)
 
 
 class SessionData:
@@ -1801,7 +1836,6 @@ def send_email(session_data):
 # ---------------------------
 # EXIT
 # ---------------------------
-# @pad_verbose_output
 def is_early_exit(evt, index, end_ms, min_duration=20*60, min_trials=150):
     width = 5
 
@@ -2060,7 +2094,15 @@ def _send_flush(link, flush):
     except Exception as e:
         link.close()
         raise RuntimeError(f'[ERROR] Failed during flush command handshake: {e}') from e
-    
+
+
+def _send_ephys(link, ephys_active):
+    try:
+        link.send_and_wait(f"ephys {'1' if ephys_active else '0'}")
+    except Exception as e:
+        link.close()
+        raise RuntimeError(f'[ERROR] Failed during ephys flag handshake: {e}') from e
+
 
 def _send_start(link):
     try:
@@ -2197,7 +2239,7 @@ def _redis_deinit():
     keyboard.read_key = _read_key_and_set_idle
 
 
-def _ephys_safe_stop(link, session_data):
+def _ephys_safe_stop(ttl, session_data):
     if not session_data.meta.get("ephys_active", False):
         return
 
@@ -2205,7 +2247,7 @@ def _ephys_safe_stop(link, session_data):
         return
 
     try:
-        link.send_and_wait(EPHYS_STOP_STRING, timeout=2.0)
+        ttl.stop()
         session_data.meta['_ephys_stopped'] = True
     except Exception as e:
         cache_exc(e, 'main.ephys_stop')
@@ -2214,6 +2256,7 @@ def _ephys_safe_stop(link, session_data):
 def setup():
     ser = None
     link = None
+    ttl = None
     client = None
     cursor = None
 
@@ -2222,7 +2265,9 @@ def setup():
 
     try:
         ser, arduino_found = _serial_connect()
+
         link = _get_arduino(ser)
+        ttl = TTLController(link)
 
         flush_spout = _prompt_flush()
 
@@ -2251,6 +2296,7 @@ def setup():
         side = settings['side']
             
         _send_config(link, phase_id, settings)
+        _send_ephys(link, ephys_active)
         
         client = _client_connect(imaging_active)
 
@@ -2273,14 +2319,14 @@ def setup():
         log_trial_config(session_data, trial_n=1, type=easy, side=side)
 
         if ephys_active:
-            link.send_and_wait(EPHYS_START_STRING)
+            ttl.start()
 
         print('Running session...\n', flush=True)
         _send_start(link)
 
         _redis_init(session_data)
 
-        return link, session_data, cursor, client
+        return link, ttl, session_data, cursor, client
     except Exception as e:
         cache_exc(e, 'setup')
 
@@ -2299,7 +2345,7 @@ def setup():
         raise
 
 
-def main(link, session_data, cursor, client=None):
+def main(link, ttl, session_data, cursor, client=None):
     do_calibration = int(session_data.meta['phase']) > 4
     imaging_active = (bool(session_data.meta.get('imaging_active', False))
                       and (client is not None))
@@ -2371,8 +2417,12 @@ def main(link, session_data, cursor, client=None):
                     session_data.add_evt(ts, p)
 
                     if imaging_active and first_trial:
-                        if not client.start():
+                        client_ok = client.start()
+                        ttl_ok = ttl.start_after(delay_s=0.0)
+
+                        if not (client_ok and ttl_ok):
                             raise RuntimeError('Initial START command failed')
+
                         first_trial = False
                     
                     trial_n += 1
@@ -2390,9 +2440,13 @@ def main(link, session_data, cursor, client=None):
                     session_data.add_evt(ts, p)
 
                     if imaging_active:
-                        stop_ok = client.stop_after(delay_s=1.0)
-                        start_ok = client.start_after(delay_s=3.0)
-                        if not (stop_ok and start_ok):
+                        client_stop_ok = client.stop_after(delay_s=1.0)
+                        ttl_stop_ok = ttl.stop_after(delay_s=1.0)
+
+                        client_start_ok = client.start_after(delay_s=3.0)
+                        ttl_start_ok = ttl.start_after(delay_s=3.0)
+
+                        if not (client_stop_ok and ttl_stop_ok and client_start_ok and ttl_start_ok):
                             raise RuntimeError('Failed to schedule imaging restart')
 
                     end_ms = _ts_to_ms(ts)
@@ -2435,7 +2489,7 @@ def main(link, session_data, cursor, client=None):
                                     time.sleep(1)
                                     client.finish()
 
-                                _ephys_safe_stop(link, session_data)
+                                _ephys_safe_stop(ttl, session_data)
 
                                 cleanup(link, 'Terminated by early exit')
                                 break
@@ -2470,7 +2524,7 @@ def main(link, session_data, cursor, client=None):
     except KeyboardInterrupt:
         session_data.meta["aborted"] = True
 
-        _ephys_safe_stop(link, session_data)
+        _ephys_safe_stop(ttl, session_data)
         cleanup(link, "\nTerminated by KeyboardInterrupt")
         raise
     except Exception as e:
@@ -2486,7 +2540,7 @@ def main(link, session_data, cursor, client=None):
         dt = 0 if (t0 is None or t1 is None) else max(0, (t1 - t0) // 1000)
         session_data.meta["duration_sec"] = int(dt)
 
-        _ephys_safe_stop(link, session_data)
+        _ephys_safe_stop(ttl, session_data)
 
         if client is not None:
             client.stop()
@@ -2498,9 +2552,10 @@ if __name__ == "__main__":
     cmd_run('cls')
 
     link = None
+    ttl = None
     session_data = None
     cursor = None
-    prairie_host = None
+    prairie = None
 
     animal_id_for_log = "UNKNOWN"
     phase_id_for_log = "0"
@@ -2508,13 +2563,13 @@ if __name__ == "__main__":
     run_exc = None
 
     try:
-        link, session_data, cursor, prairie_host = setup()
+        link, ttl, session_data, cursor, prairie = setup()
 
         if session_data is not None:
             animal_id_for_log = session_data.meta.get("animal", "UNKNOWN")
             phase_id_for_log = session_data.meta.get("phase", "0")
 
-        main(link, session_data, cursor, prairie_host)
+        main(link, ttl, session_data, cursor, prairie)
     except SystemExit as e:
         pass
     except KeyboardInterrupt as e:
@@ -2526,13 +2581,13 @@ if __name__ == "__main__":
         print_summary(session_data)
         run_info = (animal_id_for_log, phase_id_for_log)
 
-        if prairie_host is not None:
+        if prairie is not None:
             try:
-                prairie_host.finish()
+                prairie.finish()
 
                 if session_data is not None:
-                    session_data.img['start_ts'] = list(getattr(prairie_host, 'start_ts', []) or [])
-                    session_data.img['stop_ts'] = list(getattr(prairie_host, 'stop_ts', []) or [])
+                    session_data.img['start_ts'] = list(getattr(prairie, 'start_ts', []) or [])
+                    session_data.img['stop_ts'] = list(getattr(prairie, 'stop_ts', []) or [])
             except Exception as e:
                 cache_exc(e, '__main__.prairie_finish')
                 log_and_commit(*run_info, e)
