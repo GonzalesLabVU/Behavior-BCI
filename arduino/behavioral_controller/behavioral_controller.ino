@@ -41,7 +41,14 @@ constexpr float DEGREES(T d) { return static_cast<float>(d); }
 #define RAW_FLAG false
 #define SEED_PIN A0
 #define POWER_EN 7
-#define EPHYS_TTL 22
+#define RECORD_TTL 22
+#define EVENT_TTL 23
+
+#define LICK_TTL_MS 50
+#define CUE_TTL_MS 100
+#define HITMISS_TTL_MS 150
+#define IMG_START_TTL_MS 200
+#define IMG_STOP_TTL_MS 250
 
 static constexpr uint32_t RAW_HZ = 100;
 static constexpr uint32_t RAW_US = 1000000UL / RAW_HZ;
@@ -83,6 +90,7 @@ struct SessionConfig {
     char side = 'B';
     bool reverse = false;
     bool flush = false;
+    bool ephys = false;
 };
 
 struct TrialConfig {
@@ -106,6 +114,10 @@ static bool session_initialized = false;
 static bool trial_hit = false;
 static bool reward_given = false;
 static long last_disp_mark = LONG_MIN;
+
+static bool event_ttl_active = false;
+static unsigned long event_ttl_start_ms = 0;
+static unsigned long event_ttl_duration_ms = 0;
 
 // ---------------------------
 // SERIAL HELPERS
@@ -230,6 +242,13 @@ static bool parseKeyValue(char* line) {
         session_cfg.phase = (int)v;
         return true;
     }
+    if (strcmp(key, "ephys") == 0) {
+        long v = strtol(val, nullptr, 10);
+        if (!(v == 0 || v == 1)) return false;
+
+        session_cfg.ephys = (v == 1);
+        return true;
+    }
 
     return false;
 }
@@ -306,6 +325,7 @@ static void waitForHandshake() {
     bool have_reverse = false;
     bool have_trial = false;
     bool have_phase = false;
+    bool have_ephys = false;
 
     session_cfg.phase = 0;
 
@@ -348,6 +368,7 @@ static void waitForHandshake() {
                 if (strncmp(line, "side", 4) == 0) have_side = true;
                 if (strncmp(line, "reverse", 7) == 0) have_reverse = true;
                 if (strncmp(line, "phase", 5) == 0) have_phase = true;
+                if (strncmp(line, "ephys", 5) == 0) have_ephys = true;
 
                 logger.ack();
             }
@@ -358,7 +379,7 @@ static void waitForHandshake() {
 
         if (have_engage && have_release && have_pulse &&
             have_threshold && have_side && have_reverse && have_phase &&
-            (!trial_required || have_trial)) {
+            have_ephys && (!trial_required || have_trial)) {
 
             applyPhaseDefaults(session_cfg.phase);
 
@@ -380,13 +401,25 @@ static void drainSerial() {
     while (readLine(line, sizeof(line))) {
         // TTL triggering
         if (strcmp(line, "R1") == 0) {
-            digitalWrite(EPHYS_TTL, HIGH);
+            digitalWrite(RECORD_TTL, HIGH);
             logger.ack();
             continue;
         }
 
         if (strcmp(line, "R2") == 0) {
-            digitalWrite(EPHYS_TTL, LOW);
+            digitalWrite(RECORD_TTL, LOW);
+            logger.ack();
+            continue;
+        }
+
+        if (strcmp(line, "img_start") == 0) {
+            sendEventTTL(IMG_START_TTL_MS);
+            logger.ack();
+            continue;
+        }
+
+        if (strcmp(line, "img_stop") == 0) {
+            sendEventTTL(IMG_STOP_TTL_MS);
             logger.ack();
             continue;
         }
@@ -453,14 +486,14 @@ static bool handleTTLCommand() {
     }
 
     if (strcmp(line, "R1") == 0) {
-        digitalWrite(EPHYS_TTL, HIGH);
+        digitalWrite(RECORD_TTL, HIGH);
         logger.ack();
 
         return true;
     }
 
     if (strcmp(line, "R2") == 0) {
-        digitalWrite(EPHYS_TTL, LOW);
+        digitalWrite(RECORD_TTL, LOW);
         logger.ack();
 
         return true;
@@ -543,6 +576,31 @@ static void checkInactivity(float current_disp) {
 }
 
 // ---------------------------
+// TTL HELPERS
+// ---------------------------
+void sendEventTTL(unsigned long duration_ms) {
+    if (!session_cfg.ephys) return;
+    if (event_ttl_active) return;
+
+    event_ttl_active = true;
+    event_ttl_start_ms = millis();
+    event_ttl_duration_ms = duration_ms;
+
+    digitalWrite(EVENT_TTL, HIGH);
+}
+
+void serviceEventTTL() {
+    if (!event_ttl_active) return;
+
+    if ((unsigned long)(millis() - event_ttl_start_ms) >= event_ttl_duration_ms) {
+        digitalWrite(EVENT_TTL, LOW);
+
+        event_ttl_active = false;
+        event_ttl_duration_ms = 0;
+    }
+}
+
+// ---------------------------
 // TOP LEVEL
 // ---------------------------
 void run_phase_0();
@@ -558,8 +616,10 @@ void setup() {
     pinMode(POWER_EN, OUTPUT);
     digitalWrite(POWER_EN, LOW);
 
-    pinMode(EPHYS_TTL, OUTPUT);
-    digitalWrite(EPHYS_TTL, LOW);
+    pinMode(RECORD_TTL, OUTPUT);
+    digitalWrite(RECORD_TTL, LOW);
+    pinMode(EVENT_TTL, OUTPUT);
+    digitalWrite(EVENT_TTL, LOW);
 
     Serial.begin(BAUDRATE);
     randomSeed(analogRead(SEED_PIN));
@@ -621,6 +681,8 @@ void setup() {
 }
 
 void loop() {
+    serviceEventTTL();
+
     drainSerial();
     handleTTLCommand();
 
@@ -652,7 +714,12 @@ void loop() {
         }
 
         case SessionState::CLEANUP: {
-            digitalWrite(EPHYS_TTL, LOW);
+            digitalWrite(RECORD_TTL, LOW);
+            digitalWrite(EVENT_TTL, LOW);
+
+            event_ttl_active = false;
+            event_ttl_duration_ms = 0;
+
             logger.write("S");
 
             brake.engage();
@@ -690,6 +757,7 @@ void run_phase_0() {
                 phase_timer.start();
 
                 logger.write("cue");
+                sendEventTTL(CUE_TTL_MS);
             }
             else {
                 if (!phase_timer.isRunning()) {
@@ -713,6 +781,7 @@ void run_phase_0() {
 
                     if (lick.justTouched()) {
                         logger.write("lick");
+                        sendEventTTL(LICK_TTL_MS);
                     }
                 }
                 else {
@@ -731,6 +800,7 @@ void run_phase_0() {
                 phase_timer.start();
 
                 logger.write("hit");
+                sendEventTTL(HITMISS_TTL_MS);
             }
             else {
                 if (!phase_timer.isRunning()) {
@@ -785,6 +855,7 @@ void run_phase_1() {
             // entry
             if (!phase_timer.started()) {
                 logger.write("hit");
+                sendEventTTL(HITMISS_TTL_MS);
 
                 phase_timer.init(tone_T);
                 phase_timer.start();
@@ -825,8 +896,9 @@ void run_phase_1() {
                 lick.sampleFiltered();
                 if (lick.justTouched()) {
                     logger.write("lick");
-                    phase_timer.reset();
+                    sendEventTTL(LICK_TTL_MS);
 
+                    phase_timer.reset();
                     phase_state = PhaseState::HIT;
                 }
                 else if (!phase_timer.isRunning()) {
@@ -874,6 +946,7 @@ void run_phase_2() {
             // entry
             if (!phase_timer.started()) {
                 logger.write("cue");
+                sendEventTTL(CUE_TTL_MS);
 
                 phase_timer.init(tone_T);
                 phase_timer.start();
@@ -885,6 +958,7 @@ void run_phase_2() {
                     lick.sampleFiltered();
                     if (lick.justTouched()) {
                         logger.write("lick");
+                        sendEventTTL(LICK_TTL_MS);
                     }
                 }
                 // exit
@@ -916,6 +990,7 @@ void run_phase_2() {
                     lick.sampleFiltered();
                     if (lick.justTouched()) {
                         logger.write("lick");
+                        sendEventTTL(LICK_TTL_MS);
                     }
 
                     wheel.update();
@@ -965,6 +1040,7 @@ void run_phase_2() {
             // entry
             if (!phase_timer.started()) {
                 logger.write("hit");
+                sendEventTTL(HITMISS_TTL_MS);
 
                 spout.pulse();
 
@@ -978,6 +1054,7 @@ void run_phase_2() {
                     lick.sampleFiltered();
                     if (lick.justTouched()) {
                         logger.write("lick");
+                        sendEventTTL(LICK_TTL_MS);
                     }
                 // exit
                 } else {
@@ -996,6 +1073,7 @@ void run_phase_2() {
             // entry
             if (!phase_timer.started()) {
                 logger.write("miss");
+                sendEventTTL(HITMISS_TTL_MS);
 
                 phase_timer.init(tone_T);
                 phase_timer.start();
@@ -1007,6 +1085,7 @@ void run_phase_2() {
                     lick.sampleFiltered();
                     if (lick.justTouched()) {
                         logger.write("lick");
+                        sendEventTTL(LICK_TTL_MS);
                     }
                 }
                 // exit
@@ -1035,6 +1114,7 @@ void run_phase_2() {
                         lick.sampleFiltered();
                         if (lick.justTouched()) {
                             logger.write("lick");
+                            sendEventTTL(LICK_TTL_MS);
                         }
                     }
                     // exit
@@ -1076,6 +1156,7 @@ void run_phase_3() {
             // entry
             if (!phase_timer.started()) {
                 logger.write("cue");
+                sendEventTTL(CUE_TTL_MS);
 
                 phase_timer.init(tone_T);
                 phase_timer.start();
@@ -1087,6 +1168,7 @@ void run_phase_3() {
                     lick.sampleFiltered();
                     if (lick.justTouched()) {
                         logger.write("lick");
+                        sendEventTTL(LICK_TTL_MS);
                     }
                 }
                 // exit
@@ -1118,6 +1200,7 @@ void run_phase_3() {
                     lick.sampleFiltered();
                     if (lick.justTouched()) {
                         logger.write("lick");
+                        sendEventTTL(LICK_TTL_MS);
                     }
 
                     wheel.update();
@@ -1167,6 +1250,8 @@ void run_phase_3() {
             // entry
             if (!phase_timer.started()) {
                 logger.write("hit");
+                sendEventTTL(HITMISS_TTL_MS);
+
                 speaker.hit();
                 spout.pulse();
 
@@ -1180,6 +1265,7 @@ void run_phase_3() {
                     lick.sampleFiltered();
                     if (lick.justTouched()) {
                         logger.write("lick");
+                        sendEventTTL(LICK_TTL_MS);
                     }
                 // exit
                 } else {
@@ -1198,6 +1284,8 @@ void run_phase_3() {
             // entry
             if (!phase_timer.started()) {
                 logger.write("miss");
+                sendEventTTL(HITMISS_TTL_MS);
+
                 speaker.miss();
 
                 phase_timer.init(tone_T);
@@ -1210,6 +1298,7 @@ void run_phase_3() {
                     lick.sampleFiltered();
                     if (lick.justTouched()) {
                         logger.write("lick");
+                        sendEventTTL(LICK_TTL_MS);
                     }
                 }
                 // exit
@@ -1238,6 +1327,7 @@ void run_phase_3() {
                         lick.sampleFiltered();
                         if (lick.justTouched()) {
                             logger.write("lick");
+                            sendEventTTL(LICK_TTL_MS);
                         }
                     }
                     // exit
@@ -1277,6 +1367,8 @@ void run_phase_4_plus() {
             // entry
             if (!phase_timer.started()) {
                 logger.write("cue");
+                sendEventTTL(CUE_TTL_MS);
+
                 speaker.cue();
 
                 phase_timer.init(tone_T);
@@ -1289,6 +1381,7 @@ void run_phase_4_plus() {
                     lick.sampleFiltered();
                     if (lick.justTouched()) {
                         logger.write("lick");
+                        sendEventTTL(LICK_TTL_MS);
                     }
                 }
                 // exit
@@ -1321,6 +1414,7 @@ void run_phase_4_plus() {
                     lick.sampleFiltered();
                     if (lick.justTouched()) {
                         logger.write("lick");
+                        sendEventTTL(LICK_TTL_MS);
                     }
 
                     wheel.update();
@@ -1372,6 +1466,8 @@ void run_phase_4_plus() {
             // entry
             if (!phase_timer.started()) {
                 logger.write("hit");
+                sendEventTTL(HITMISS_TTL_MS);
+
                 brake.engage();
                 speaker.hit();
 
@@ -1385,6 +1481,7 @@ void run_phase_4_plus() {
                     lick.sampleFiltered();
                     if (lick.justTouched()) {
                         logger.write("lick");
+                        sendEventTTL(LICK_TTL_MS);
                     }
 
                     if ((phase_timer.timeElapsed() >= (tone_T >> 1)) && !reward_given) {
@@ -1408,6 +1505,8 @@ void run_phase_4_plus() {
             // entry
             if (!phase_timer.started()) {
                 logger.write("miss");
+                sendEventTTL(HITMISS_TTL_MS);
+
                 brake.engage();
                 speaker.miss();
 
@@ -1421,11 +1520,8 @@ void run_phase_4_plus() {
                     lick.sampleFiltered();
                     if (lick.justTouched()) {
                         logger.write("lick");
+                        sendEventTTL(LICK_TTL_MS);
                     }
-
-                    // if (phase_timer.timeElapsed() >= (tone_T >> 3)) {
-                    //     brake.engage();
-                    // }
                 }
                 // exit
                 else {
@@ -1453,6 +1549,7 @@ void run_phase_4_plus() {
                         lick.sampleFiltered();
                         if (lick.justTouched()) {
                             logger.write("lick");
+                            sendEventTTL(LICK_TTL_MS);
                         }
                     }
                     // exit
