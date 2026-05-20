@@ -44,11 +44,9 @@ constexpr float DEGREES(T d) { return static_cast<float>(d); }
 #define RECORD_TTL 22
 #define EVENT_TTL 23
 
-#define LICK_TTL_MS 50
-#define CUE_TTL_MS 100
-#define HITMISS_TTL_MS 150
-#define IMG_START_TTL_MS 200
-#define IMG_STOP_TTL_MS 250
+const unsigned long EVENT_PULSE_US = 11111;
+const unsigned long EVENT_IPI_US = 11111;
+const unsigned long EVENT_TRAIN_GAP_US = 40000;
 
 static constexpr uint32_t RAW_HZ = 100;
 static constexpr uint32_t RAW_US = 1000000UL / RAW_HZ;
@@ -115,9 +113,11 @@ static bool trial_hit = false;
 static bool reward_given = false;
 static long last_disp_mark = LONG_MIN;
 
-static bool event_ttl_active = false;
-static unsigned long event_ttl_start_ms = 0;
-static unsigned long event_ttl_duration_ms = 0;
+// ---------------------------
+// FORWARD DECLARATIONS
+// ---------------------------
+int eventTypeToPulseCount(const String& eventType);
+bool sendPulseTrain(const String& eventType);
 
 // ---------------------------
 // SERIAL HELPERS
@@ -305,15 +305,39 @@ void parseStartCommand() {
     char line[96];
 
     for (;;) {
-        if (readLine(line, sizeof(line)) && parseStartLine(line)) {
-            logger.ack();
-            return;
+        if (readLine(line, sizeof(line))) {
+            if (strcmp(line, "R1") == 0) {
+                digitalWrite(RECORD_TTL, HIGH);
+                logger.ack();
+                continue;
+            }
+
+            if (strcmp(line, "R2") == 0) {
+                digitalWrite(RECORD_TTL, LOW);
+                logger.ack();
+                continue;
+            }
+
+            if (strcmp(line, "img_start") == 0) {
+                sendPulseTrain("img_start");
+                logger.ack();
+                continue;
+            }
+
+            if (strcmp(line, "img_stop") == 0) {
+                sendPulseTrain("img_stop");
+                logger.ack();
+                continue;
+            }
+
+            if (parseStartLine(line)) {
+                logger.ack();
+                return;
+            }
         }
 
         delay(10);
     }
-
-    logger.ack();
 }
 
 static void waitForHandshake() {
@@ -399,7 +423,6 @@ static void drainSerial() {
     char line[96];
 
     while (readLine(line, sizeof(line))) {
-        // TTL triggering
         if (strcmp(line, "R1") == 0) {
             digitalWrite(RECORD_TTL, HIGH);
             logger.ack();
@@ -413,18 +436,17 @@ static void drainSerial() {
         }
 
         if (strcmp(line, "img_start") == 0) {
-            sendEventTTL(IMG_START_TTL_MS);
+            sendPulseTrain("img_start");
             logger.ack();
             continue;
         }
 
         if (strcmp(line, "img_stop") == 0) {
-            sendEventTTL(IMG_STOP_TTL_MS);
+            sendPulseTrain("img_stop");
             logger.ack();
             continue;
         }
 
-        // control override messages
         if (strcmp(line, "E") == 0) {
             session_state = SessionState::CLEANUP;
             logger.ack();
@@ -444,7 +466,6 @@ static void drainSerial() {
             continue;
         }
 
-        // trial config settings
         {
             char tmp[96];
             strncpy(tmp, line, sizeof(tmp));
@@ -456,7 +477,6 @@ static void drainSerial() {
             }
         }
 
-        // session config settings
         {
             char tmp[96];
             strncpy(tmp, line, sizeof(tmp));
@@ -470,36 +490,41 @@ static void drainSerial() {
     }
 }
 
-static bool handleTTLCommand() {
-    if (!Serial.available()) return false;
+void writeSerial(const char* event) {
+    if (event == nullptr) return;
 
-    if (Serial.peek() != 'R') return false;
+    bool sent = false;
 
-    char line[8];
-    size_t n = Serial.readBytesUntil('\n', line, sizeof(line) - 1);
-    if (n == 0) return false;
-
-    line[n] = '\0';
-
-    while (n && (line[n-1] == '\r' || line[n-1] == ' ' || line[n-1] == '\t')) {
-        line[--n] = '\0';
+    // cue, r_cue
+    if (strcmp(event, "cue") == 0) {
+        logger.write("cue");
+        sent = true;
+    }
+    else if (strcmp(event, "r_cue") == 0) {
+        logger.write("r_cue");
+        sent = true;
     }
 
-    if (strcmp(line, "R1") == 0) {
-        digitalWrite(RECORD_TTL, HIGH);
-        logger.ack();
-
-        return true;
+    // hit, miss
+    else if (strcmp(event, "hit") == 0) {
+        logger.write("hit");
+        sent = true;
+    }
+    else if (strcmp(event, "miss") == 0) {
+        logger.write("miss");
+        sent = true;
     }
 
-    if (strcmp(line, "R2") == 0) {
-        digitalWrite(RECORD_TTL, LOW);
-        logger.ack();
-
-        return true;
+    // lick
+    else if (strcmp(event, "lick") == 0) {
+        logger.write("lick");
+        sent = true;
     }
 
-    return false;
+    // process pulse train
+    if (sent) {
+        sendPulseTrain(event);
+    }
 }
 
 // ---------------------------
@@ -553,7 +578,7 @@ static void checkInactivity(float current_disp) {
 
         if (!inactivity_timer.isRunning() && (remaining_ms > tone_T)) {
             speaker.cue();
-            logger.write("r_cue");
+            writeSerial("r_cue");
             
             cue_active = true;
             inactivity_timer.init(tone_T);
@@ -578,26 +603,38 @@ static void checkInactivity(float current_disp) {
 // ---------------------------
 // TTL HELPERS
 // ---------------------------
-void sendEventTTL(unsigned long duration_ms) {
-    if (!session_cfg.ephys) return;
-    if (event_ttl_active) return;
+int eventTypeToPulseCount(const String& eventType) {
+    if (eventType == "lick") return 1;
+    if (eventType == "cue") return 2;
+    if (eventType == "r_cue") return 2;
+    if (eventType == "hit") return 3;
+    if (eventType == "miss") return 3;
+    if (eventType == "img_start") return 4;
+    if (eventType == "img_stop") return 5;
 
-    event_ttl_active = true;
-    event_ttl_start_ms = millis();
-    event_ttl_duration_ms = duration_ms;
-
-    digitalWrite(EVENT_TTL, HIGH);
+    return 0;
 }
 
-void serviceEventTTL() {
-    if (!event_ttl_active) return;
+bool sendPulseTrain(const String& eventType) {
+    if (!session_cfg.ephys) return false;
 
-    if ((unsigned long)(millis() - event_ttl_start_ms) >= event_ttl_duration_ms) {
+    int count = eventTypeToPulseCount(eventType);
+    if (count <= 0) return false;
+
+    for (int i = 0; i < count; i++) {
+        digitalWrite(EVENT_TTL, HIGH);
+        delayMicroseconds(EVENT_PULSE_US);
+
         digitalWrite(EVENT_TTL, LOW);
 
-        event_ttl_active = false;
-        event_ttl_duration_ms = 0;
+        if (i < count - 1) {
+            delayMicroseconds(EVENT_IPI_US);
+        }
     }
+
+    delayMicroseconds(EVENT_TRAIN_GAP_US);
+
+    return true;
 }
 
 // ---------------------------
@@ -670,7 +707,6 @@ void setup() {
 
     wheel.init(easy_threshold, session_cfg.threshold, trial_cfg.side, session_cfg.reverse);
 
-    handleTTLCommand();
     parseStartCommand();
 
     raw_timer.init(sample_T);
@@ -681,10 +717,7 @@ void setup() {
 }
 
 void loop() {
-    serviceEventTTL();
-
     drainSerial();
-    handleTTLCommand();
 
     switch (session_state) {
         case SessionState::MAIN: {
@@ -716,9 +749,6 @@ void loop() {
         case SessionState::CLEANUP: {
             digitalWrite(RECORD_TTL, LOW);
             digitalWrite(EVENT_TTL, LOW);
-
-            event_ttl_active = false;
-            event_ttl_duration_ms = 0;
 
             logger.write("S");
 
@@ -756,8 +786,7 @@ void run_phase_0() {
                 phase_timer.init(tone_T);
                 phase_timer.start();
 
-                logger.write("cue");
-                sendEventTTL(CUE_TTL_MS);
+                writeSerial("cue");
             }
             else {
                 if (!phase_timer.isRunning()) {
@@ -780,8 +809,7 @@ void run_phase_0() {
                     lick.sampleFiltered();
 
                     if (lick.justTouched()) {
-                        logger.write("lick");
-                        sendEventTTL(LICK_TTL_MS);
+                        writeSerial("lick");
                     }
                 }
                 else {
@@ -799,8 +827,7 @@ void run_phase_0() {
                 phase_timer.init(tone_T);
                 phase_timer.start();
 
-                logger.write("hit");
-                sendEventTTL(HITMISS_TTL_MS);
+                writeSerial("hit");
             }
             else {
                 if (!phase_timer.isRunning()) {
@@ -854,8 +881,7 @@ void run_phase_1() {
         case PhaseState::HIT: {
             // entry
             if (!phase_timer.started()) {
-                logger.write("hit");
-                sendEventTTL(HITMISS_TTL_MS);
+                writeSerial("hit");
 
                 phase_timer.init(tone_T);
                 phase_timer.start();
@@ -866,7 +892,7 @@ void run_phase_1() {
                 if (phase_timer.isRunning()) {
                     lick.sampleFiltered();
                     if (lick.justTouched()) {
-                        logger.write("lick");
+                        writeSerial("lick");
                     }
 
                     if ((phase_timer.timeElapsed() >= (tone_T >> 1)) && !reward_given) {
@@ -895,8 +921,7 @@ void run_phase_1() {
 
                 lick.sampleFiltered();
                 if (lick.justTouched()) {
-                    logger.write("lick");
-                    sendEventTTL(LICK_TTL_MS);
+                    writeSerial("lick");
 
                     phase_timer.reset();
                     phase_state = PhaseState::HIT;
@@ -911,7 +936,6 @@ void run_phase_1() {
             }
             else {
                 spout.pulse();
-                logger.write("hit");
 
                 session_state = SessionState::CLEANUP;
             }
@@ -945,8 +969,7 @@ void run_phase_2() {
         case PhaseState::CUE: {
             // entry
             if (!phase_timer.started()) {
-                logger.write("cue");
-                sendEventTTL(CUE_TTL_MS);
+                writeSerial("cue");
 
                 phase_timer.init(tone_T);
                 phase_timer.start();
@@ -957,8 +980,7 @@ void run_phase_2() {
                 if (phase_timer.isRunning()) {
                     lick.sampleFiltered();
                     if (lick.justTouched()) {
-                        logger.write("lick");
-                        sendEventTTL(LICK_TTL_MS);
+                        writeSerial("lick");
                     }
                 }
                 // exit
@@ -989,8 +1011,7 @@ void run_phase_2() {
                 if (phase_timer.isRunning()) {
                     lick.sampleFiltered();
                     if (lick.justTouched()) {
-                        logger.write("lick");
-                        sendEventTTL(LICK_TTL_MS);
+                        writeSerial("lick");
                     }
 
                     wheel.update();
@@ -1039,8 +1060,7 @@ void run_phase_2() {
         case PhaseState::HIT: {
             // entry
             if (!phase_timer.started()) {
-                logger.write("hit");
-                sendEventTTL(HITMISS_TTL_MS);
+                writeSerial("hit");
 
                 spout.pulse();
 
@@ -1053,8 +1073,7 @@ void run_phase_2() {
                 if (phase_timer.isRunning()) {
                     lick.sampleFiltered();
                     if (lick.justTouched()) {
-                        logger.write("lick");
-                        sendEventTTL(LICK_TTL_MS);
+                        writeSerial("lick");
                     }
                 // exit
                 } else {
@@ -1072,8 +1091,7 @@ void run_phase_2() {
         case PhaseState::MISS: {
             // entry
             if (!phase_timer.started()) {
-                logger.write("miss");
-                sendEventTTL(HITMISS_TTL_MS);
+                writeSerial("miss");
 
                 phase_timer.init(tone_T);
                 phase_timer.start();
@@ -1084,8 +1102,7 @@ void run_phase_2() {
                 if (phase_timer.isRunning()) {
                     lick.sampleFiltered();
                     if (lick.justTouched()) {
-                        logger.write("lick");
-                        sendEventTTL(LICK_TTL_MS);
+                        writeSerial("lick");
                     }
                 }
                 // exit
@@ -1113,8 +1130,7 @@ void run_phase_2() {
                     if (phase_timer.isRunning()) {
                         lick.sampleFiltered();
                         if (lick.justTouched()) {
-                            logger.write("lick");
-                            sendEventTTL(LICK_TTL_MS);
+                            writeSerial("lick");
                         }
                     }
                     // exit
@@ -1155,8 +1171,7 @@ void run_phase_3() {
         case PhaseState::CUE: {
             // entry
             if (!phase_timer.started()) {
-                logger.write("cue");
-                sendEventTTL(CUE_TTL_MS);
+                writeSerial("cue");
 
                 phase_timer.init(tone_T);
                 phase_timer.start();
@@ -1167,8 +1182,7 @@ void run_phase_3() {
                 if (phase_timer.isRunning()) {
                     lick.sampleFiltered();
                     if (lick.justTouched()) {
-                        logger.write("lick");
-                        sendEventTTL(LICK_TTL_MS);
+                        writeSerial("lick");
                     }
                 }
                 // exit
@@ -1199,8 +1213,7 @@ void run_phase_3() {
                 if (phase_timer.isRunning()) {
                     lick.sampleFiltered();
                     if (lick.justTouched()) {
-                        logger.write("lick");
-                        sendEventTTL(LICK_TTL_MS);
+                        writeSerial("lick");
                     }
 
                     wheel.update();
@@ -1249,8 +1262,7 @@ void run_phase_3() {
         case PhaseState::HIT: {
             // entry
             if (!phase_timer.started()) {
-                logger.write("hit");
-                sendEventTTL(HITMISS_TTL_MS);
+                writeSerial("hit");
 
                 speaker.hit();
                 spout.pulse();
@@ -1264,8 +1276,7 @@ void run_phase_3() {
                 if (phase_timer.isRunning()) {
                     lick.sampleFiltered();
                     if (lick.justTouched()) {
-                        logger.write("lick");
-                        sendEventTTL(LICK_TTL_MS);
+                        writeSerial("lick");
                     }
                 // exit
                 } else {
@@ -1283,8 +1294,7 @@ void run_phase_3() {
         case PhaseState::MISS: {
             // entry
             if (!phase_timer.started()) {
-                logger.write("miss");
-                sendEventTTL(HITMISS_TTL_MS);
+                writeSerial("miss");
 
                 speaker.miss();
 
@@ -1297,8 +1307,7 @@ void run_phase_3() {
                 if (phase_timer.isRunning()) {
                     lick.sampleFiltered();
                     if (lick.justTouched()) {
-                        logger.write("lick");
-                        sendEventTTL(LICK_TTL_MS);
+                        writeSerial("lick");
                     }
                 }
                 // exit
@@ -1326,8 +1335,7 @@ void run_phase_3() {
                     if (phase_timer.isRunning()) {
                         lick.sampleFiltered();
                         if (lick.justTouched()) {
-                            logger.write("lick");
-                            sendEventTTL(LICK_TTL_MS);
+                            writeSerial("lick");
                         }
                     }
                     // exit
@@ -1366,8 +1374,7 @@ void run_phase_4_plus() {
         case PhaseState::CUE: {
             // entry
             if (!phase_timer.started()) {
-                logger.write("cue");
-                sendEventTTL(CUE_TTL_MS);
+                writeSerial("cue");
 
                 speaker.cue();
 
@@ -1380,8 +1387,7 @@ void run_phase_4_plus() {
                 if (phase_timer.isRunning()) {
                     lick.sampleFiltered();
                     if (lick.justTouched()) {
-                        logger.write("lick");
-                        sendEventTTL(LICK_TTL_MS);
+                        writeSerial("lick");
                     }
                 }
                 // exit
@@ -1413,8 +1419,7 @@ void run_phase_4_plus() {
                 if (phase_timer.isRunning()) {
                     lick.sampleFiltered();
                     if (lick.justTouched()) {
-                        logger.write("lick");
-                        sendEventTTL(LICK_TTL_MS);
+                        writeSerial("lick");
                     }
 
                     wheel.update();
@@ -1465,8 +1470,7 @@ void run_phase_4_plus() {
         case PhaseState::HIT: {
             // entry
             if (!phase_timer.started()) {
-                logger.write("hit");
-                sendEventTTL(HITMISS_TTL_MS);
+                writeSerial("hit");
 
                 brake.engage();
                 speaker.hit();
@@ -1480,8 +1484,7 @@ void run_phase_4_plus() {
                 if (phase_timer.isRunning()) {
                     lick.sampleFiltered();
                     if (lick.justTouched()) {
-                        logger.write("lick");
-                        sendEventTTL(LICK_TTL_MS);
+                        writeSerial("lick");
                     }
 
                     if ((phase_timer.timeElapsed() >= (tone_T >> 1)) && !reward_given) {
@@ -1504,8 +1507,7 @@ void run_phase_4_plus() {
         case PhaseState::MISS: {
             // entry
             if (!phase_timer.started()) {
-                logger.write("miss");
-                sendEventTTL(HITMISS_TTL_MS);
+                writeSerial("miss");
 
                 brake.engage();
                 speaker.miss();
@@ -1519,8 +1521,7 @@ void run_phase_4_plus() {
                 if (phase_timer.isRunning()) {
                     lick.sampleFiltered();
                     if (lick.justTouched()) {
-                        logger.write("lick");
-                        sendEventTTL(LICK_TTL_MS);
+                        writeSerial("lick");
                     }
                 }
                 // exit
@@ -1548,8 +1549,7 @@ void run_phase_4_plus() {
                     if (phase_timer.isRunning()) {
                         lick.sampleFiltered();
                         if (lick.justTouched()) {
-                            logger.write("lick");
-                            sendEventTTL(LICK_TTL_MS);
+                            writeSerial("lick");
                         }
                     }
                     // exit
