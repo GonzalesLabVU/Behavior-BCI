@@ -20,7 +20,7 @@ from threading import Thread, Event, Lock
 import serial
 import serial.tools.list_ports
 from cursor_utils import BCI, ABORT_EVT
-from redis_utils import add_entry, remove_entry
+from dashboard_utils import write_fields
 from TCPClient import PrairieClient
 
 import gspread
@@ -552,88 +552,52 @@ class TrainerInterface(InterfaceObject):
         return save_choice in {"", "y", "yes"}
 
 
-class RedisInterface(InterfaceObject):
-    interface_name = "redis"
+class DashboardInterface(InterfaceObject):
+    interface_name = "dashboard"
 
     def __init__(self, client_id=None):
-        """Initialize Redis status publishing for a client.
-
-        Args:
-            client_id: Optional client identifier; defaults to CLIENT_ID.
-        """
-        self.client_id = str(client_id or os.getenv("CLIENT_ID"))
+        self.client_id = str(client_id or os.getenv("CLIENT_ID")).strip().upper()
 
     @staticmethod
     def _utc_iso():
-        """Return the current UTC time as an ISO-8601 string."""
-        return datetime.now(timezone.utc).isoformat(timespec='seconds').replace('+00:00', 'Z')
+        return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
-    def _write(self, key, value):
-        """Replace a Redis-style key with a string value.
-
-        Args:
-            key: Key to update.
-            value: Value to write.
-        """
-        remove_entry(key)
-        add_entry(key, str(value))
-
-    def session_key(self, field):
-        """Build a Redis session key for a field.
-
-        Args:
-            field: Session field name.
-
-        Returns:
-            Fully qualified Redis key.
-        """
-        return f"client:{self.client_id}:session:{field}"
-
-    def clear_session(self):
-        """Remove active session metadata keys for this client."""
-        for field in ("animal", "phase", "start_utc", "stop_utc"):
-            remove_entry(self.session_key(field))
+    def _safe_write(self, fields, timestamp=None):
+        try:
+            return write_fields(self.client_id,
+                                fields,
+                                timestamp=timestamp or self._utc_iso())
+        except Exception as exc:
+            print(f"[WARNING] Dashboard update failed: {type(exc).__name__}: {exc}",
+                  flush=True)
+            return None
 
     def notify_start(self, session_data):
-        """Publish session start metadata and running state.
-
-        Args:
-            session_data: SessionData instance for the active run.
-        """
         start_utc = self._utc_iso()
 
-        self.clear_session()
-
-        self._write(self.session_key("animal"), session_data.meta.get("animal", ""))
-        self._write(self.session_key("phase"), session_data.meta.get("phase", ""))
-        self._write(self.session_key("start_utc"), start_utc)
-
-        self._write(f"client:{self.client_id}:state", "running")
+        self._safe_write({
+            "status": "running",
+            "animal": session_data.meta.get("animal", ""),
+            "phase": session_data.meta.get("phase", "")
+            }, timestamp=start_utc)
 
     def notify_finish(self):
-        """Publish session finish state and defer idle cleanup until key press."""
-        self._write(self.session_key("stop_utc"), self._utc_iso())
-        self._write(f"client:{self.client_id}:state", "finished")
+        self._safe_write({"status": "finished"}, timestamp=self._utc_iso())
 
         original_read_key = keyboard.read_key
 
         def _read_key_and_set_idle(*args, **kwargs):
-            """Wrap keyboard.read_key to set Redis state idle after the key press.
-
-            Args:
-                *args: Positional arguments forwarded to keyboard.read_key.
-                **kwargs: Keyword arguments forwarded to keyboard.read_key.
-
-            Returns:
-                The original keyboard.read_key return value.
-            """
             try:
                 return original_read_key(*args, **kwargs)
             finally:
-                self._write(f"client:{self.client_id}:state", "idle")
-                self.clear_session()
+                self._safe_write({
+                    "status": "idle",
+                    "animal": "",
+                    "phase": ""
+                    }, timestamp=self._utc_iso())
+
                 keyboard.read_key = original_read_key
-        
+
         keyboard.read_key = _read_key_and_set_idle
 
 
@@ -1624,7 +1588,7 @@ class BehaviorInterfaces:
         self.system = SystemInterface()
         self.user = TrainerInterface(self.system)
         self.console = ConsoleInterface()
-        self.redis = RedisInterface()
+        self.dashboard = DashboardInterface()
         self.exceptions = ExceptionInterface()
         self.email = EmailInterface()
         self.saving = SaveInterface()
@@ -2724,7 +2688,7 @@ def setup(interfaces=None):
     user_proxy = interfaces.user
     prairie_proxy = interfaces.prairie
     cursor_proxy = interfaces.cursor
-    redis_proxy = interfaces.redis
+    dashboard_proxy = interfaces.dashboard
 
     ser = None
     link = None
@@ -2791,7 +2755,7 @@ def setup(interfaces=None):
         print('Running session...\n', flush=True)
         link.send_start()
 
-        redis_proxy.notify_start(session_data)
+        dashboard_proxy.notify_start(session_data)
 
         return link, session_data, cursor, client
     except Exception as e:
@@ -2981,7 +2945,7 @@ def main(link, session_data, cursor, client=None, interfaces=None):
     interfaces = interfaces or BehaviorInterfaces()
 
     console_proxy = interfaces.console
-    redis_proxy = interfaces.redis
+    dashboard_proxy = interfaces.dashboard
     cursor_proxy = interfaces.cursor
 
     do_calibration = int(session_data.meta['phase']) > 4
@@ -3191,7 +3155,7 @@ def main(link, session_data, cursor, client=None, interfaces=None):
         if client is not None:
             client.stop()
 
-        redis_proxy.notify_finish()
+        dashboard_proxy.notify_finish()
 
 
 if __name__ == "__main__":
