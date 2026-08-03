@@ -8,31 +8,6 @@ void Spout::init(unsigned long pulse_dur_us) {
     digitalWrite(PULSE_PIN, LOW);
 
     pulse_dur_us_ = pulse_dur_us;
-
-    pinMode(FORCE_PIN, INPUT);
-
-    last_pulse_ms_ = 0;
-    forced_ = false;
-    prev_forced_ = (digitalRead(FORCE_PIN) == HIGH);
-}
-
-void Spout::poll() {
-    const bool curr_forced = (digitalRead(FORCE_PIN) == HIGH);
-    const unsigned long now_ms = millis();
-
-    if (curr_forced && !prev_forced_) {
-        if ((now_ms - last_pulse_ms_) >= debounce_ms_) {
-            forced_ = true;
-        }
-    }
-
-    if (forced_) {
-        pulse();
-        last_pulse_ms_ = now_ms;
-        forced_ = false;
-    }
-
-    prev_forced_ = curr_forced;
 }
 
 void Spout::pulse() {
