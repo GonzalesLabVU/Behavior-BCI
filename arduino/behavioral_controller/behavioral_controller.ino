@@ -667,8 +667,8 @@ void setup() {
         digitalWrite(POWER_EN, HIGH);
         delay(100);
 
-        spout.init(1);
-        spout.flush(5000);
+        spout.init(0);
+        spout.flush(3000);
 
         logger.write("R");
         Serial.flush();
@@ -698,8 +698,8 @@ void setup() {
     spout.init(pulse_us);
 
     for (int i = 0; i < 5; i++) {
-        spout.pulse();
-        delay(500);
+        spout.flush(5);
+        delay(150);
     }
 
     lick.init(RAW_FLAG);
@@ -931,8 +931,6 @@ void run_phase_1() {
 
                     phase_state = PhaseState::HIT;
                 }
-
-                spout.poll();
             }
             else {
                 spout.pulse();
@@ -1041,8 +1039,6 @@ void run_phase_2() {
                         trial_hit = false;
                         phase_state = PhaseState::MISS;
                     }
-
-                    spout.poll();
                 }
                 // failure exit
                 else {
@@ -1243,8 +1239,6 @@ void run_phase_3() {
                         trial_hit = false;
                         phase_state = PhaseState::MISS;
                     }
-
-                    spout.poll();
                 }
                 // failure exit
                 else {
@@ -1451,8 +1445,6 @@ void run_phase_4_plus() {
                         trial_hit = false;
                         phase_state = PhaseState::MISS;
                     }
-
-                    spout.poll();
                 }
                 // failure exit
                 else {
