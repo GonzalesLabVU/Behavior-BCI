@@ -41,8 +41,18 @@ constexpr float DEGREES(T d) { return static_cast<float>(d); }
 #define RAW_FLAG false
 #define SEED_PIN A0
 #define POWER_EN 7
-#define RECORD_TTL 22
-#define EVENT_TTL 23
+// #define RECORD_TTL 22
+// #define EVENT_TTL 23
+
+#if defined(ARDUINO_AVR_MEGA2560)
+    #define RECORD_TTL 22
+    #define EVENT_TTL 23
+#elif defined(ARDUINO_AVR_UNO)
+    #define RECORD_TTL 10
+    #define EVENT_TTL 11
+#else
+    #error "Unsupported board: select Arduino Mega 2560 or Arduino Uno"
+#endif
 
 const unsigned long EVENT_PULSE_US = 11111;
 const unsigned long EVENT_IPI_US = 11111;

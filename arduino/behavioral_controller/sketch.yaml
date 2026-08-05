@@ -1,6 +1,12 @@
-default_fqbn: arduino:avr:mega
+default_profile: mega2560
 
 profiles:
   mega2560:
     fqbn: arduino:avr:mega
-    port: COM9
+    platforms:
+      - platform: arduino:avr
+
+  uno:
+    fqbn: arduino:avr:uno
+    platforms:
+      - platform: arduino:avr

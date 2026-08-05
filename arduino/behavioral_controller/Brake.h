@@ -4,9 +4,15 @@
 #include <Arduino.h>
 #include <Servo.h>
 
+// #define BRAKE_PIN 44
 
-#define BRAKE_PIN 44
-
+#if defined(ARDUINO_AVR_MEGA2560)
+    static constexpr uint8_t BRAKE_PIN = 44;
+#elif defined(ARDUINO_AVR_UNO)
+    static constexpr uint8_t BRAKE_PIN = 9;
+#else
+    #error "Unsupported board: select Arduino Mega 2560 or Arduino Uno")
+#endif
 
 class Brake {
     public:
