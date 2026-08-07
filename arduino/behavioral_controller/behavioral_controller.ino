@@ -678,7 +678,7 @@ void setup() {
         delay(100);
 
         spout.init(0);
-        spout.flush(3000);
+        spout.flush(10000);
 
         logger.write("R");
         Serial.flush();
