@@ -13,7 +13,8 @@ Speaker::Speaker():
     elapsed_us_(0),
     target_us_(0),
     step_us_(0),
-    since_step_us_(0)
+    since_step_us_(0),
+    rng_(1)
 {}
 
 void Speaker::init(const String& side) {
@@ -30,17 +31,24 @@ void Speaker::init(const String& side) {
 
     mode_ = IDLE;
     instance_ = this;
+
     rng_ = (uint32_t)micros() | 1;
 }
 
 void Speaker::cue() {
     noInterrupts();
+
     bool can_start = (mode_ == IDLE);
+
     interrupts();
 
     if (!can_start) return;
 
-    unsigned int freq_hz = (side_ == "R") ? RIGHT_CUE_HZ : LEFT_CUE_HZ;
+    unsigned int freq_hz =
+        (side_ == "R")
+        ? RIGHT_CUE_HZ
+        : LEFT_CUE_HZ;
+
     startTone_(CUE, freq_hz, TONE_MS);
 }
 
@@ -105,6 +113,7 @@ void Speaker::startTone_(Mode m, unsigned freq_hz, unsigned long duration_ms) {
 
     elapsed_us_ = 0;
     target_us_ = duration_ms * 1000UL;
+
     since_step_us_ = 0;
     step_us_ = 0;
 
@@ -125,6 +134,7 @@ void Speaker::startMiss_(unsigned long duration_ms) {
 
     step_us_ = MISS_STEP_US_MIN + (xorshift32_(rng_) % (MISS_STEP_US_MAX - MISS_STEP_US_MIN + 1));
     since_step_us_ = 0;
+
     elapsed_us_ = 0;
     target_us_ = duration_ms * 1000UL;
 
@@ -148,12 +158,7 @@ void Speaker::updateForFreq_(unsigned freq_hz) {
 }
 
 inline void Speaker::drivePin_(bool high) {
-    if (high) {
-        PORTC |= _BV(4);
-    } else {
-        PORTC &= ~_BV(4);
-    }
-    
+    digitalWrite(SPEAKER_PIN, high ? HIGH : LOW);
     pin_state_ = high;
 }
 
@@ -176,17 +181,18 @@ void Speaker::stopTimer2_() {
 }
 
 void Speaker::onTick_() {
-    PINC = _BV(4);
-    pin_state_ = !pin_state_;
+    drivePin_(!pin_state_);
 
     elapsed_us_ += half_us_;
     since_step_us_ += half_us_;
 
     if (mode_ == MISS && since_step_us_ >= step_us_) {
-        unsigned f = MISS_HZ_MIN + (xorshift32_(rng_) % (MISS_HZ_MAX - MISS_HZ_MIN + 1));
-        updateForFreq_(f);
+        unsigned int freq_hz = MISS_HZ_MIN + (xorshift32_(rng_) % (MISS_HZ_MAX - MISS_HZ_MIN + 1));
+
+        updateForFreq_(freq_hz);
 
         OCR2A = ocr_val_;
+
         step_us_ = MISS_STEP_US_MIN + (xorshift32_(rng_) % (MISS_STEP_US_MAX - MISS_STEP_US_MIN + 1));
         since_step_us_ = 0;
     }

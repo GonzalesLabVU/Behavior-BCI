@@ -168,11 +168,11 @@ static void applyPhaseDefaults(int phase_id) {
     } else if (phase_id == 2) {
         session_T = MINUTES(20);
         trial_T = SECONDS(30);
-        delay_T = SECONDS(3);
+        delay_T = SECONDS(1);
     } else if (phase_id == 3) {
         session_T = MINUTES(20);
         trial_T = SECONDS(30);
-        delay_T = SECONDS(3);
+        delay_T = SECONDS(1);
     } else {
         session_T = MINUTES(30);
         trial_T = SECONDS(30);
@@ -976,28 +976,7 @@ void run_phase_2() {
 
         case PhaseState::CUE: {
             // entry
-            if (!phase_timer.started()) {
-                writeSerial("cue");
-
-                phase_timer.init(tone_T);
-                phase_timer.start();
-            }
-            // active
-            else {
-                // running
-                if (phase_timer.isRunning()) {
-                    lick.sampleFiltered();
-                    if (lick.justTouched()) {
-                        writeSerial("lick");
-                    }
-                }
-                // exit
-                else {
-                    phase_timer.reset();
-
-                    phase_state = PhaseState::TRIAL;
-                }
-            }
+            phase_state = PhaseState::TRIAL;
 
             break;
         }
@@ -1125,28 +1104,7 @@ void run_phase_2() {
 
         case PhaseState::DELAY: {
             if (session_timer.isRunning()) {
-                // entry
-                if (!phase_timer.started()) {
-                    phase_timer.init(delay_T);
-                    phase_timer.start();
-                }
-                // active
-                else {
-                    // running
-                    if (phase_timer.isRunning()) {
-                        lick.sampleFiltered();
-                        if (lick.justTouched()) {
-                            writeSerial("lick");
-                        }
-                    }
-                    // exit
-                    else {
-                        phase_timer.reset();
-
-                        // DELAY -> CUE
-                        phase_state = PhaseState::CUE;
-                    }
-                }
+                phase_state = PhaseState::CUE;
             }
             else {
                 // DELAY -> CLEANUP
@@ -1178,6 +1136,8 @@ void run_phase_3() {
             // entry
             if (!phase_timer.started()) {
                 writeSerial("cue");
+
+                speaker.cue();
 
                 phase_timer.init(tone_T);
                 phase_timer.start();
