@@ -48,8 +48,8 @@ rem ================================================================
 
 rem ----------------------------------------------------------------
 rem :verifyArduino
-rem   Ensures arduino-cli is installed, updates core/lib indexes,
-rem   and upgrades arduino:avr and Servo to their latest versions.
+rem   Ensures arduino-cli is available, updates indexes, and
+rem   explicitly installs/upgrades the arduino:avr core and Servo library.
 rem ----------------------------------------------------------------
 :verifyArduino
     @echo off
@@ -69,17 +69,18 @@ rem ----------------------------------------------------------------
     if errorlevel 1 (endlocal & exit /b 1)
 
 :arduinoReady
-    arduino-cli config init >nul 2>&1
+    echo   Initialising configuration...
+    "%ARDUINO_CLI%" config init >nul 2>&1
 
     echo   Updating core index and arduino:avr...
-    arduino-cli core update-index >nul 2>&1
-    arduino-cli core install arduino:avr >nul 2>&1
-    arduino-cli core upgrade arduino:avr >nul 2>&1
+    "%ARDUINO_CLI%" core update-index
+    "%ARDUINO_CLI%" core install arduino:avr
+    "%ARDUINO_CLI%" core upgrade arduino:avr
 
-    echo   Updating library index and Servo...
-    arduino-cli lib update-index >nul 2>&1
-    arduino-cli lib install Servo >nul 2>&1
-    arduino-cli lib upgrade Servo >nul 2>&1
+    echo   Updating library index and installing Servo...
+    "%ARDUINO_CLI%" lib update-index
+    "%ARDUINO_CLI%" lib install "Servo"
+    "%ARDUINO_CLI%" lib upgrade "Servo"
 
     endlocal & exit /b 0
 
@@ -135,7 +136,7 @@ rem ----------------------------------------------------------------
     if errorlevel 1 (echo [ERROR] Sketch compilation failed & endlocal & exit /b 1)
 
     echo Uploading sketch to %PORT%...
-    "%ARDUINO_CLI%" upload --port "%PORT%" --fqbn "%FQBN%" "%SKETCH_DIR%" >nul 2>&1
+    "%ARDUINO_CLI%" upload --port "%PORT%" --fqbn "%FQBN%" "%SKETCH_DIR%"
     if errorlevel 1 (echo [ERROR] Sketch upload failed & endlocal & exit /b 1)
 
     endlocal & exit /b 0
