@@ -131,7 +131,7 @@ rem ----------------------------------------------------------------
     if not defined PORT (echo [ERROR] PORT not set                          & endlocal & exit /b 1)
 
     echo Compiling sketch from %SKETCH_DIR%...
-    "%ARDUINO_CLI%" compile --fqbn "%FQBN%" "%SKETCH_DIR%" >nul 2>&1
+    "%ARDUINO_CLI%" compile --fqbn "%FQBN%" "%SKETCH_DIR%"
     if errorlevel 1 (echo [ERROR] Sketch compilation failed & endlocal & exit /b 1)
 
     echo Uploading sketch to %PORT%...
