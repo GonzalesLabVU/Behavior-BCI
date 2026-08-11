@@ -2837,6 +2837,8 @@ def _is_early_exit(evt, index, end_ms, min_duration=20*60, min_trials=150):
     Returns:
         True when early-exit criteria are met, otherwise False.
     """
+    return False
+
     width = 5
 
     buf = getattr(_is_early_exit, '_buf', None)
