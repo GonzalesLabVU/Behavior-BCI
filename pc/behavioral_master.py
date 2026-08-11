@@ -495,6 +495,20 @@ class TrainerInterface(InterfaceObject):
 
             print('Please enter a valid phase\n', flush=True)
 
+    def prompt_side(self):
+        """
+        Prompt for target side to use (phase 4 only)
+        
+        Returns:
+            'L' or 'R' selected by the trainer
+        """
+        while True:
+            side_raw = input('Target side (L/R):  ').strip().upper()
+            if side_raw in {'L', 'R'}:
+                return side_raw
+
+            print('Please enter L or R\n', flush=True)
+
     def prompt_imaging(self):
         """Prompt whether imaging is active.
 
@@ -2717,6 +2731,7 @@ def setup(interfaces=None):
         if not arduino_found:
             raise RuntimeError(f'No Arduino detected (required for phase {phase_id})')
 
+        side_override = user_proxy.prompt_side() if phase_id == "4" else None
         imaging_active = user_proxy.prompt_imaging()
         ephys_active = user_proxy.prompt_ephys()
 
@@ -2724,6 +2739,8 @@ def setup(interfaces=None):
 
         settings = system_proxy.get_config(phase_id)
         cfg = settings['cfg']
+        if side_override:
+            settings['side'] = side_override
         side = settings['side']
             
         link.send_config(phase_id, settings)
@@ -2746,6 +2763,7 @@ def setup(interfaces=None):
         session_data.meta['workbook_id'] = workbook_id
         session_data.meta['imaging_active'] = bool(client is not None)
         session_data.meta['ephys_active'] = bool(ephys_active)
+        session_data.meta['side_override'] = side_override
 
         session_data.log_trial_config(trial_n=1, type=is_easy, side=side)
 
@@ -3106,7 +3124,7 @@ def main(link, session_data, cursor, client=None, interfaces=None):
 
                         next_trial_n = trial_n + 1
                         next_easy = _get_easy(int(phase_id), next_trial_n, K)
-                        next_side = PHASE_CONFIG[phase_id]['side']
+                        next_side = session_data.meta.get('side_override') or PHASE_CONFIG[phase_id]['side']
 
                         time.sleep(0.05)
                         link.send_and_wait(f'{next_trial_n} {"1" if next_easy else "0"}')
