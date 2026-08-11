@@ -23,7 +23,7 @@ class Speaker {
     
     private:
         static constexpr unsigned int LEFT_CUE_HZ = 2500;
-        static constexpr unsigned int RIGHT_CUE_HZ = 6000;
+        static constexpr unsigned int RIGHT_CUE_HZ = 2500;
         static constexpr unsigned int HIT_HZ = 4000;
 
         static constexpr unsigned int MISS_HZ_MIN = 1000;
