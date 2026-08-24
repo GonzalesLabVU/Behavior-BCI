@@ -1,0 +1,331 @@
+TIME = 2026-01-08 12:41:53
+USER = UNKNOWN_USER
+ANIMAL = UNKNOWN
+PHASE = 0
+SOURCE = behavioral_master_FINAL.py
+--------------------------------------------------
+  Traceback (most recent call last):
+    File "c:\Users\Max\Documents\Classes\Gonzales Lab\Behavioral\Local\behavioral_master_FINAL.py", line 1049, in <module>
+      link, session_data, cursor_thread, dev_mode = setup()
+    File "c:\Users\Max\Documents\Classes\Gonzales Lab\Behavioral\Local\behavioral_master_FINAL.py", line 844, in setup
+      raise RuntimeError("No Arduino detected")
+  RuntimeError: No Arduino detected
+
+TIME = 2026-01-08 14:45:44
+USER = UNKNOWN_USER
+ANIMAL = UNKNOWN
+PHASE = 0
+SOURCE = behavioral_master_FINAL.py
+----------------------------------------
+  Traceback (most recent call last):
+    File "c:\Users\Max\Documents\Classes\Gonzales Lab\Behavioral\Local\behavioral_master_FINAL.py", line 1136, in <module>
+      link, session_data, cursor_thread, dev_mode = setup()
+    File "c:\Users\Max\Documents\Classes\Gonzales Lab\Behavioral\Local\behavioral_master_FINAL.py", line 931, in setup
+      raise RuntimeError("No Arduino detected")
+  RuntimeError: No Arduino detected
+
+TIME = 2026-01-13 10:55:35
+USER = MAX-LAPTOP
+ANIMAL = UNKNOWN
+PHASE = 0
+SOURCE = behavioral_master.py
+----------------------------------------
+  Traceback (most recent call last):
+    File "c:\Users\Max\Documents\Classes\Gonzales Lab\Behavioral\Local\behavioral_master.py", line 1114, in setup
+      link.send_and_wait(phase_id)
+    File "c:\Users\Max\Documents\Classes\Gonzales Lab\Behavioral\Local\behavioral_master.py", line 940, in send_and_wait
+      raise TimeoutError(f"No ACK after sending: {text!r}")
+  TimeoutError: No ACK after sending: '5'
+  
+  The above exception was the direct cause of the following exception:
+  
+  Traceback (most recent call last):
+    File "c:\Users\Max\Documents\Classes\Gonzales Lab\Behavioral\Local\behavioral_master.py", line 1282, in <module>
+      link, session_data, cursor, dev_mode = setup()
+    File "c:\Users\Max\Documents\Classes\Gonzales Lab\Behavioral\Local\behavioral_master.py", line 1117, in setup
+      raise RuntimeError(f"Failed to send training phase to Arduino: {e}") from e
+  RuntimeError: Failed to send training phase to Arduino: No ACK after sending: '5'
+
+TIME = 2026-01-13 11:17:05
+USER = MAX-LAPTOP
+ANIMAL = X
+PHASE = 5
+SOURCE = behavioral_master.py
+----------------------------------------
+  Traceback (most recent call last):
+    File "c:\Users\Max\Documents\Classes\Gonzales Lab\Behavioral\Local\behavioral_master.py", line 1185, in main
+      typ, ts, payload = link.msg_q.get(timeout=0.05)
+    File "C:\Users\Max\AppData\Local\Programs\Python\Python310\lib\queue.py", line 180, in get
+      self.not_empty.wait(remaining)
+    File "C:\Users\Max\AppData\Local\Programs\Python\Python310\lib\threading.py", line 324, in wait
+      gotit = waiter.acquire(True, timeout)
+  KeyboardInterrupt
+  
+  During handling of the above exception, another exception occurred:
+  
+  Traceback (most recent call last):
+    File "c:\Users\Max\Documents\Classes\Gonzales Lab\Behavioral\Local\behavioral_master.py", line 1290, in <module>
+      main(link, session_data, cursor)
+    File "c:\Users\Max\Documents\Classes\Gonzales Lab\Behavioral\Local\behavioral_master.py", line 1255, in main
+      _terminate_session(link, "Session terminated by user")
+    File "c:\Users\Max\Documents\Classes\Gonzales Lab\Behavioral\Local\behavioral_master.py", line 1044, in _terminate_session
+      link.send_and_wait(EARLY_END_STRING, timeout=2.0)
+    File "c:\Users\Max\Documents\Classes\Gonzales Lab\Behavioral\Local\behavioral_master.py", line 940, in send_and_wait
+      raise TimeoutError(f"No ACK after sending: {text!r}")
+  TimeoutError: No ACK after sending: 'E'
+
+----------------------------------------------------------------------------------------------------
+
+TIME = 2026-01-13 16:12:11
+USER = UNKNOWN_USER
+ANIMAL = UNKNOWN
+PHASE = 0
+SOURCE = behavioral_master.py
+  type: <class 'ValueError'>
+
+----------------------------------------------------------------------------------------------------
+
+TIME = 2026-01-13 16:12:11
+USER = UNKNOWN_USER
+ANIMAL = UNKNOWN
+PHASE = 0
+SOURCE = behavioral_master.py
+  Traceback (most recent call last):
+    File "c:\Users\Max\Documents\Classes\Gonzales Lab\Behavioral\Local\behavioral_master.py", line 1436, in <module>
+      link, session_data, cursor, dev_mode = setup()
+    File "c:\Users\Max\Documents\Classes\Gonzales Lab\Behavioral\Local\behavioral_master.py", line 1201, in setup
+      raise RuntimeError("No Arduino detected")
+  RuntimeError: No Arduino detected
+
+----------------------------------------------------------------------------------------------------
+
+TIME = 2026-01-13 16:13:28
+USER = UNKNOWN_USER
+ANIMAL = UNKNOWN
+PHASE = 0
+SOURCE = behavioral_master.py
+  type: <class 'ValueError'>
+
+----------------------------------------------------------------------------------------------------
+
+TIME = 2026-01-13 16:13:28
+USER = UNKNOWN_USER
+ANIMAL = UNKNOWN
+PHASE = 0
+SOURCE = behavioral_master.py
+  Traceback (most recent call last):
+    File "c:\Users\Max\Documents\Classes\Gonzales Lab\Behavioral\Local\behavioral_master.py", line 1436, in <module>
+      raise e
+  ValueError
+
+----------------------------------------------------------------------------------------------------
+TIME = 2026-01-13 16:15:58
+USER = UNKNOWN_USER
+ANIMAL = UNKNOWN
+PHASE = 0
+SOURCE = behavioral_master.py
+
+  type: <class 'ValueError'>
+----------------------------------------------------------------------------------------------------
+TIME = 2026-01-13 16:15:58
+USER = UNKNOWN_USER
+ANIMAL = UNKNOWN
+PHASE = 0
+SOURCE = behavioral_master.py
+
+  Traceback (most recent call last):
+    File "c:\Users\Max\Documents\Classes\Gonzales Lab\Behavioral\Local\behavioral_master.py", line 1435, in <module>
+      raise e
+  ValueError
+TIME=2026-03-10 00:12:25
+USER=MAX-PERSONAL
+ANIMAL=F2
+PHASE=3
+SOURCE=behavioral_master.py
+----------------------------------------
+  Traceback (most recent call last):
+    File "C:\Users\Max\AppData\Local\Programs\Python\Python310\lib\site-packages\gspread\client.py", line 168, in open_by_key
+      spreadsheet = Spreadsheet(self.http_client, {"id": key})
+    File "C:\Users\Max\AppData\Local\Programs\Python\Python310\lib\site-packages\gspread\spreadsheet.py", line 29, in __init__
+      metadata = self.fetch_sheet_metadata()
+    File "C:\Users\Max\AppData\Local\Programs\Python\Python310\lib\site-packages\gspread\spreadsheet.py", line 230, in fetch_sheet_metadata
+      return self.client.fetch_sheet_metadata(self.id, params=params)
+    File "C:\Users\Max\AppData\Local\Programs\Python\Python310\lib\site-packages\gspread\http_client.py", line 305, in fetch_sheet_metadata
+      r = self.request("get", url, params=params)
+    File "C:\Users\Max\AppData\Local\Programs\Python\Python310\lib\site-packages\gspread\http_client.py", line 128, in request
+      raise APIError(response)
+  gspread.exceptions.APIError: APIError: [403]: The caller does not have permission
+  
+  The above exception was the direct cause of the following exception:
+  
+  Traceback (most recent call last):
+    File "c:\Users\Max\Documents\Classes\Gonzales Lab\Behavioral\Local\behavioral_master.py", line 1466, in safe_save
+      save_data(session_data)
+    File "c:\Users\Max\Documents\Classes\Gonzales Lab\Behavioral\Local\behavioral_master.py", line 1288, in save_data
+      lock = FileLock(workbook_id, owner=client_id).acquire()
+    File "c:\Users\Max\Documents\Classes\Gonzales Lab\Behavioral\Local\behavioral_master.py", line 936, in acquire
+      wb = self._open_wb()
+    File "c:\Users\Max\Documents\Classes\Gonzales Lab\Behavioral\Local\behavioral_master.py", line 859, in _open_wb
+      self.wb = self.client.open_by_key(self.workbook_id)
+    File "C:\Users\Max\AppData\Local\Programs\Python\Python310\lib\site-packages\gspread\client.py", line 173, in open_by_key
+      raise PermissionError from ex
+  PermissionError
+
+TIME=2026-03-10 00:28:09
+USER=MAX-PERSONAL
+ANIMAL=F2
+PHASE=3
+SOURCE=behavioral_master.py
+----------------------------------------
+  Traceback (most recent call last):
+    File "C:\Users\Max\AppData\Local\Programs\Python\Python310\lib\site-packages\gspread\client.py", line 168, in open_by_key
+      spreadsheet = Spreadsheet(self.http_client, {"id": key})
+    File "C:\Users\Max\AppData\Local\Programs\Python\Python310\lib\site-packages\gspread\spreadsheet.py", line 29, in __init__
+      metadata = self.fetch_sheet_metadata()
+    File "C:\Users\Max\AppData\Local\Programs\Python\Python310\lib\site-packages\gspread\spreadsheet.py", line 230, in fetch_sheet_metadata
+      return self.client.fetch_sheet_metadata(self.id, params=params)
+    File "C:\Users\Max\AppData\Local\Programs\Python\Python310\lib\site-packages\gspread\http_client.py", line 305, in fetch_sheet_metadata
+      r = self.request("get", url, params=params)
+    File "C:\Users\Max\AppData\Local\Programs\Python\Python310\lib\site-packages\gspread\http_client.py", line 128, in request
+      raise APIError(response)
+  gspread.exceptions.APIError: APIError: [403]: The caller does not have permission
+  
+  The above exception was the direct cause of the following exception:
+  
+  Traceback (most recent call last):
+    File "c:\Users\Max\Documents\Classes\Gonzales Lab\Behavioral\Local\behavioral_master.py", line 1466, in safe_save
+      save_data(session_data)
+    File "c:\Users\Max\Documents\Classes\Gonzales Lab\Behavioral\Local\behavioral_master.py", line 1288, in save_data
+      lock = FileLock(workbook_id, owner=client_id).acquire()
+    File "c:\Users\Max\Documents\Classes\Gonzales Lab\Behavioral\Local\behavioral_master.py", line 936, in acquire
+      wb = self._open_wb()
+    File "c:\Users\Max\Documents\Classes\Gonzales Lab\Behavioral\Local\behavioral_master.py", line 859, in _open_wb
+      self.wb = self.client.open_by_key(self.workbook_id)
+    File "C:\Users\Max\AppData\Local\Programs\Python\Python310\lib\site-packages\gspread\client.py", line 173, in open_by_key
+      raise PermissionError from ex
+  PermissionError
+
+----------------------------------------
+TIME=2026-03-11 07:14:46
+USER=MAX-PERSONAL
+ANIMAL=A2
+PHASE=3
+SOURCE=behavioral_master.py
+----------------------------------------
+  Traceback (most recent call last):
+    File "C:\Users\Max\Documents\Classes\Gonzales Lab\Behavioral\Local\behavioral_master.py", line 2125, in <module>
+      send_email(session_data)
+    File "C:\Users\Max\Documents\Classes\Gonzales Lab\Behavioral\Local\behavioral_master.py", line 1585, in send_email
+      with smtplib.SMTP(SMTP_SERVER, SMTP_PORT, timeout=30) as server:
+    File "C:\Users\Max\AppData\Local\Programs\Python\Python310\lib\smtplib.py", line 255, in __init__
+      (code, msg) = self.connect(host, port)
+    File "C:\Users\Max\AppData\Local\Programs\Python\Python310\lib\smtplib.py", line 341, in connect
+      self.sock = self._get_socket(host, port, self.timeout)
+    File "C:\Users\Max\AppData\Local\Programs\Python\Python310\lib\smtplib.py", line 312, in _get_socket
+      return socket.create_connection((host, port), timeout,
+    File "C:\Users\Max\AppData\Local\Programs\Python\Python310\lib\socket.py", line 824, in create_connection
+      for res in getaddrinfo(host, port, 0, SOCK_STREAM):
+    File "C:\Users\Max\AppData\Local\Programs\Python\Python310\lib\socket.py", line 955, in getaddrinfo
+      for res in _socket.getaddrinfo(host, port, family, type, proto, flags):
+  socket.gaierror: [Errno 11001] getaddrinfo failed
+
+----------------------------------------
+TIME=2026-03-11 07:14:53
+USER=MAX-PERSONAL
+ANIMAL=A2
+PHASE=3
+SOURCE=behavioral_master.py
+----------------------------------------
+  Traceback (most recent call last):
+    File "C:\Users\Max\AppData\Local\Programs\Python\Python310\lib\site-packages\urllib3\connection.py", line 174, in _new_conn
+      conn = connection.create_connection(
+    File "C:\Users\Max\AppData\Local\Programs\Python\Python310\lib\site-packages\urllib3\util\connection.py", line 72, in create_connection
+      for res in socket.getaddrinfo(host, port, family, socket.SOCK_STREAM):
+    File "C:\Users\Max\AppData\Local\Programs\Python\Python310\lib\socket.py", line 955, in getaddrinfo
+      for res in _socket.getaddrinfo(host, port, family, type, proto, flags):
+  socket.gaierror: [Errno 11001] getaddrinfo failed
+  
+  During handling of the above exception, another exception occurred:
+  
+  Traceback (most recent call last):
+    File "C:\Users\Max\AppData\Local\Programs\Python\Python310\lib\site-packages\urllib3\connectionpool.py", line 703, in urlopen
+      httplib_response = self._make_request(
+    File "C:\Users\Max\AppData\Local\Programs\Python\Python310\lib\site-packages\urllib3\connectionpool.py", line 386, in _make_request
+      self._validate_conn(conn)
+    File "C:\Users\Max\AppData\Local\Programs\Python\Python310\lib\site-packages\urllib3\connectionpool.py", line 1042, in _validate_conn
+      conn.connect()
+    File "C:\Users\Max\AppData\Local\Programs\Python\Python310\lib\site-packages\urllib3\connection.py", line 358, in connect
+      self.sock = conn = self._new_conn()
+    File "C:\Users\Max\AppData\Local\Programs\Python\Python310\lib\site-packages\urllib3\connection.py", line 186, in _new_conn
+      raise NewConnectionError(
+  urllib3.exceptions.NewConnectionError: <urllib3.connection.HTTPSConnection object at 0x00000247D08B5390>: Failed to establish a new connection: [Errno 11001] getaddrinfo failed
+  
+  During handling of the above exception, another exception occurred:
+  
+  Traceback (most recent call last):
+    File "C:\Users\Max\AppData\Local\Programs\Python\Python310\lib\site-packages\requests\adapters.py", line 644, in send
+      resp = conn.urlopen(
+    File "C:\Users\Max\AppData\Local\Programs\Python\Python310\lib\site-packages\urllib3\connectionpool.py", line 815, in urlopen
+      return self.urlopen(
+    File "C:\Users\Max\AppData\Local\Programs\Python\Python310\lib\site-packages\urllib3\connectionpool.py", line 815, in urlopen
+      return self.urlopen(
+    File "C:\Users\Max\AppData\Local\Programs\Python\Python310\lib\site-packages\urllib3\connectionpool.py", line 815, in urlopen
+      return self.urlopen(
+    File "C:\Users\Max\AppData\Local\Programs\Python\Python310\lib\site-packages\urllib3\connectionpool.py", line 787, in urlopen
+      retries = retries.increment(
+    File "C:\Users\Max\AppData\Local\Programs\Python\Python310\lib\site-packages\urllib3\util\retry.py", line 592, in increment
+      raise MaxRetryError(_pool, url, error or ResponseError(cause))
+  urllib3.exceptions.MaxRetryError: HTTPSConnectionPool(host='oauth2.googleapis.com', port=443): Max retries exceeded with url: /token (Caused by NewConnectionError('<urllib3.connection.HTTPSConnection object at 0x00000247D08B5390>: Failed to establish a new connection: [Errno 11001] getaddrinfo failed'))
+  
+  During handling of the above exception, another exception occurred:
+  
+  Traceback (most recent call last):
+    File "C:\Users\Max\AppData\Local\Programs\Python\Python310\lib\site-packages\google\auth\transport\requests.py", line 186, in __call__
+      response = self.session.request(
+    File "C:\Users\Max\AppData\Local\Programs\Python\Python310\lib\site-packages\requests\sessions.py", line 589, in request
+      resp = self.send(prep, **send_kwargs)
+    File "C:\Users\Max\AppData\Local\Programs\Python\Python310\lib\site-packages\requests\sessions.py", line 703, in send
+      r = adapter.send(request, **kwargs)
+    File "C:\Users\Max\AppData\Local\Programs\Python\Python310\lib\site-packages\requests\adapters.py", line 677, in send
+      raise ConnectionError(e, request=request)
+  requests.exceptions.ConnectionError: HTTPSConnectionPool(host='oauth2.googleapis.com', port=443): Max retries exceeded with url: /token (Caused by NewConnectionError('<urllib3.connection.HTTPSConnection object at 0x00000247D08B5390>: Failed to establish a new connection: [Errno 11001] getaddrinfo failed'))
+  
+  The above exception was the direct cause of the following exception:
+  
+  Traceback (most recent call last):
+    File "C:\Users\Max\Documents\Classes\Gonzales Lab\Behavioral\Local\behavioral_master.py", line 1465, in safe_save
+      save_data(session_data)
+    File "C:\Users\Max\Documents\Classes\Gonzales Lab\Behavioral\Local\behavioral_master.py", line 1287, in save_data
+      lock = FileLock(workbook_id, owner=client_id).acquire()
+    File "C:\Users\Max\Documents\Classes\Gonzales Lab\Behavioral\Local\behavioral_master.py", line 935, in acquire
+      wb = self._open_wb()
+    File "C:\Users\Max\Documents\Classes\Gonzales Lab\Behavioral\Local\behavioral_master.py", line 858, in _open_wb
+      self.wb = self.client.open_by_key(self.workbook_id)
+    File "C:\Users\Max\AppData\Local\Programs\Python\Python310\lib\site-packages\gspread\client.py", line 168, in open_by_key
+      spreadsheet = Spreadsheet(self.http_client, {"id": key})
+    File "C:\Users\Max\AppData\Local\Programs\Python\Python310\lib\site-packages\gspread\spreadsheet.py", line 29, in __init__
+      metadata = self.fetch_sheet_metadata()
+    File "C:\Users\Max\AppData\Local\Programs\Python\Python310\lib\site-packages\gspread\spreadsheet.py", line 230, in fetch_sheet_metadata
+      return self.client.fetch_sheet_metadata(self.id, params=params)
+    File "C:\Users\Max\AppData\Local\Programs\Python\Python310\lib\site-packages\gspread\http_client.py", line 305, in fetch_sheet_metadata
+      r = self.request("get", url, params=params)
+    File "C:\Users\Max\AppData\Local\Programs\Python\Python310\lib\site-packages\gspread\http_client.py", line 114, in request
+      response = self.session.request(
+    File "C:\Users\Max\AppData\Local\Programs\Python\Python310\lib\site-packages\google\auth\transport\requests.py", line 533, in request
+      self.credentials.before_request(auth_request, method, url, request_headers)
+    File "C:\Users\Max\AppData\Local\Programs\Python\Python310\lib\site-packages\google\auth\credentials.py", line 239, in before_request
+      self._blocking_refresh(request)
+    File "C:\Users\Max\AppData\Local\Programs\Python\Python310\lib\site-packages\google\auth\credentials.py", line 202, in _blocking_refresh
+      self.refresh(request)
+    File "C:\Users\Max\AppData\Local\Programs\Python\Python310\lib\site-packages\google\oauth2\service_account.py", line 448, in refresh
+      access_token, expiry, _ = _client.jwt_grant(
+    File "C:\Users\Max\AppData\Local\Programs\Python\Python310\lib\site-packages\google\oauth2\_client.py", line 299, in jwt_grant
+      response_data = _token_endpoint_request(
+    File "C:\Users\Max\AppData\Local\Programs\Python\Python310\lib\site-packages\google\oauth2\_client.py", line 259, in _token_endpoint_request
+      response_status_ok, response_data, retryable_error = _token_endpoint_request_no_throw(
+    File "C:\Users\Max\AppData\Local\Programs\Python\Python310\lib\site-packages\google\oauth2\_client.py", line 192, in _token_endpoint_request_no_throw
+      response = request(
+    File "C:\Users\Max\AppData\Local\Programs\Python\Python310\lib\site-packages\google\auth\transport\requests.py", line 192, in __call__
+      raise new_exc from caught_exc
+  google.auth.exceptions.TransportError: HTTPSConnectionPool(host='oauth2.googleapis.com', port=443): Max retries exceeded with url: /token (Caused by NewConnectionError('<urllib3.connection.HTTPSConnection object at 0x00000247D08B5390>: Failed to establish a new connection: [Errno 11001] getaddrinfo failed'))
+

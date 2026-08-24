@@ -1,0 +1,7 @@
+open-ephys/
+behavioral_controller/build/
+*.hex
+.env
+credentials.json
+__pycache__/
+.venv/

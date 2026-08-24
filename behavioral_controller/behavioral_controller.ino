@@ -1,0 +1,1534 @@
+// ---------------------------
+// IMPORTS
+// ---------------------------
+#include "Wheel.h"
+#include "Brake.h"
+#include "Lick.h"
+#include "Speaker.h"
+#include "Spout.h"
+#include "Logger.h"
+#include "Timer.h"
+
+#include <math.h>
+#include <limits.h>
+#include <string.h>
+#include <stdlib.h>
+#include <ctype.h>
+#include <avr/wdt.h>
+
+// ---------------------------
+// CONVERSION HANDLES
+// ---------------------------
+template <typename T>
+constexpr unsigned long MILLISECONDS(T s) { return static_cast<unsigned long>(s * 1000.0f); }
+
+template <typename T>
+constexpr unsigned long MICROSECONDS(T s) { return static_cast<unsigned long>(s * 1000000.0f); }
+
+template <typename T>
+constexpr unsigned long SECONDS(T s) { return static_cast<unsigned long>(s * 1000.0f); }
+
+template <typename T>
+constexpr unsigned long MINUTES(T m) { return static_cast<unsigned long>(m * 60.0f * 1000.0f); }
+
+template <typename T>
+constexpr float DEGREES(T d) { return static_cast<float>(d); }
+
+// ---------------------------
+// CONFIG
+// ---------------------------
+#define BAUDRATE 1000000
+#define RAW_FLAG false
+#define SEED_PIN A0
+#define POWER_EN 7
+// #define RECORD_TTL 22
+// #define EVENT_TTL 23
+
+#if defined(ARDUINO_AVR_MEGA2560)
+    #define RECORD_TTL 22
+    #define EVENT_TTL 23
+#elif defined(ARDUINO_AVR_UNO)
+    #define RECORD_TTL 10
+    #define EVENT_TTL 11
+#else
+    #error "Unsupported board: select Arduino Mega 2560 or Arduino Uno"
+#endif
+
+const unsigned long EVENT_PULSE_US = 11111;
+const unsigned long EVENT_IPI_US = 11111;
+const unsigned long EVENT_TRAIN_GAP_US = 40000;
+
+static constexpr uint32_t RAW_HZ = 100;
+static constexpr uint32_t RAW_US = 1000000UL / RAW_HZ;
+static constexpr unsigned long sample_T = MINUTES(5);
+
+// ---------------------------
+// STATE
+// ---------------------------
+enum class SessionState { MAIN, CLEANUP };
+enum class PhaseState { IDLE, CUE, TRIAL, HIT, MISS, DELAY };
+
+SessionState session_state = SessionState::MAIN;
+PhaseState phase_state = PhaseState::IDLE;
+
+// ---------------------------
+// COMPONENTS
+// ---------------------------
+Brake brake;
+Lick lick;
+Wheel wheel;
+Spout spout;
+Speaker speaker;
+
+Timer session_timer;
+Timer phase_timer;
+Timer raw_timer;
+
+Logger logger;
+
+// ---------------------------
+// TRIAL CONFIG
+// ---------------------------
+struct SessionConfig {
+    int phase = 0;
+    float engage_ms = 0.0f;
+    float release_ms = 0.0f;
+    float pulse_ms = 0.0f;
+    float threshold = 30.0f;
+    char side = 'B';
+    bool reverse = false;
+    bool flush = false;
+    bool ephys = false;
+};
+
+struct TrialConfig {
+    long trial_n = 0;
+    bool easy = false;
+    char side = 'B';
+    bool pending = false;
+};
+
+static SessionConfig session_cfg;
+static TrialConfig trial_cfg;
+
+static unsigned long session_T = MINUTES(45);
+static unsigned long trial_T = SECONDS(30);
+static unsigned long delay_T = SECONDS(3);
+static unsigned long tone_T = SECONDS(1);
+
+static float easy_threshold = DEGREES(15.0f);
+
+static bool session_initialized = false;
+static bool trial_hit = false;
+static bool reward_given = false;
+static long last_disp_mark = LONG_MIN;
+
+// ---------------------------
+// FORWARD DECLARATIONS
+// ---------------------------
+int eventTypeToPulseCount(const String& eventType);
+bool sendPulseTrain(const String& eventType);
+
+// ---------------------------
+// SERIAL HELPERS
+// ---------------------------
+static bool readLine(char* buf, size_t cap) {
+    if (!Serial.available()) return false;
+
+    size_t n = Serial.readBytesUntil('\n', buf, cap - 1);
+    if (n == 0) return false;
+
+    buf[n] = '\0';
+
+    while (n && (buf[n - 1] == '\r' || buf[n - 1] == ' ' || buf[n - 1] == '\t')) {
+        buf[--n] = '\0';
+    }
+
+    char* p = buf;
+    while (*p == ' ' || *p == '\t') p++;
+    if (p != buf) memmove(buf, p, strlen(p) + 1);
+
+    return buf[0] != '\0';
+}
+
+static bool isSideChar(char c) {
+    c = (char)toupper((unsigned char)c);
+    return (c == 'L' || c == 'R' || c == 'B');
+}
+
+static void applyPhaseDefaults(int phase_id) {
+    if (phase_id == 0) {
+        session_T = MINUTES(20);
+        trial_T = SECONDS(30);
+        delay_T = SECONDS(3);
+    } else if (phase_id == 1) {
+        session_T = MINUTES(10);
+        trial_T = SECONDS(5);
+        delay_T = SECONDS(3);
+    } else if (phase_id == 2) {
+        session_T = MINUTES(20);
+        trial_T = SECONDS(30);
+        delay_T = SECONDS(1);
+    } else if (phase_id == 3) {
+        session_T = MINUTES(20);
+        trial_T = SECONDS(30);
+        delay_T = SECONDS(1);
+    } else {
+        session_T = MINUTES(30);
+        trial_T = SECONDS(30);
+        delay_T = SECONDS(3);
+    }
+}
+
+static bool parseTrialConfig(char* line) {
+    if (isalpha((unsigned char)line[0])) return false;
+
+    char* s = line;
+    char* t0 = strtok(s, " \t");
+    char* t1 = strtok(nullptr, " \t");
+    char* t2 = strtok(nullptr, " \t");
+
+    if (!t0 || !t1) return false;
+
+    char* end0 = nullptr;
+    long tn = strtol(t0, &end0, 10);
+    if (!end0 || *end0 != '\0') return false;
+
+    char* end1 = nullptr;
+    long ef = strtol(t1, &end1, 10);
+    if (!end1 || *end1 != '\0') return false;
+
+    trial_cfg.trial_n = tn;
+    trial_cfg.easy = (ef != 0);
+    trial_cfg.side = session_cfg.side;
+
+    if (t2 && t2[0] && isSideChar(t2[0])) {
+        trial_cfg.side = (char)toupper((unsigned char)t2[0]);
+    }
+
+    trial_cfg.pending = true;
+    return true;
+}
+
+static bool parseKeyValue(char* line) {
+    char* key = strtok(line, " \t");
+    char* val = strtok(nullptr, " \t");
+    if (!key || !val) return false;
+
+    if (strcmp(key, "engage") == 0) {
+        session_cfg.engage_ms = atof(val);
+        return (session_cfg.engage_ms > 0.0f);
+    }
+    if (strcmp(key, "release") == 0) {
+        session_cfg.release_ms = atof(val);
+        return (session_cfg.release_ms > 0.0f);
+    }
+    if (strcmp(key, "pulse") == 0) {
+        session_cfg.pulse_ms = atof(val);
+        return (session_cfg.pulse_ms > 0.0f);
+    }
+    if (strcmp(key, "threshold") == 0) {
+        session_cfg.threshold = DEGREES(atof(val));
+        return (session_cfg.threshold >= 0.0f);
+    }
+    if (strcmp(key, "side") == 0) {
+        char c = (char)toupper((unsigned char)val[0]);
+        if (!isSideChar(c)) return false;
+
+        session_cfg.side = c;
+        return true;
+    }
+    if (strcmp(key, "reverse") == 0) {
+        long v = strtol(val, nullptr, 10);
+        if (!(v == 0 || v == 1)) return false;
+
+        session_cfg.reverse = (v == 1);
+        return true;
+    }
+    if (strcmp(key, "phase") == 0) {
+        long v = strtol(val, nullptr, 10);
+        if (v < 0 || v > 99) return false;
+
+        session_cfg.phase = (int)v;
+        return true;
+    }
+    if (strcmp(key, "ephys") == 0) {
+        long v = strtol(val, nullptr, 10);
+        if (!(v == 0 || v == 1)) return false;
+
+        session_cfg.ephys = (v == 1);
+        return true;
+    }
+
+    return false;
+}
+
+static bool parseFlushLine(char* line) {
+    char* key = strtok(line, " \t");
+    char* val = strtok(nullptr, " \t");
+    char* extra = strtok(nullptr, " \t");
+
+    if (!key || !val || extra) return false;
+    if (strcmp(key, "flush") != 0) return false;
+
+    char* end = nullptr;
+    long v = strtol(val, &end, 10);
+
+    if (!end || *end != '\0') return false;
+    if (!(v == 0 || v == 1)) return false;
+
+    session_cfg.flush = (v == 1);
+    return true;
+}
+
+void parseFlushCommand() {
+    char line[96];
+
+    for (;;) {
+        if (readLine(line, sizeof(line)) && parseFlushLine(line)) {
+            logger.ack();
+            return;
+        }
+
+        delay(10);
+    }
+}
+
+static bool parseStartLine(char* line) {
+    char* key = strtok(line, " \t");
+    char* val = strtok(nullptr, " \t");
+    char* extra = strtok(nullptr, " \t");
+
+    if (!key || !val || extra) return false;
+    if (strcmp(key, "start") != 0) return false;
+
+    char* end = nullptr;
+    long v = strtol(val, &end, 10);
+
+    if (!end || *end != '\0') return false;
+    if (!(v == 0 || v == 1)) return false;
+
+    return true;
+}
+
+void parseStartCommand() {
+    char line[96];
+
+    for (;;) {
+        if (readLine(line, sizeof(line))) {
+            if (strcmp(line, "R1") == 0) {
+                digitalWrite(RECORD_TTL, HIGH);
+                logger.ack();
+                continue;
+            }
+
+            if (strcmp(line, "R2") == 0) {
+                digitalWrite(RECORD_TTL, LOW);
+                logger.ack();
+                continue;
+            }
+
+            if (strcmp(line, "img_start") == 0) {
+                sendPulseTrain("img_start");
+                logger.ack();
+                continue;
+            }
+
+            if (strcmp(line, "img_stop") == 0) {
+                sendPulseTrain("img_stop");
+                logger.ack();
+                continue;
+            }
+
+            if (parseStartLine(line)) {
+                logger.ack();
+                return;
+            }
+        }
+
+        delay(10);
+    }
+}
+
+static void waitForHandshake() {
+    bool have_engage = false;
+    bool have_release = false;
+    bool have_pulse = false;
+    bool have_threshold = false;
+    bool have_side = false;
+    bool have_reverse = false;
+    bool have_trial = false;
+    bool have_phase = false;
+    bool have_ephys = false;
+
+    session_cfg.phase = 0;
+
+    char line[96];
+
+    for (;;) {
+        if (!readLine(line, sizeof(line))) continue;
+
+        // control override messages
+        if (strcmp(line, "E") == 0) {
+            session_state = SessionState::CLEANUP;
+            logger.ack();
+            return;
+        }
+
+        // trial config settings
+        {
+            char tmp[96];
+            strncpy(tmp, line, sizeof(tmp));
+            tmp[sizeof(tmp)-1] = 0;
+
+            if (!have_trial && parseTrialConfig(tmp)) {
+                have_trial = true;
+                logger.ack();
+                goto check_done;
+            }
+        }
+
+        // session config settings
+        {
+            char tmp[96];
+            strncpy(tmp, line, sizeof(tmp));
+            tmp[sizeof(tmp)-1] = 0;
+
+            if (parseKeyValue(tmp)) {
+                if (strncmp(line, "engage", 6) == 0) have_engage = (session_cfg.engage_ms > 0.0f);
+                if (strncmp(line, "release", 7) == 0) have_release = (session_cfg.release_ms > 0.0f);
+                if (strncmp(line, "pulse", 5) == 0) have_pulse = (session_cfg.pulse_ms > 0.0f);
+                if (strncmp(line, "threshold", 9) == 0) have_threshold = true;
+                if (strncmp(line, "side", 4) == 0) have_side = true;
+                if (strncmp(line, "reverse", 7) == 0) have_reverse = true;
+                if (strncmp(line, "phase", 5) == 0) have_phase = true;
+                if (strncmp(line, "ephys", 5) == 0) have_ephys = true;
+
+                logger.ack();
+            }
+        }
+    
+    check_done:
+        bool trial_required = (session_cfg.phase != 0 && session_cfg.phase != 1);
+
+        if (have_engage && have_release && have_pulse &&
+            have_threshold && have_side && have_reverse && have_phase &&
+            have_ephys && (!trial_required || have_trial)) {
+
+            applyPhaseDefaults(session_cfg.phase);
+
+            if (!have_trial) {
+                trial_cfg.trial_n = 1;
+                trial_cfg.easy = false;
+                trial_cfg.side = session_cfg.side;
+                trial_cfg.pending = false;
+            }
+
+            return;
+        }
+    }
+}
+
+static void drainSerial() {
+    char line[96];
+
+    while (readLine(line, sizeof(line))) {
+        if (strcmp(line, "R1") == 0) {
+            digitalWrite(RECORD_TTL, HIGH);
+            logger.ack();
+            continue;
+        }
+
+        if (strcmp(line, "R2") == 0) {
+            digitalWrite(RECORD_TTL, LOW);
+            logger.ack();
+            continue;
+        }
+
+        if (strcmp(line, "img_start") == 0) {
+            sendPulseTrain("img_start");
+            logger.ack();
+            continue;
+        }
+
+        if (strcmp(line, "img_stop") == 0) {
+            sendPulseTrain("img_stop");
+            logger.ack();
+            continue;
+        }
+
+        if (strcmp(line, "E") == 0) {
+            session_state = SessionState::CLEANUP;
+            logger.ack();
+            continue;
+        }
+
+        if (strcmp(line, "H") == 0 || strcmp(line, "M") == 0) {
+            logger.ack();
+
+            if (phase_state == PhaseState::TRIAL) {
+                phase_timer.reset();
+                trial_hit = (line[0] == 'H');
+                reward_given = false;
+                phase_state = trial_hit ? PhaseState::HIT : PhaseState::MISS;
+            }
+
+            continue;
+        }
+
+        {
+            char tmp[96];
+            strncpy(tmp, line, sizeof(tmp));
+            tmp[sizeof(tmp)-1] = 0;
+
+            if (parseTrialConfig(tmp)) {
+                logger.ack();
+                continue;
+            }
+        }
+
+        {
+            char tmp[96];
+            strncpy(tmp, line, sizeof(tmp));
+            tmp[sizeof(tmp)-1] = 0;
+
+            if (parseKeyValue(tmp)) {
+                logger.ack();
+                continue;
+            }
+        }
+    }
+}
+
+void writeSerial(const char* event) {
+    if (event == nullptr) return;
+
+    bool sent = false;
+
+    // cue, r_cue
+    if (strcmp(event, "cue") == 0) {
+        logger.write("cue");
+        sent = true;
+    }
+    else if (strcmp(event, "r_cue") == 0) {
+        logger.write("r_cue");
+        sent = true;
+    }
+
+    // hit, miss
+    else if (strcmp(event, "hit") == 0) {
+        logger.write("hit");
+        sent = true;
+    }
+    else if (strcmp(event, "miss") == 0) {
+        logger.write("miss");
+        sent = true;
+    }
+
+    // lick
+    else if (strcmp(event, "lick") == 0) {
+        logger.write("lick");
+        sent = true;
+    }
+
+    // process pulse train
+    if (sent) {
+        sendPulseTrain(event);
+    }
+}
+
+// ---------------------------
+// DATA HELPERS
+// ---------------------------
+inline bool nearMultiple(float x, float step, float tol, float* nearest_out) {
+    float q = roundf(x / step);
+    float m = q * step;
+
+    if (nearest_out) *nearest_out = m;
+
+    return fabsf(x - m) <= tol;
+}
+
+static void checkInactivity(float current_disp) {
+    static Timer inactivity_timer;
+    static bool cue_active = false;
+    static unsigned long timeout_T = SECONDS(5);
+    static float init_disp = 0.0f;
+    const unsigned long inactivity_start_T = SECONDS(5);
+
+    if (phase_state != PhaseState::TRIAL) {
+        cue_active = false;
+        inactivity_timer.reset();
+        init_disp = current_disp;
+        return;
+    }
+
+    unsigned long elapsed_ms = phase_timer.timeElapsed();
+    if (elapsed_ms < inactivity_start_T) {
+        cue_active = false;
+        inactivity_timer.reset();
+        init_disp = current_disp;
+        return;
+    }
+
+    unsigned long remaining_ms = (elapsed_ms < trial_T) ? (trial_T - elapsed_ms) : 0;
+
+    if (!cue_active) {
+        if (!inactivity_timer.started()) {
+            init_disp = current_disp;
+            inactivity_timer.init(timeout_T);
+            inactivity_timer.start();
+        }
+
+        if (fabsf(current_disp - init_disp) >= DEGREES(5)) {
+            init_disp = current_disp;
+            inactivity_timer.init(timeout_T);
+            inactivity_timer.start();
+        }
+
+        if (!inactivity_timer.isRunning() && (remaining_ms > tone_T)) {
+            speaker.cue();
+            writeSerial("r_cue");
+            
+            cue_active = true;
+            inactivity_timer.init(tone_T);
+            inactivity_timer.start();
+        }
+    } else {
+        if (!inactivity_timer.isRunning()) {
+            speaker.stop();
+            cue_active = false;
+
+            if (remaining_ms > 0) {
+                init_disp = current_disp;
+                inactivity_timer.init(timeout_T);
+                inactivity_timer.start();
+            } else {
+                inactivity_timer.reset();
+            }
+        }
+    }
+}
+
+// ---------------------------
+// TTL HELPERS
+// ---------------------------
+int eventTypeToPulseCount(const String& eventType) {
+    if (eventType == "lick") return 1;
+    if (eventType == "cue") return 2;
+    if (eventType == "r_cue") return 2;
+    if (eventType == "hit") return 3;
+    if (eventType == "miss") return 3;
+    if (eventType == "img_start") return 4;
+    if (eventType == "img_stop") return 5;
+
+    return 0;
+}
+
+bool sendPulseTrain(const String& eventType) {
+    if (!session_cfg.ephys) return false;
+
+    int count = eventTypeToPulseCount(eventType);
+    if (count <= 0) return false;
+
+    for (int i = 0; i < count; i++) {
+        digitalWrite(EVENT_TTL, HIGH);
+        delayMicroseconds(EVENT_PULSE_US);
+
+        digitalWrite(EVENT_TTL, LOW);
+
+        if (i < count - 1) {
+            delayMicroseconds(EVENT_IPI_US);
+        }
+    }
+
+    delayMicroseconds(EVENT_TRAIN_GAP_US);
+
+    return true;
+}
+
+// ---------------------------
+// TOP LEVEL
+// ---------------------------
+void run_phase_0();
+void run_phase_1();
+void run_phase_2();
+void run_phase_3();
+void run_phase_4_plus();
+
+void setup() {
+    MCUSR = 0;
+    wdt_disable();
+
+    pinMode(POWER_EN, OUTPUT);
+    digitalWrite(POWER_EN, LOW);
+
+    pinMode(RECORD_TTL, OUTPUT);
+    digitalWrite(RECORD_TTL, LOW);
+    pinMode(EVENT_TTL, OUTPUT);
+    digitalWrite(EVENT_TTL, LOW);
+
+    Serial.begin(BAUDRATE);
+    randomSeed(analogRead(SEED_PIN));
+
+    parseFlushCommand();
+
+    if (session_cfg.flush) {
+        digitalWrite(POWER_EN, HIGH);
+        delay(100);
+
+        spout.init(0);
+        spout.flush(10000);
+
+        logger.write("R");
+        Serial.flush();
+
+        delay(100);
+        digitalWrite(POWER_EN, LOW);
+
+        wdt_enable(WDTO_15MS);
+        while (1) {}
+    }
+
+    waitForHandshake();
+
+    unsigned long engage_us = (unsigned long)(session_cfg.engage_ms * 1000.0f);
+    unsigned long release_us = (unsigned long)(session_cfg.release_ms * 1000.0f);
+    unsigned long pulse_us = (unsigned long)(session_cfg.pulse_ms * 1000.0f);
+
+    digitalWrite(POWER_EN, HIGH);
+    delay(100);
+
+    brake.init(engage_us, release_us);
+    brake.engage();
+
+    String side = (session_cfg.side == 'R') ? "R" : "L";
+    speaker.init(side);
+
+    spout.init(pulse_us);
+
+    for (int i = 0; i < 5; i++) {
+        spout.flush(5);
+        delay(150);
+    }
+
+    lick.init(RAW_FLAG);
+    // lick.calibrate();
+
+    wheel.init(easy_threshold, session_cfg.threshold, trial_cfg.side, session_cfg.reverse);
+
+    parseStartCommand();
+
+    raw_timer.init(sample_T);
+    raw_timer.start();
+
+    session_state = SessionState::MAIN;
+    phase_state = PhaseState::IDLE;
+}
+
+void loop() {
+    drainSerial();
+
+    switch (session_state) {
+        case SessionState::MAIN: {
+            switch (session_cfg.phase) {
+                case 0: run_phase_0(); break;
+                case 1: run_phase_1(); break;
+                case 2: run_phase_2(); break;
+                case 3: run_phase_3(); break;
+                default: run_phase_4_plus(); break;
+            }
+
+            static uint32_t last_raw_us = 0;
+            if (RAW_FLAG && raw_timer.isRunning()) {
+                uint32_t now_us = micros();
+
+                if ((uint32_t)(now_us - last_raw_us) >= RAW_US) {
+                    last_raw_us += RAW_US;
+
+                    uint16_t raw_val = lick.sampleRaw();
+                    logger.writeRaw(raw_val);
+                }
+            } else {
+                last_raw_us = micros();
+            }
+
+            break;
+        }
+
+        case SessionState::CLEANUP: {
+            digitalWrite(RECORD_TTL, LOW);
+            digitalWrite(EVENT_TTL, LOW);
+
+            logger.write("S");
+
+            brake.engage();
+
+            phase_timer.reset();
+            session_timer.reset();
+
+            delay(500);
+            digitalWrite(POWER_EN, LOW);
+
+            for (;;) { delay(1000); }
+            break;
+        }
+    }
+}
+
+void run_phase_0() {
+    switch (phase_state) {
+        case PhaseState::IDLE: {
+            if (!session_initialized) {
+                session_initialized = true;
+
+                session_timer.init(session_T);
+                session_timer.start();
+
+                phase_state = PhaseState::CUE;
+            }
+
+            break;
+        }
+
+        case PhaseState::CUE: {
+            if (!phase_timer.started()) {
+                phase_timer.init(tone_T);
+                phase_timer.start();
+
+                writeSerial("cue");
+            }
+            else {
+                if (!phase_timer.isRunning()) {
+                    phase_timer.reset();
+
+                    phase_state = PhaseState::TRIAL;
+                }
+            }
+
+            break;
+        }
+
+        case PhaseState::TRIAL: {
+            if (!phase_timer.started()) {
+                phase_timer.init(trial_T);
+                phase_timer.start();
+            }
+            else {
+                if (phase_timer.isRunning()) {
+                    lick.sampleFiltered();
+
+                    if (lick.justTouched()) {
+                        writeSerial("lick");
+                    }
+                }
+                else {
+                    phase_timer.reset();
+
+                    phase_state = PhaseState::HIT;
+                }
+            }
+
+            break;
+        }
+
+        case PhaseState::HIT: {
+            if (!phase_timer.started()) {
+                phase_timer.init(tone_T);
+                phase_timer.start();
+
+                writeSerial("hit");
+            }
+            else {
+                if (!phase_timer.isRunning()) {
+                    phase_timer.reset();
+
+                    phase_state = PhaseState::DELAY;
+                }
+            }
+
+            break;
+        }
+
+        case PhaseState::DELAY: {
+            if (session_timer.isRunning()) {
+                if (!phase_timer.started()) {
+                    phase_timer.init(delay_T);
+                    phase_timer.start();
+                }
+                else {
+                    if (!phase_timer.isRunning()) {
+                        phase_timer.reset();
+
+                        phase_state = PhaseState::CUE;
+                    }
+                }
+            }
+            else {
+                session_state = SessionState::CLEANUP;
+            }
+
+            break;
+        }
+    }
+}
+
+void run_phase_1() {
+    switch (phase_state) {
+        case PhaseState::IDLE: {
+            if (!session_initialized) {
+                session_initialized = true;
+
+                session_timer.init(session_T);
+                session_timer.start();
+
+                phase_state = PhaseState::HIT;
+            }
+
+            break;
+        }
+        
+        case PhaseState::HIT: {
+            // entry
+            if (!phase_timer.started()) {
+                writeSerial("hit");
+
+                phase_timer.init(tone_T);
+                phase_timer.start();
+            }
+            // active
+            else {
+                // running
+                if (phase_timer.isRunning()) {
+                    lick.sampleFiltered();
+                    if (lick.justTouched()) {
+                        writeSerial("lick");
+                    }
+
+                    if ((phase_timer.timeElapsed() >= (tone_T >> 1)) && !reward_given) {
+                        spout.pulse();
+                        reward_given = true;
+                    }
+                // exit
+                } else {
+                    phase_timer.reset();
+                    reward_given = false;
+
+                    // HIT -> DELAY
+                    phase_state = PhaseState::DELAY;
+                }
+            }
+
+            break;
+        }
+        
+        case PhaseState::TRIAL: {
+            if (session_timer.isRunning()) {
+                if (!phase_timer.started()) {
+                    phase_timer.init(trial_T);
+                    phase_timer.start();
+                }
+
+                lick.sampleFiltered();
+                if (lick.justTouched()) {
+                    writeSerial("lick");
+
+                    phase_timer.reset();
+                    phase_state = PhaseState::HIT;
+                }
+                else if (!phase_timer.isRunning()) {
+                    phase_timer.reset();
+
+                    phase_state = PhaseState::HIT;
+                }
+            }
+            else {
+                spout.pulse();
+
+                session_state = SessionState::CLEANUP;
+            }
+            break;
+        }
+        
+        case PhaseState::DELAY: {
+            phase_state = PhaseState::TRIAL;
+
+            break;
+        }
+    }
+}
+
+void run_phase_2() {
+    switch (phase_state) {
+        case PhaseState::IDLE: {
+            if (!session_initialized) {
+                brake.release();
+
+                session_timer.init(session_T);
+                session_timer.start();
+
+                session_initialized = true;
+                phase_state = PhaseState::CUE;
+            }
+
+            break;
+        }
+
+        case PhaseState::CUE: {
+            // entry
+            phase_state = PhaseState::TRIAL;
+
+            break;
+        }
+
+        case PhaseState::TRIAL: {
+            // entry
+            if (!phase_timer.started()) {
+                wheel.reset(trial_cfg.easy, trial_cfg.side);
+                trial_cfg.pending = false;
+
+                last_disp_mark = LONG_MIN;
+
+                phase_timer.init(trial_T);
+                phase_timer.start();
+            }
+            // active
+            else {
+                // running
+                if (phase_timer.isRunning()) {
+                    lick.sampleFiltered();
+                    if (lick.justTouched()) {
+                        writeSerial("lick");
+                    }
+
+                    wheel.update();
+                    float disp = wheel.displacement;
+
+                    float nearest;
+                    if (nearMultiple(disp, 0.5f, 0.1f, &nearest)) {
+                        long mark = lroundf(nearest);
+                        if (mark != last_disp_mark) {
+                            logger.write(nearest);
+                            last_disp_mark = mark;
+                        }
+                    }
+
+                    // success exit
+                    if (wheel.thresholdReached()) {
+                        phase_timer.reset();
+
+                        // TRIAL -> HIT
+                        trial_hit = true;
+                        phase_state = PhaseState::HIT;
+                    }
+                    else if (wheel.thresholdMissed()) {
+                        phase_timer.reset();
+
+                        // TRIAL -> MISS
+                        trial_hit = false;
+                        phase_state = PhaseState::MISS;
+                    }
+                }
+                // failure exit
+                else {
+                    phase_timer.reset();
+
+                    // TRIAL -> MISS
+                    trial_hit = false;
+                    phase_state = PhaseState::MISS;
+                }
+            }
+
+            break;
+        }
+
+        case PhaseState::HIT: {
+            // entry
+            if (!phase_timer.started()) {
+                writeSerial("hit");
+
+                spout.pulse();
+
+                phase_timer.init(tone_T);
+                phase_timer.start();
+            }
+            // active
+            else {
+                // running
+                if (phase_timer.isRunning()) {
+                    lick.sampleFiltered();
+                    if (lick.justTouched()) {
+                        writeSerial("lick");
+                    }
+                // exit
+                } else {
+                    phase_timer.reset();
+                    reward_given = false;
+
+                    // HIT -> DELAY
+                    phase_state = PhaseState::DELAY;
+                }
+            }
+
+            break;
+        }
+
+        case PhaseState::MISS: {
+            // entry
+            if (!phase_timer.started()) {
+                writeSerial("miss");
+
+                phase_timer.init(tone_T);
+                phase_timer.start();
+            }
+            // active
+            else {
+                // running
+                if (phase_timer.isRunning()) {
+                    lick.sampleFiltered();
+                    if (lick.justTouched()) {
+                        writeSerial("lick");
+                    }
+                }
+                // exit
+                else {
+                    phase_timer.reset();
+
+                    // MISS -> DELAY
+                    phase_state = PhaseState::DELAY;
+                }
+            }
+
+            break;
+        }
+
+        case PhaseState::DELAY: {
+            if (session_timer.isRunning()) {
+                phase_state = PhaseState::CUE;
+            }
+            else {
+                // DELAY -> CLEANUP
+                session_state = SessionState::CLEANUP;
+            }
+
+            break;
+        }
+    }
+}
+
+void run_phase_3() {
+    switch (phase_state) {        
+        case PhaseState::IDLE: {
+            if (!session_initialized) {
+                brake.release();
+
+                session_timer.init(session_T);
+                session_timer.start();
+
+                session_initialized = true;
+                phase_state = PhaseState::CUE;
+            }
+
+            break;
+        }
+        
+        case PhaseState::CUE: {
+            // entry
+            if (!phase_timer.started()) {
+                writeSerial("cue");
+
+                speaker.cue();
+
+                phase_timer.init(tone_T);
+                phase_timer.start();
+            }
+            // active
+            else {
+                // running
+                if (phase_timer.isRunning()) {
+                    lick.sampleFiltered();
+                    if (lick.justTouched()) {
+                        writeSerial("lick");
+                    }
+                }
+                // exit
+                else {
+                    phase_timer.reset();
+
+                    phase_state = PhaseState::TRIAL;
+                }
+            }
+
+            break;
+        }
+        
+        case PhaseState::TRIAL: {
+            // entry
+            if (!phase_timer.started()) {
+                wheel.reset(trial_cfg.easy, trial_cfg.side);
+                trial_cfg.pending = false;
+
+                last_disp_mark = LONG_MIN;
+
+                phase_timer.init(trial_T);
+                phase_timer.start();
+            }
+            // active
+            else {
+                // running
+                if (phase_timer.isRunning()) {
+                    lick.sampleFiltered();
+                    if (lick.justTouched()) {
+                        writeSerial("lick");
+                    }
+
+                    wheel.update();
+                    float disp = wheel.displacement;
+
+                    float nearest;
+                    if (nearMultiple(disp, 0.5f, 0.1f, &nearest)) {
+                        long mark = lroundf(nearest);
+                        if (mark != last_disp_mark) {
+                            logger.write(nearest);
+                            last_disp_mark = mark;
+                        }
+                    }
+
+                    // success exit
+                    if (wheel.thresholdReached()) {
+                        phase_timer.reset();
+
+                        // TRIAL -> HIT
+                        trial_hit = true;
+                        phase_state = PhaseState::HIT;
+                    }
+                    else if (wheel.thresholdMissed()) {
+                        phase_timer.reset();
+
+                        // TRIAL -> MISS
+                        trial_hit = false;
+                        phase_state = PhaseState::MISS;
+                    }
+                }
+                // failure exit
+                else {
+                    phase_timer.reset();
+
+                    // TRIAL -> MISS
+                    trial_hit = false;
+                    phase_state = PhaseState::MISS;
+                }
+            }
+
+            break;
+        }
+
+        case PhaseState::HIT: {
+            // entry
+            if (!phase_timer.started()) {
+                writeSerial("hit");
+
+                speaker.hit();
+                spout.pulse();
+
+                phase_timer.init(tone_T);
+                phase_timer.start();
+            }
+            // active
+            else {
+                // running
+                if (phase_timer.isRunning()) {
+                    lick.sampleFiltered();
+                    if (lick.justTouched()) {
+                        writeSerial("lick");
+                    }
+                // exit
+                } else {
+                    phase_timer.reset();
+                    reward_given = false;
+
+                    // HIT -> DELAY
+                    phase_state = PhaseState::DELAY;
+                }
+            }
+
+            break;
+        }
+
+        case PhaseState::MISS: {
+            // entry
+            if (!phase_timer.started()) {
+                writeSerial("miss");
+
+                speaker.miss();
+
+                phase_timer.init(tone_T);
+                phase_timer.start();
+            }
+            // active
+            else {
+                // running
+                if (phase_timer.isRunning()) {
+                    lick.sampleFiltered();
+                    if (lick.justTouched()) {
+                        writeSerial("lick");
+                    }
+                }
+                // exit
+                else {
+                    phase_timer.reset();
+
+                    // MISS -> DELAY
+                    phase_state = PhaseState::DELAY;
+                }
+            }
+
+            break;
+        }
+        
+        case PhaseState::DELAY: {
+            if (session_timer.isRunning()) {
+                // entry
+                if (!phase_timer.started()) {
+                    phase_timer.init(delay_T);
+                    phase_timer.start();
+                }
+                // active
+                else {
+                    // running
+                    if (phase_timer.isRunning()) {
+                        lick.sampleFiltered();
+                        if (lick.justTouched()) {
+                            writeSerial("lick");
+                        }
+                    }
+                    // exit
+                    else {
+                        phase_timer.reset();
+
+                        // DELAY -> CUE
+                        phase_state = PhaseState::CUE;
+                    }
+                }
+            }
+            else {
+                // DELAY -> CLEANUP
+                session_state = SessionState::CLEANUP;
+            }
+
+            break;
+        }
+    }
+}
+
+void run_phase_4_plus() {
+    switch (phase_state) {        
+        case PhaseState::IDLE: {
+            if (!session_initialized) {
+                session_timer.init(session_T);
+                session_timer.start();
+
+                session_initialized = true;
+                phase_state = PhaseState::CUE;
+            }
+
+            break;
+        }
+        
+        case PhaseState::CUE: {
+            // entry
+            if (!phase_timer.started()) {
+                writeSerial("cue");
+
+                speaker.cue();
+
+                phase_timer.init(tone_T);
+                phase_timer.start();
+            }
+            // active
+            else {
+                // running
+                if (phase_timer.isRunning()) {
+                    lick.sampleFiltered();
+                    if (lick.justTouched()) {
+                        writeSerial("lick");
+                    }
+                }
+                // exit
+                else {
+                    phase_timer.reset();
+                    brake.release();
+
+                    phase_state = PhaseState::TRIAL;
+                }
+            }
+
+            break;
+        }
+        
+        case PhaseState::TRIAL: {
+            // entry
+            if (!phase_timer.started()) {
+                wheel.reset(trial_cfg.easy, trial_cfg.side);
+                trial_cfg.pending = false;
+
+                last_disp_mark = LONG_MIN;
+
+                phase_timer.init(trial_T);
+                phase_timer.start();
+            }
+            // active
+            else {
+                // running
+                if (phase_timer.isRunning()) {
+                    lick.sampleFiltered();
+                    if (lick.justTouched()) {
+                        writeSerial("lick");
+                    }
+
+                    wheel.update();
+                    float disp = wheel.displacement;
+
+                    float nearest;
+                    if (nearMultiple(disp, 0.5f, 0.1f, &nearest)) {
+                        long mark = lroundf(nearest);
+                        if (mark != last_disp_mark) {
+                            logger.write(nearest);
+                            last_disp_mark = mark;
+                        }
+                    }
+
+                    checkInactivity(disp);
+
+                    // success exit
+                    if (wheel.thresholdReached()) {
+                        phase_timer.reset();
+
+                        // TRIAL -> HIT
+                        trial_hit = true;
+                        phase_state = PhaseState::HIT;
+                    }
+                    else if (wheel.thresholdMissed()) {
+                        phase_timer.reset();
+
+                        // TRIAL -> MISS
+                        trial_hit = false;
+                        phase_state = PhaseState::MISS;
+                    }
+                }
+                // failure exit
+                else {
+                    phase_timer.reset();
+
+                    // TRIAL -> MISS
+                    trial_hit = false;
+                    phase_state = PhaseState::MISS;
+                }
+            }
+
+            break;
+        }
+
+        case PhaseState::HIT: {
+            // entry
+            if (!phase_timer.started()) {
+                writeSerial("hit");
+
+                brake.engage();
+                speaker.hit();
+
+                phase_timer.init(tone_T);
+                phase_timer.start();
+            }
+            // active
+            else {
+                // running
+                if (phase_timer.isRunning()) {
+                    lick.sampleFiltered();
+                    if (lick.justTouched()) {
+                        writeSerial("lick");
+                    }
+
+                    if ((phase_timer.timeElapsed() >= (tone_T >> 1)) && !reward_given) {
+                        spout.pulse();
+                        reward_given = true;
+                    }
+                // exit
+                } else {
+                    phase_timer.reset();
+                    reward_given = false;
+
+                    // HIT -> DELAY
+                    phase_state = PhaseState::DELAY;
+                }
+            }
+
+            break;
+        }
+
+        case PhaseState::MISS: {
+            // entry
+            if (!phase_timer.started()) {
+                writeSerial("miss");
+
+                brake.engage();
+                speaker.miss();
+
+                phase_timer.init(tone_T);
+                phase_timer.start();
+            }
+            // active
+            else {
+                // running
+                if (phase_timer.isRunning()) {
+                    lick.sampleFiltered();
+                    if (lick.justTouched()) {
+                        writeSerial("lick");
+                    }
+                }
+                // exit
+                else {
+                    phase_timer.reset();
+
+                    // MISS -> DELAY
+                    phase_state = PhaseState::DELAY;
+                }
+            }
+
+            break;
+        }
+        
+        case PhaseState::DELAY: {
+            if (session_timer.isRunning()) {
+                // entry
+                if (!phase_timer.started()) {
+                    phase_timer.init(delay_T);
+                    phase_timer.start();
+                }
+                // active
+                else {
+                    // running
+                    if (phase_timer.isRunning()) {
+                        lick.sampleFiltered();
+                        if (lick.justTouched()) {
+                            writeSerial("lick");
+                        }
+                    }
+                    // exit
+                    else {
+                        phase_timer.reset();
+
+                        // DELAY -> CUE
+                        phase_state = PhaseState::CUE;
+                    }
+                }
+            }
+            else {
+                // DELAY -> CLEANUP
+                session_state = SessionState::CLEANUP;
+            }
+
+            break;
+        }
+    }
+}

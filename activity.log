@@ -1,0 +1,23 @@
+[open-ephys][debug] Setting num inputs on LfpDisplayNode to 16
+[open-ephys][ddebug]     Finished creating buffers in 0.4938 milliseconds
+[open-ephys][debug] Creating LfpDisplayCanvas
+[open-ephys][debug]     Created split displays in 1.074 milliseconds
+[open-ephys][ddebug]     Loaded layout in 0.0004 milliseconds
+[open-ephys][debug] LfpDisplayCanvas loading custom parameters.
+[open-ephys][debug] Setting num inputs on LfpDisplayNode to 16
+[open-ephys][ddebug]     Finished creating buffers in 0.0094 milliseconds
+[open-ephys][debug] TTLRecordPanel: record line set to 4
+[open-ephys][debug] TTLRecordPanel: event line set to 5
+[open-ephys][debug] Setting num inputs on LfpDisplayNode to 16
+[open-ephys][ddebug]     Finished creating buffers in 0.5411 milliseconds
+[open-ephys][debug] Creating LfpDisplayCanvas
+[open-ephys][debug]     Created split displays in 1.1907 milliseconds
+[open-ephys][ddebug]     Loaded layout in 0.0099 milliseconds
+[open-ephys][debug] LfpDisplayCanvas loading custom parameters.
+[open-ephys][debug] Setting num inputs on LfpDisplayNode to 16
+[open-ephys][ddebug]     Finished creating buffers in 0.013 milliseconds
+[open-ephys][debug] TTLRecordPanel: record line set to 4
+[open-ephys][debug] TTLRecordPanel: event line set to 5
+[open-ephys][debug] TTLInputSim: started pulse-count train on line 5 with 1 pulses
+[open-ephys][debug] TTLInputSim: finished pulse-count train on line 5
+[open-ephys] TTLRecordPanel: decoded pulse-count event lick from 1 pulses

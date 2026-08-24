@@ -1,0 +1,12 @@
+default_profile: mega2560
+
+profiles:
+  mega2560:
+    fqbn: arduino:avr:mega
+    platforms:
+      - platform: arduino:avr
+
+  uno:
+    fqbn: arduino:avr:uno
+    platforms:
+      - platform: arduino:avr
