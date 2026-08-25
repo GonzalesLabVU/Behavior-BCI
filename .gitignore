@@ -1,10 +1,15 @@
 open-ephys/
 build/
-data/dev/
+dist/
+data/
+src/*.egg-info/
 behavioral_controller/behavioral_controller_overview.md
 behavioral_master_overview.md
 *.hex
 .env
 credentials.json
 __pycache__/
+.pytest_cache/
 .venv/
+.vscode/
+.idea/

@@ -6,7 +6,7 @@ warnings.filterwarnings('ignore', message='pkg_resources is deprecated as an API
 
 import time
 import threading
-from queue import Queue, Empty
+from queue import Empty
 import pygame as pg
 
 # ---------------------------

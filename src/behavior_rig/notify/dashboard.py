@@ -1,14 +1,12 @@
-import json
 import os
+import keyboard
 from datetime import datetime, timezone
-from pathlib import Path
-
-import gspread
-from google.oauth2.service_account import Credentials
 from gspread.utils import rowcol_to_a1
 
+from behavior_rig.config import CONFIG_DIR, get_sheets_client
+from behavior_rig.hardware.system import InterfaceObject
 
-CONFIG_DIR = Path(os.getenv("BEHAVIOR_CONFIG_DIR", str(Path(__file__).resolve().parent / "config")))
+
 ENV_PATH = CONFIG_DIR / ".env"
 CREDENTIALS_PATH = CONFIG_DIR / "credentials.json"
 
@@ -28,7 +26,55 @@ FIELD_ROWS = {
     }
 
 _ENV_CACHE = None
-_CLIENT_CACHE = None
+
+
+class DashboardInterface(InterfaceObject):
+    interface_name = "dashboard"
+
+    def __init__(self, client_id=None):
+        self.client_id = str(client_id or os.getenv("CLIENT_ID")).strip().upper()
+
+    @staticmethod
+    def _utc_iso():
+        return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+    def _safe_write(self, fields, timestamp=None):
+        try:
+            return write_fields(self.client_id,
+                                fields,
+                                timestamp=timestamp or self._utc_iso())
+        except Exception as exc:
+            print(f"[WARNING] Dashboard update failed: {type(exc).__name__}: {exc}",
+                  flush=True)
+            return None
+
+    def notify_start(self, session_data):
+        start_utc = self._utc_iso()
+
+        self._safe_write({
+            "status": "running",
+            "animal": session_data.meta.get("animal", ""),
+            "phase": session_data.meta.get("phase", "")
+            }, timestamp=start_utc)
+
+    def notify_finish(self):
+        self._safe_write({"status": "finished"}, timestamp=self._utc_iso())
+
+        original_read_key = keyboard.read_key
+
+        def _read_key_and_set_idle(*args, **kwargs):
+            try:
+                return original_read_key(*args, **kwargs)
+            finally:
+                self._safe_write({
+                    "status": "idle",
+                    "animal": "",
+                    "phase": ""
+                    }, timestamp=self._utc_iso())
+
+                keyboard.read_key = original_read_key
+
+        keyboard.read_key = _read_key_and_set_idle
 
 
 def _load_env():
@@ -85,24 +131,6 @@ def _norm_client_id(client_id):
         return "DEVELOPMENT"
 
     raise ValueError(f"Unknown dashboard client ID: {client_id!r}")
-
-
-def get_sheets_client():
-    global _CLIENT_CACHE
-
-    if _CLIENT_CACHE is not None:
-        return _CLIENT_CACHE
-
-    if CREDENTIALS_PATH.exists():
-        creds = Credentials.from_service_account_file(CREDENTIALS_PATH,
-                                                      scopes=API_SCOPES)
-    else:
-        raw = _get_env("GOOGLE_SERVICE_ACCOUNT_JSON")
-        creds = Credentials.from_service_account_info(json.loads(raw),
-                                                      scopes=API_SCOPES)
-
-    _CLIENT_CACHE = gspread.authorize(creds)
-    return _CLIENT_CACHE
 
 
 def _dashboard_worksheet():

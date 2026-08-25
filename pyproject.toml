@@ -17,5 +17,8 @@ dependencies = [
 	"keyboard"
 ]
 
+[tool.setuptools]
+package-dir = {"" = "src"}
+
 [project.scripts]
 behavior-rig = "behavior_rig.__main__:main"
