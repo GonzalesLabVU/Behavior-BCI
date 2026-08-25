@@ -8,8 +8,10 @@ from google.oauth2.service_account import Credentials
 from gspread.utils import rowcol_to_a1
 
 
-ENV_PATH = Path(__file__).resolve().parent / ".env"
-CREDENTIALS_PATH = Path(__file__).resolve().parent / "credentials.json"
+CONFIG_DIR = Path(os.getenv("BEHAVIOR_CONFIG_DIR", str(Path(__file__).resolve().parent / "config")))
+ENV_PATH = CONFIG_DIR / ".env"
+CREDENTIALS_PATH = CONFIG_DIR / "credentials.json"
+
 API_SCOPES = ["https://www.googleapis.com/auth/spreadsheets",
               "https://www.googleapis.com/auth/drive"]
 
@@ -85,7 +87,7 @@ def _norm_client_id(client_id):
     raise ValueError(f"Unknown dashboard client ID: {client_id!r}")
 
 
-def _build_client():
+def get_sheets_client():
     global _CLIENT_CACHE
 
     if _CLIENT_CACHE is not None:
@@ -105,7 +107,7 @@ def _build_client():
 
 def _dashboard_worksheet():
     dashboard_id = _get_env("DASHBOARD_ID")
-    workbook = _build_client().open_by_key(dashboard_id)
+    workbook = get_sheets_client().open_by_key(dashboard_id)
 
     try:
         worksheet = workbook.worksheet(DB_SHEET_NAME)
