@@ -1,5 +1,7 @@
 open-ephys/
-behavioral_controller/build/
+build/
+behavioral_controller/behavioral_controller_overview.md
+behavioral_master_overview.md
 *.hex
 .env
 credentials.json

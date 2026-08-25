@@ -1,0 +1,12 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "Behavior Rig: Behavioral Training Control System and Data Pipeline"
+version: 0.1.0
+date-released: 2026-08-24
+authors:
+  - family-names: "Sharp"
+    given-names: "Max"
+    affiliation: "Gonzales Laboratory, Vanderbilt University"
+    orcid: "https://orcid.org/0000-0000-0000-0000"
+repository-code: "https://github.com/GonzalesLabVU/Behavior-BCI"
+license: MIT

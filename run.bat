@@ -384,7 +384,7 @@ rem ----------------------------------------------------------------
     @echo off
     setlocal EnableExtensions EnableDelayedExpansion
 
-    set "SKETCH_DIR=%SCRIPT_DIR%\%~1"
+    set "SKETCH_DIR=%SCRIPT_DIR%\firmware\%~1"
 
     if not defined SKETCH_DIR    (echo [ERROR] Missing sketch folder argument  & endlocal & exit /b 1)
     if not exist "%SKETCH_DIR%\" (echo [ERROR] Folder not found: "%SKETCH_DIR%" & endlocal & exit /b 1)

@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61.0.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "behavior-rig"
+version = "0.1.0"
+description = "Behavioral BCI data acquisition and rig control"
+requires-python = ">=3.10"
+dependencies = [
+	"pyserial",
+	"gspread",
+	"google-auth",
+	"google-api-python-client",
+	"python-dotenv",
+	"pygame",
+	"keyboard"
+]
+
+[project.scripts]
+behavior-rig = "behavior_rig.__main__:main"
