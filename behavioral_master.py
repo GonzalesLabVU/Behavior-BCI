@@ -47,11 +47,14 @@ warnings.filterwarnings("ignore",
                         message="pkg_resources is deprecated as an API.*",
                         )
 
-SCRIPT_DIR = Path.cwd()
-ANIMAL_MAP_PATH = SCRIPT_DIR / "animal_map.json"
-ERROR_LOG_PATH = SCRIPT_DIR / "errors.log"
+REPO_ROOT = Path(__file__).resolve().parent
+CONFIG_DIR = Path(os.getenv("BEHAVIOR_CONFIG_DIR", str(REPO_ROOT / "config")))
+DATA_DIR = REPO_ROOT / "data"
 
-load_dotenv(SCRIPT_DIR / ".env")
+ANIMAL_MAP_PATH = CONFIG_DIR / "animal_map.json"
+ERROR_LOG_PATH = CONFIG_DIR / "errors.log"
+
+load_dotenv(CONFIG_DIR / ".env")
 
 BAUDRATE = 1_000_000
 EARLY_STRING = "E"
@@ -64,10 +67,6 @@ PHASE_CONFIG = {
     '6': {'threshold': 60.0, 'side': 'L', 'reverse': False}, # harder wheel
     '7': {'threshold': 90.0, 'side': 'L', 'reverse': False}, # hardest wheel
     }
-
-MAX_STREAK = 4
-LAST_SIDE = None
-SIDE_STREAK = 0
 
 EVT_QUEUE: "Queue[tuple[str, str]]" = Queue()
 ENC_QUEUE: "Queue[tuple[str, object]]" = Queue()
@@ -91,18 +90,17 @@ class InterfaceObject:
 class SystemInterface(InterfaceObject):
     interface_name = "environment"
 
-    def __init__(self, script_dir=SCRIPT_DIR):
-        """Initialize paths and load environment settings for the script.
+    def __init__(self, config_dir=CONFIG_DIR):
+        """
+        Initialize paths and load environment settings for the script.
 
         Args:
             script_dir: Directory containing runtime assets and the .env file.
         """
-        self.script_dir = Path(script_dir)
+        self.script_dir = Path(config_dir)
         self.animal_map_path = self.script_dir / "animal_map.json"
         self.credentials_path = self.script_dir / "credentials.json"
         self.env_path = self.script_dir / ".env"
-
-        load_dotenv(self.env_path)
 
     @property
     def animal_map(self):
@@ -244,8 +242,8 @@ class SystemInterface(InterfaceObject):
             print(f"\n[WARNING] Could not open Arduino port: {e}", flush=True)
             return None, False
 
-    def get_arduino(self, ser):
-        link = ArduinoLink(ser)
+    def get_arduino(self, ser, exceptions=None):
+        link = ArduinoLink(ser, exceptions=exceptions)
 
         try:
             link.start()
@@ -797,8 +795,12 @@ class EmailInterface(InterfaceObject):
     SMTP_SERVER = "smtp.gmail.com"
     SMTP_PORT = 587
 
+    def __init__(self, system=None):
+        self.system = system or SystemInterface()
+
     def send_session_summary(self, session_data):
-        """Email a summary of the completed session.
+        """
+        Email a summary of the completed session.
 
         Args:
             session_data: SessionData instance containing event and timing data.
@@ -880,9 +882,9 @@ class EmailInterface(InterfaceObject):
 
             return f'{h12}:{m:02d} {am_pm}'
 
-        smtp_username = SystemInterface().require("SMTP_USERNAME")
-        smtp_password = SystemInterface().require("SMTP_PASSWORD")
-        smtp_to_addr = SystemInterface().require("SMTP_TO_ADDR")
+        smtp_username = self.system.require("SMTP_USERNAME")
+        smtp_password = self.system.require("SMTP_PASSWORD")
+        smtp_to_addr = self.system.require("SMTP_TO_ADDR")
 
         date = session_data.meta['date']
         animal = session_data.meta['animal']
@@ -934,6 +936,10 @@ class SaveInterface(InterfaceObject):
     interface_name = "save"
 
     VALID_SESSION_S = 5 * 60
+
+    def __init__(self, trainer=None, exceptions=None):
+        self.trainer = trainer or TrainerInterface()
+        self.exceptions = exceptions or ExceptionInterface()
 
     def _build_rows(self, session_data, dtype):
         """
@@ -1104,7 +1110,7 @@ class SaveInterface(InterfaceObject):
                 session_data.overwrite_confirmed = True
                 return True
 
-            wb = API_CLIENT.open_by_key(workbook_id)
+            wb = get_sheets_client.open_by_key(workbook_id)
             existing = _find_existing_block(wb)
             if existing is None:
                 session_data.overwrite_confirmed = True
@@ -1131,7 +1137,7 @@ class SaveInterface(InterfaceObject):
                 session_data.overwrite_confirmed = False
                 return False
 
-            TrainerInterface().confirm_meta(session_data)
+            self.trainer.confirm_meta(session_data)
 
     def save_data(self, session_data):
         """
@@ -1257,7 +1263,7 @@ class SaveInterface(InterfaceObject):
         try:
             lock = FileLock(workbook_id, owner=client_id).acquire()
 
-            wb = API_CLIENT.open_by_key(workbook_id)
+            wb = get_sheets_client.open_by_key(workbook_id)
             lock.wb = wb
 
             sheet_map = (
@@ -1365,9 +1371,9 @@ class SaveInterface(InterfaceObject):
                 try:
                     lock.release()
                 except Exception as e:
-                    exc_proxy = ExceptionInterface(session_data.meta.get("animal", "UNKNOWN"),
-                                                   session_data.meta.get("phase", "0"))
-                    exc_proxy.log_and_commit(e)
+                    self.exceptions.set_session(session_data.meta.get("animal", "UNKNOWN"),
+                                                session_data.meta.get("phase", "0"))
+                    self.exceptions.log_and_commit(e)
 
     def save_raw(self, session_data):
         """Save raw capacitive sensor data to a local JSON file.
@@ -1434,7 +1440,7 @@ class SaveInterface(InterfaceObject):
         animal = session_data.meta.get('animal', 'UNKNOWN') if session_data else 'UNKNOWN'
         phase = session_data.meta.get('phase', '0') if session_data else '0'
 
-        exc_proxy = ExceptionInterface(animal, phase)
+        self.exceptions.set_session(animal, phase)
 
         try:
             self.save_data(session_data)
@@ -1443,13 +1449,13 @@ class SaveInterface(InterfaceObject):
             try:
                 self.fallback_save(session_data)
             except Exception as e2:
-                exc_proxy.log(e2)
+                self.exceptions.log(e2)
 
-            exc_proxy.log(e)
+            self.exceptions.log(e)
             return False
         finally:
             try:
-                exc_proxy.commit()
+                self.exceptions.commit()
             except Exception:
                 pass
 
@@ -1599,13 +1605,13 @@ class BehaviorInterfaces:
         """
         Create the default runtime interfaces used by setup and main.
         """
+        self.exceptions = ExceptionInterface()
         self.system = SystemInterface()
-        self.user = TrainerInterface(self.system)
+        self.user = TrainerInterface(system=self.system)
         self.console = ConsoleInterface()
         self.dashboard = DashboardInterface()
-        self.exceptions = ExceptionInterface()
-        self.email = EmailInterface()
-        self.saving = SaveInterface()
+        self.email = EmailInterface(system=self.system)
+        self.saving = SaveInterface(trainer=self.user, exceptions=self.exceptions)
         self.prairie = PrairieInterface()
         self.cursor = CursorInterface()
 
@@ -1631,7 +1637,7 @@ class ArduinoLink:
     RESTART_STRING = "R"
     ACK_STRING = "A"
 
-    def __init__(self, ser, verbose=False):
+    def __init__(self, ser, verbose=False, exceptions=None):
         """
         Initialize the serial link wrapper and reader thread.
 
@@ -1641,6 +1647,7 @@ class ArduinoLink:
         self.ser = ser
         self.verbose = bool(verbose)
         self.active = ser is not None and ser.is_open
+        self.exceptions = exceptions
         self.stop_evt = Event()
         self.ack_evt = Event()
         self.write_lock = Lock()
@@ -1864,7 +1871,8 @@ class ArduinoLink:
                 self.send_and_wait(self.EPHYS_STOP_STRING, timeout_s=timeout_s)
                 session_data.meta['_ephys_stopped'] = True
             except Exception as e:
-                ExceptionInterface().cache(e, "main.ephys_stop")
+                if self.exceptions is not None:
+                    self.exceptions.cache(e, "main.ephys_stop")
 
             return True
 
@@ -2109,11 +2117,38 @@ def _get_easy(phase, trial_n, K):
 # ---------------------------
 # DATA SAVING
 # ---------------------------
-API_SCOPES = ["https://www.googleapis.com/auth/spreadsheets",
-              "https://www.googleapis.com/auth/drive"]
-API_CREDS = Credentials.from_service_account_file(str(SCRIPT_DIR / 'credentials.json'), scopes=API_SCOPES)
-API_CLIENT = gspread.authorize(API_CREDS)
-API_DRIVE = build('drive', 'v3', credentials=API_CREDS, cache_discovery=False)
+_api_cache = dict()
+
+
+def _credentials_path():
+    return CONFIG_DIR / "credentials.json"
+
+
+def get_sheets_client():
+    if "client" not in _api_cache:
+        creds_path = _credentials_path()
+        if not creds_path.exists():
+            raise RuntimeError(f"Google service-account credentials not found at {creds_path}; see docs/install.md for how to provision one")
+
+        creds = Credentials.from_service_account_file(str(creds_path),
+                                                      scopes=[
+                                                          "https://www.googleapis.com/auth/spreadsheets",
+                                                          "https://www.googleapis.com/auth/drive"
+                                                            ]
+                                                        )
+        _api_cache["client"] = gspread.authorize(creds)
+
+    return _api_cache["client"]
+
+
+def get_drive_client():
+    if "drive" not in _api_cache:
+        creds = Credentials.from_service_account_file(str(_credentials_path()),
+                                                      scopes=["https://www.googleapis.com/auth/drive"]
+                                                      )
+        _api_cache["drive"] = build("drive", "v3", credentials=creds, cache_discovery=False)
+
+    return _api_cache["drive"]
 
 
 class FileLock:
@@ -2140,7 +2175,7 @@ class FileLock:
         self.reset_s = int(self.RESET_S)
         self.timeout_s = int(self.TIMEOUT_S)
 
-        self.client = API_CLIENT
+        self.client = get_sheets_client()
         self.workbook_id = workbook_id
         self.owner = owner
         self.token = uuid.uuid4().hex
@@ -2714,7 +2749,7 @@ def setup(interfaces=None):
 
     try:
         ser, arduino_found = system_proxy.serial_connect()
-        link = system_proxy.get_arduino(ser)
+        link = system_proxy.get_arduino(ser, exceptions=interfaces.exceptions)
 
         flush_active = user_proxy.prompt_flush()
         if link.active:
@@ -2825,7 +2860,8 @@ def _update_easy_rate(session_data, trial_stack):
 
 
 def _is_early_exit(evt, index, end_ms, min_duration=20*60, min_trials=150):
-    """Determine whether low recent trial rate should end the session early.
+    """
+    Determine whether low recent trial rate should end the session early.
 
     Args:
         evt: Event dictionary containing timestamps and values.
@@ -2837,10 +2873,6 @@ def _is_early_exit(evt, index, end_ms, min_duration=20*60, min_trials=150):
     Returns:
         True when early-exit criteria are met, otherwise False.
     """
-    return False
-
-    width = 5
-
     buf = getattr(_is_early_exit, '_buf', None)
     if buf is None:
         buf = deque(maxlen=11)
@@ -3111,7 +3143,8 @@ def main(link, session_data, cursor, client=None, interfaces=None):
 
                     if int(phase_id) >= 4:
                         if calibrated:
-                            early_exit = _is_early_exit(session_data.evt, trial_n, end_ms)
+                            # early_exit = _is_early_exit(session_data.evt, trial_n, end_ms)
+                            early_exit = False
 
                             if early_exit:
                                 if imaging_active:
