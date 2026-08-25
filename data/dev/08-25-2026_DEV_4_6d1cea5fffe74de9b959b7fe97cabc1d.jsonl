@@ -1,0 +1,4 @@
+{"type": "header", "client": null, "workbook_id": null, "date": "08/25/2026", "animal": "DEV", "phase": "4", "session_id": "6d1cea5fffe74de9b959b7fe97cabc1d", "schema_version": "1", "started_at_utc": "2026-08-25T18:22:02+00:00", "aborted": false, "t_start": null, "t_stop": null, "duration_sec": null, "imaging_active": false, "ephys_active": false, "K1": 5, "K2": null, "easy_trials": [], "normal_trials": [], "left_targets": [], "right_targets": [], "both_targets": []}
+{"type": "evt", "ts": "13:22:04.313", "value": "cue"}
+{"type": "enc", "ts": "13:22:05.782", "value": 0.0}
+{"type": "evt", "ts": "13:22:15.768", "value": "r_cue"}

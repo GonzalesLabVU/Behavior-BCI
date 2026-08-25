@@ -1375,58 +1375,6 @@ class SaveInterface(InterfaceObject):
                                                 session_data.meta.get("phase", "0"))
                     self.exceptions.log_and_commit(e)
 
-    def save_raw(self, session_data):
-        """Save raw capacitive sensor data to a local JSON file.
-
-        Args:
-            session_data: SessionData instance containing raw cap data.
-
-        Returns:
-            Path to the saved file, or None when no raw data is available.
-        """
-        if session_data is None:
-            return None
-
-        cap = session_data.raw.get('cap', {})
-        ts_list = cap.get('timestamps', [])
-        val_list = cap.get('values', [])
-
-        if not ts_list:
-            return None
-
-        animal_id = str(session_data.meta.get("animal", "UNKNOWN"))
-        animal_str = f'Animal={animal_id}'
-
-        phase_id = str(session_data.meta.get("phase", "0"))
-        phase_str = f'Phase={phase_id}'
-
-        date_str = str(session_data.meta.get("date", "")).strip()
-        try:
-            mm_dd_yyyy = datetime.strptime(date_str, "%m/%d/%Y").strftime("%m-%d-%Y")
-        except Exception:
-            mm_dd_yyyy = datetime.now().strftime("%m-%d-%Y")
-
-        out_name = f'raw_cap_{animal_str}_{phase_str}_{mm_dd_yyyy}.json'
-        out_path = SCRIPT_DIR / out_name
-
-        payload = {
-            "meta": {
-                "animal": animal_id,
-                "phase": str(session_data.meta.get("phase", "")),
-                "date": date_str,
-            },
-            "data": {
-                "timestamps": ts_list,
-                "values": val_list,
-            },
-        }
-
-        with open(out_path, 'w', encoding='utf-8') as out_file:
-            json.dump(payload, out_file, indent=4)
-
-        print(f'Saved raw data locally to {out_path.name}', flush=True)
-        return out_path
-
     def save_session(self, session_data):
         """
         Save session data to Google Sheets with local fallback on failure.
@@ -1913,12 +1861,19 @@ class SessionData:
             phase_id: Training phase identifier.
             date_str: Session date string.
         """
+        self.session_id = uuid.uuid4().hex
+        self.schema_version = "1"
+        self.started_at_utc = datetime.now(timezone.utc).isoformat(timespec="seconds")
+
         self.meta = {
             "client": None,
             "workbook_id": None,
             "date": date_str,
             "animal": animal_id,
             "phase": phase_id,
+            "session_id": self.session_id,
+            "schema_version": self.schema_version,
+            "started_at_utc": self.started_at_utc,
             "aborted": False,
             "t_start": None,
             "t_stop": None,
@@ -2034,13 +1989,15 @@ class SessionData:
         raise ValueError(f"Invalid field: {field!r} (Expected one of: None, 'evt', 'enc', 'raw')")
 
     def to_dict(self):
-        """Convert the session data to JSON-safe dictionaries.
+        """
+        Convert the session data to JSON-safe dictionaries.
 
         Returns:
             Dictionary containing metadata, event, encoder, imaging, and raw data.
         """
         def _json_safe(x):
-            """Recursively convert values to JSON-safe primitives.
+            """
+            Recursively convert values to JSON-safe primitives.
 
             Args:
                 x: Value to convert.
@@ -2080,6 +2037,9 @@ class SessionData:
         meta_out['both_targets'] = list(both_targets)
 
         return {
+            'session_id': self.session_id,
+            'schema_version': self.schema_version,
+            'started_at_utc': self.started_at_utc,
             'meta': _json_safe(meta_out),
             'evt': _json_safe(self.evt),
             'enc': _json_safe(self.enc),
@@ -2091,6 +2051,77 @@ class SessionData:
     def is_finished(self):
         """Return whether the session has both start and stop timestamps."""
         return (self.meta['t_start'] is not None) and (self.meta['t_stop'] is not None)
+
+
+class SessionWriter:
+    """
+    Append-only local recorder
+
+    This is the canonical session record — Google Sheets is an export target, not the source of truth
+    """
+    def __init__(self, base_dir):
+        self.base_dir = Path(base_dir)
+        self._fh = None
+        self._path = None
+        self._buffer_count = 0
+        self._buffer_limit = 25
+
+    def open(self, session_data):
+        self.base_dir.mkdir(parents=True, exist_ok=True)
+
+        animal = session_data.meta.get("animal", "UNKNOWN")
+        phase = session_data.meta.get("phase", "0")
+        date = str(session_data.meta.get("date", "")).replace("/", "-")
+        fname = f"{date}_{animal}_{phase}_{session_data.session_id}.jsonl"
+
+        self._path = self.base_dir / fname
+
+        self._fh = open(self._path, "a", encoding="utf-8")
+        self._fh.write(json.dumps({"type": "header", **session_data.meta}) + "\n")
+        self._fh.flush()
+        os.fsync(self._fh.fileno())
+
+        return self._path
+
+    def append(self, record, force_fsync=False):
+        if self._fh is None:
+            return
+
+        self._fh.write(json.dumps(record) + "\n")
+        self._buffer_count += 1
+
+        if force_fsync or self._buffer_count >= self._buffer_limit:
+            self._fh.flush()
+            os.fsync(self._fh.fileno())
+            self._buffer_count = 0
+
+    def finalize(self, session_data):
+        payload = session_data.to_dict()
+        final_path = self._path.with_suffix(".json")
+
+        with open(final_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+
+        if self._fh is not None:
+            self._fh.flush()
+            os.fsync(self._fh.fileno())
+            self._fh.close()
+            self._fh = None
+
+        return self._path, final_path
+
+    def emergency_dump(self, session_data):
+        try:
+            path = self.base_dir / f"EMERGENCY_{session_data.session_id}.json"
+
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(session_data.to_dict(), f, indent=2)
+
+            return path
+        except Exception:
+            return None
 
 
 def _get_easy(phase, trial_n, K):
@@ -2795,6 +2826,14 @@ def setup(interfaces=None):
         
         session_data = SessionData(animal_id, str(phase_id), _get_date())
 
+        data_subdir = "dev" if animal_id == "DEV" else Path("sessions") / "pending"
+        writer = SessionWriter(DATA_DIR / data_subdir)
+
+        try:
+            writer.open(session_data)
+        except Exception as e:
+            raise RuntimeError(f"Could not open local session record: {e}") from e
+
         session_data.meta['workbook_id'] = workbook_id
         session_data.meta['imaging_active'] = bool(client is not None)
         session_data.meta['ephys_active'] = bool(ephys_active)
@@ -2810,7 +2849,7 @@ def setup(interfaces=None):
 
         dashboard_proxy.notify_start(session_data)
 
-        return link, session_data, cursor, client
+        return link, session_data, cursor, client, writer
     except Exception as e:
         interfaces.exceptions.cache(e, 'setup')
 
@@ -2983,7 +3022,7 @@ def _cleanup(link, msg, timeout_s=30.0):
         link.close()
 
 
-def main(link, session_data, cursor, client=None, interfaces=None):
+def main(link, session_data, cursor, client=None, writer=None, interfaces=None):
     """
     Run the behavioral session event loop.
 
@@ -3076,8 +3115,10 @@ def main(link, session_data, cursor, client=None, interfaces=None):
                 except Exception:
                     pass
 
-                if p == 'cue':
+                if p == "cue":
                     session_data.add_evt(ts, p)
+                    if writer is not None:
+                        writer.append({"type": "evt", "ts": ts, "value": p}, force_fsync=True)
 
                     if imaging_active and first_trial:
                         client_ok = client.start()
@@ -3094,6 +3135,8 @@ def main(link, session_data, cursor, client=None, interfaces=None):
                 
                 if p == 'r_cue':
                     session_data.add_evt(ts, p)
+                    if writer is not None:
+                        writer.append({"type": "evt", "ts": ts, "value": p}, force_fsync=True)
                 
                 if p in {'hit', 'miss'}:
                     if last_outcome == p:
@@ -3102,6 +3145,8 @@ def main(link, session_data, cursor, client=None, interfaces=None):
                     last_outcome = p
 
                     session_data.add_evt(ts, p)
+                    if writer is not None:
+                        writer.append({"type": "evt", "ts": ts, "value": p}, force_fsync=True)
 
                     if imaging_active:
                         client_stop_ok = client.stop_after(delay_s=1.0)
@@ -3176,7 +3221,10 @@ def main(link, session_data, cursor, client=None, interfaces=None):
                 
                 try:
                     pos = float(p)
+
                     session_data.add_enc(ts, str(pos))
+                    if writer is not None:
+                        writer.append({"type": "enc", "ts": ts, "value": pos})
 
                     try:
                         ENC_QUEUE.put_nowait(("WHEEL", pos))
@@ -3203,6 +3251,12 @@ def main(link, session_data, cursor, client=None, interfaces=None):
         dt = 0 if (t0 is None or t1 is None) else max(0, (t1 - t0) // 1000)
         session_data.meta["duration_sec"] = int(dt)
 
+        if writer is not None:
+            try:
+                writer.finalize(session_data)
+            except Exception:
+                writer.emergency_dump(session_data)
+
         link.stop_ephys(session_data, safe=True)
 
         if client is not None:
@@ -3226,13 +3280,13 @@ if __name__ == "__main__":
     run_exc = None
 
     try:
-        link, session_data, cursor, prairie = setup(interfaces)
+        link, session_data, cursor, prairie, writer = setup(interfaces)
 
         if session_data is not None:
             animal_id_for_log = session_data.meta.get("animal", "UNKNOWN")
             phase_id_for_log = session_data.meta.get("phase", "0")
 
-        main(link, session_data, cursor, prairie, interfaces)
+        main(link, session_data, cursor, prairie, writer, interfaces)
     except SystemExit as e:
         pass
     except KeyboardInterrupt as e:
@@ -3279,13 +3333,11 @@ if __name__ == "__main__":
                 try:
                     if interfaces.user.confirm_save():
                         if interfaces.saving.resolve_protocol(session_data):
-                            interfaces.saving.save_raw(session_data)
-
                             ok = interfaces.saving.save_session(session_data)
                             if not ok:
-                                interfaces.console.warning("Google Sheets save failed (saving locally instead)")
+                                interfaces.console.warning("Google Sheets save failed (local record already saved)")
                         else:
-                            print("Session exited without saving", flush=True)
+                            print("Session exited a Google Sheets upload (local record already saved)", flush=True)
                 except Exception as e:
                     interfaces.exceptions.cache(e, '__main__.safe_save')
 
