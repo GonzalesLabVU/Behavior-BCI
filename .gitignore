@@ -1,5 +1,6 @@
 open-ephys/
 build/
+data/dev/
 behavioral_controller/behavioral_controller_overview.md
 behavioral_master_overview.md
 *.hex
