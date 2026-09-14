@@ -11,15 +11,21 @@ void Spout::init(unsigned long pulse_dur_us) {
 }
 
 void Spout::pulse() {
-    digitalWrite(PULSE_PIN, HIGH);
-    delayMicroseconds(pulse_dur_us_);
-    digitalWrite(PULSE_PIN, LOW);
+    pulse(pulse_dur_us_);
 }
 
 void Spout::pulse(unsigned long us) {
-    digitalWrite(PULSE_PIN, HIGH);
-    delayMicroseconds(us);
-    digitalWrite(PULSE_PIN, LOW);
+    static constexpr unsigned long SUBPULSE_US = 2500;
+    static constexpr unsigned long GAP_MS = 20;
+
+    unsigned long start_us = micros();
+
+    while ((unsigned long)(micros() - start_us) < us) {
+        digitalWrite(PULSE_PIN, HIGH);
+        delayMicroseconds(SUBPULSE_US);
+        digitalWrite(PULSE_PIN, LOW);
+        delay(GAP_MS);
+    }
 }
 
 void Spout::flush() {
