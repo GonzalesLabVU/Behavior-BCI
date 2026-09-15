@@ -5,8 +5,12 @@ profiles:
     fqbn: arduino:avr:mega
     platforms:
       - platform: arduino:avr
+    libraries:
+      - Servo (1.3.0)
 
   uno:
     fqbn: arduino:avr:uno
     platforms:
       - platform: arduino:avr
+    libraries:
+      - Servo (1.3.0)
