@@ -9,8 +9,11 @@
 # ======================================================================
 # CONFIGURATION
 # ======================================================================
-$script:FQBN = "arduino:avr:mega"
 $script:ARDUINO_CLI = "arduino-cli"
+$script:CANDIDATE_BOARDS = @(
+    [PSCustomObject]@{ Fqbn = "arduino:avr:mega"; Profile = "mega2560" },
+    [PSCustomObject]@{ Fqbn = "arduino:avr:uno"; Profile = "uno" }
+)
 $script:CORE_HEADERS = @("Wire.h", "SPI.h", "EEPROM.h", "SoftwareSerial.h")
 $script:HEADER_TO_LIBRARY = @{
     "Servo.h" = "Servo"
@@ -22,11 +25,7 @@ $script:HEADER_TO_LIBRARY = @{
 function Exit-Fatal {
     param([string]$Message)
 
-    Write-Host ""
-    Write-Host "[FATAL] $Message"
-    Write-Host ""
-
-    exit 1
+    throw $Message
 }
 
 function Get-MissingHeaders {
@@ -144,33 +143,45 @@ function Initialize-ArduinoCli {
     return $true
 }
 
-function Find-ArduinoPort {
+function Find-ArduinoBoard {
     try {
         $out = arduino-cli board list --format json 2>$null
         if ($LASTEXITCODE -eq 0 -and $out) {
             $json = $out | ConvertFrom-Json
-            $match = $json.ports | Where-Object { $_.matching_boards.fqbn -contains "arduino:avr:mega" } |
-                Select-Object -First 1
-
-            if ($match) { return $match.address }
+            foreach ($port in $json.ports) {
+                foreach ($candidate in $script:CANDIDATE_BOARDS) {
+                    if ($port.matching_boards.fqbn -contains $candidate.Fqbn) {
+                        return [PSCustomObject]@{
+                            Port = $port.address
+                            Fqbn = $candidate.Fqbn
+                            Profile = $candidate.Profile
+                        }
+                    }
+                }
+            }
         }
     }
     catch { }
 
     $textList = arduino-cli board list 2>$null
-    $line = $textList | Select-String -Pattern "arduino:avr:mega" -SimpleMatch | Select-Object -First 1
-
-    if ($line) {
-        $firstToken = ($line.Line -split '\s+')[0]
-
-        if ($firstToken) { return $firstToken }
+    foreach ($candidate in $script:CANDIDATE_BOARDS) {
+        $line = $textList | Select-String -Pattern $candidate.Fqbn -SimpleMatch | Select-Object -First 1
+        if ($line) {
+            $firstToken = ($line.Line -split '\s+')[0]
+            if ($firstToken) {
+                return [PSCustomObject]@{ Port = $firstToken; Fqbn = $candidate.Fqbn; Profile = $candidate.Profile }
+            }
+        }
     }
 
     return $null
 }
 
 function Write-Sketch {
-    param([string]$SketchFolderName)
+    param(
+        [string]$SketchFolderName,
+        [string]$ProfileName
+    )
 
     $sketchDir = Join-Path $script:SCRIPT_DIR $SketchFolderName
 
@@ -189,9 +200,8 @@ function Write-Sketch {
         Write-Host "[ERROR] No .ino file found in `"$sketchDir`""
         return $false
     }
-
-    if (-not $script:FQBN) {
-        Write-Host "[ERROR] FQBN not set"
+    if (-not $ProfileName) {
+        Write-Host "[ERROR] No sketch.yaml profile resolved for the connected board"
         return $false
     }
     if (-not $script:PORT) {
@@ -208,7 +218,7 @@ function Write-Sketch {
 
     while ($attempt -lt $maxAttempts -and -not $compileSucceeded) {
         $attempt++
-        $compileOutput = & $script:ARDUINO_CLI compile --fqbn $script:FQBN $sketchDir 2>&1
+        $compileOutput = & $script:ARDUINO_CLI compile --profile $ProfileName $sketchDir 2>&1
         $lastOutput = $compileOutput
 
         if ($LASTEXITCODE -eq 0) {
@@ -248,9 +258,10 @@ function Write-Sketch {
     }
 
     Write-Host "Uploading Arduino sketch..."
-    & $script:ARDUINO_CLI upload --port $script:PORT --fqbn $script:FQBN $sketchDir *> $null
+    $uploadOutput = & $script:ARDUINO_CLI upload --port $script:PORT --profile $ProfileName $sketchDir 2>&1
     if ($LASTEXITCODE -ne 0) {
         Write-Host "[ERROR] Sketch upload failed"
+        $uploadOutput | ForEach-Object { Write-Host $_ }
         return $false
     }
 
@@ -260,53 +271,77 @@ function Write-Sketch {
 # ======================================================================
 # MAIN
 # ======================================================================
-Clear-Host
-Start-Sleep -Seconds 2
+$script:ExitCode = 0
 
-Write-Host "Resolving script directory..."
-$script:SCRIPT_DIR = $PSScriptRoot
-Set-Location $script:SCRIPT_DIR
+try {
+    Clear-Host
+    Start-Sleep -Seconds 2
 
-Write-Host ""
-$script:DO_UPDATE = Read-Host "Install/update required Python packages? [y/N]"
-if (-not $script:DO_UPDATE) {
-    $script:DO_UPDATE = "N"
-}
-Write-Host ""
+    Write-Host "Resolving script directory..."
+    $script:SCRIPT_DIR = $PSScriptRoot
+    Set-Location $script:SCRIPT_DIR
 
-if ($script:DO_UPDATE -ieq "Y") {
-    Write-Host "Making sure pip is up to date..."
-    python -m pip install --upgrade pip -q
+    Write-Host ""
+    $script:DO_UPDATE = Read-Host "Install/update required Python packages? [y/N]"
+    if (-not $script:DO_UPDATE) {
+        $script:DO_UPDATE = "N"
+    }
+    Write-Host ""
 
-    Write-Host "Installing required packages..."
-    $requirementsPath = Join-Path $script:SCRIPT_DIR ".\requirements.txt"
-    if (-not (Test-Path $requirementsPath)) {
-        Write-Host "[ERROR] requirements.txt not found at $requirementsPath"
-        Exit-Fatal "requirements.txt missing"
+    if ($script:DO_UPDATE -ieq "Y") {
+        Write-Host "Making sure pip is up to date..."
+        python -m pip install --upgrade pip -q
+
+        Write-Host "Installing required packages..."
+        $requirementsPath = Join-Path $script:SCRIPT_DIR ".\requirements.txt"
+        if (-not (Test-Path $requirementsPath)) {
+            Write-Host "[ERROR] requirements.txt not found at $requirementsPath"
+            Exit-Fatal "requirements.txt missing"
+        }
+
+        python -m pip install -r $requirementsPath -q
+        if ($LASTEXITCODE -ne 0) {
+            Exit-Fatal "pip install failed"
+        }
     }
 
-    python -m pip install -r $requirementsPath -q
+    if (-not (Initialize-ArduinoCli)) {
+            Exit-Fatal "arduino-cli installation failed or not found on PATH"
+        }
+
+    Write-Host "Searching for Arduino Mega/Uno..."
+    $script:BOARD = Find-ArduinoBoard
+    if (-not $script:BOARD) {
+        Write-Host "[ERROR] No supported Arduino board detected"
+        Exit-Fatal "Arduino not detected"
+    }
+    $script:PORT = $script:BOARD.Port
+    Write-Host "  Found $($script:BOARD.Fqbn) on $($script:PORT) - using profile '$($script:BOARD.Profile)'"
+
+    if (-not (Write-Sketch -SketchFolderName "behavioral_controller" -ProfileName $script:BOARD.Profile)) {
+        Exit-Fatal "Arduino compile/upload failed"
+    }
+
+    Write-Host "Running Python script..."
+    Start-Sleep -Seconds 1
+    python -m behavioral_master
+
     if ($LASTEXITCODE -ne 0) {
-        Exit-Fatal "pip install failed"
+        Write-Host ""
+        Write-Host "[WARNING] Python script exited with a non-zero exit code ($LASTEXITCODE)"
     }
+    Start-Sleep -Seconds 1
+    Write-Host ""
+}
+catch {
+    Write-host ""
+    Write-Host "[FATAL] $($_.Exception.Message)"
+    Write-Host ""
+    $script:ExitCode = 1
+}
+finally {
+    Write-Host "`nPress Enter to continue . . ."
+    Read-Host | Out-Null
 }
 
-if (-not (Initialize-ArduinoCli)) {
-        Exit-Fatal "arduino-cli installation failed or not found on PATH"
-    }
-
-Write-Host "Searching for Arduino..."
-$script:PORT = Find-ArduinoPort
-if (-not $script:PORT) {
-    Write-Host "[ERROR] No Arduino detected"
-    Exit-Fatal "Arduino not detected"
-}
-
-if (-not (Write-Sketch -SketchFolderName "behavioral_controller")) {
-    Exit-Fatal "Arduino compile/upload failed"
-}
-
-Write-Host "Running Python script..."
-python -m behavioral_master
-Start-Sleep -Seconds 1
-Write-Host ""
+exit $script:ExitCode
