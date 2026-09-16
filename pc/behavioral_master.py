@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from queue import Queue, Empty
 from collections import deque
-from threading import Thread, Event, Lock
+from threading import Thread, Event, Lock, Timer
 
 import serial
 import serial.tools.list_ports
@@ -415,16 +415,9 @@ class ConsoleInterface(InterfaceObject):
 
     def wait_for_key(self):
         """Wait for one keyboard press before exiting."""
-        print('\nPress Enter to continue . . .', end="", flush=True)
+        print('\nPress any key to continue . . .', end="", flush=True)
         time.sleep(0.25)
-
-        while True:
-                try:
-                        input()
-                        break
-                except KeyboardInterrupt:
-                        pass
-
+        keyboard.read_key()
         _cmd_run('echo.', 'echo.')
 
 
@@ -524,6 +517,26 @@ class TrainerInterface(InterfaceObject):
         """
         imaging_raw = input('\nImaging active? [y/N]:  ')
         return _is_affirmative(imaging_raw)
+
+    def prompt_imaging_window(self):
+        """Prompt for the continuous-imaging start/stop window (phase 2 only).
+
+        Returns:
+            Tuple of (start_min, stop_min) as floats, in minutes since session start.
+        """
+        while True:
+            try:
+                start_m = float(input('Continuous imaging start time (minutes):  ').strip())
+                stop_m = float(input('Continuous imaging stop time (minutes):  ').strip())
+            except ValueError:
+                print('\nPlease enter valid numbers\n', flush=True)
+                continue
+
+            if start_m < 0 or stop_m <= start_m:
+                print('\nStop time must be a positive number greater than the start time\n', flush=True)
+                continue
+
+            return start_m, stop_m
 
     def prompt_ephys(self):
         """Prompt whether electrophysiology recording is active.
@@ -1490,7 +1503,7 @@ class SaveInterface(InterfaceObject):
 class PrairieInterface(InterfaceObject):
     interface_name = "prairie"
 
-    def connect(self, imaging_active):
+    def connect(self, imaging_active, session_data=None, verbose=False):
         """
         Connect to Prairie View when imaging is active.
 
@@ -1502,6 +1515,12 @@ class PrairieInterface(InterfaceObject):
         """
         if not imaging_active:
             return None
+
+        if verbose:
+            print(f"[{_utc_ts()}][DEV][IMG-TCP] configure()", flush=True)
+
+        if session_data is not None:
+            session_data.img_mark_configured()
 
         try:
             client = PrairieClient()
@@ -1526,7 +1545,7 @@ class PrairieInterface(InterfaceObject):
 
         return client
 
-    def finish(self, client, session_data):
+    def finish(self, client, session_data, verbose=False):
         """Finish Prairie imaging and copy timestamps into session data.
 
         Args:
@@ -1534,6 +1553,9 @@ class PrairieInterface(InterfaceObject):
             session_data: SessionData instance to receive imaging timestamps.
         """
         if client is None:
+            if verbose and session_data is not None and session_data.meta.get('imaging_requested', False):
+                print(f"[{_utc_ts()}][DEV][IMG-TCP] finish()", flush=True)
+
             return
         
         client.finish()
@@ -1903,9 +1925,6 @@ class ArduinoLink:
 
 
 class SessionData:
-    _IMMEDIATE_FSYNC_KINDS = {"trial_config", "evt", "raw_evt"}
-    _BATCH_FSYNC_INTERVAL_S = 0.5
-
     def __init__(self, animal_id, phase_id, date_str):
         """
         Initialize containers for one behavioral session.
@@ -1946,117 +1965,6 @@ class SessionData:
             "cap": {"timestamps": [], "values": []}
             }
 
-        self.backup_jsonl_path, self.backup_json_path = self._make_backup_paths(animal_id,
-                                                                                phase_id,
-                                                                                date_str)
-
-        self._backup_queue = Queue()
-        self._backup_stop_evt = Event()
-        self._backup_thread = Thread(target=self._backup_writer_loop, daemon=True)
-        self._backup_thread.start()
-
-    @staticmethod
-    def _make_backup_paths(animal_id, phase_id, date_str):
-        """
-        Build the local backup file paths for this session
-
-        Both files share the same name stem and only differ by extension:
-        the .jsonl file is appended to live, the .json file is the final
-        aggregated snapshot
-        """
-        try:
-            date_obj = datetime.strptime(str(date_str).strip(), "%m/%d/%Y")
-        except Exception:
-            date_obj = datetime.now()
-
-        stem = (f"{date_obj.strftime('%m')}-{date_obj.strftime('%d')}-{date_obj.strftime('%Y')}"
-                f"_animal-{animal_id}_phase-{phase_id}_backup")
-
-        return SCRIPT_DIR / f"{stem}.jsonl", SCRIPT_DIR / f"{stem}.json"
-
-    def _append_backup(self, kind, ts, value):
-        """
-        Hand one collecated data point to the background backup-writer thread
-
-        Must stay effectively instantaneous so it never blocks the real-time
-        collection loop, even under high-frequency encoder input
-        """
-        try:
-            self._backup_queue.put_nowait((kind, ts, value))
-        except Exception:
-            pass
-
-    def _backup_writer_loop(self):
-        last_fsync = time.monotonic()
-
-        try:
-            f = open(self.backup_jsonl_path, "a", encoding="utf-8")
-        except Exception:
-            f = None
-
-        try:
-            while True:
-                try:
-                    item = self._backup_queue.get(timeout=0.2)
-                except Empty:
-                    item = None
-
-                if item is None:
-                    if self._backup_stop_evt.is_set() and self._backup_queue.empty():
-                        break
-
-                    now = time.monotonic()
-                    if f is not None and (now - last_fsync) >= self._BATCH_FSYNC_INTERVAL_S:
-                        try:
-                            f.flush()
-                            os.fsync(f.fileno())
-                        except Exception:
-                            pass
-
-                        last_fsync = now
-
-                    continue
-
-                kind, ts, value = item
-                record = {
-                    "kind": kind,
-                    "ts": ts,
-                    "value": value,
-                    "written_at": datetime.now(timezone.utc).isoformat()
-                    }
-
-                if f is None:
-                    try:
-                        f = open(self.backup_jsonl_path, "a", encoding="utf-8")
-                    except Exception:
-                        continue
-
-                try:
-                    f.write(json.dumps(record, default=str))
-                    f.write("\n")
-
-                    if kind in self._IMMEDIATE_FSYNC_KINDS:
-                        f.flush()
-                        os.fsync(f.fileno())
-                        last_fsync = time.monotonic()
-                    else:
-                        f.flush()
-                except Exception:
-                    try:
-                        with open(ERROR_LOG_PATH, "a", encoding="utf-8") as err_f:
-                            err_f.write(f"{datetime.now().isoformat()} - backup jsonl write failed: "
-                                        f"{traceback.format_exc()}\n")
-                    except Exception:
-                        pass
-        finally:
-            if f is not None:
-                try:
-                    f.flush()
-                    os.fsync(f.fileno())
-                    f.close()
-                except Exception:
-                    pass
-
     def _ensure_session_tracking(self):
         self.meta.setdefault("trial_config", [])
         self.meta.setdefault("K1", 5)
@@ -2065,14 +1973,26 @@ class SessionData:
     def log_trial_config(self, trial_n, type, side):
         self._ensure_session_tracking()
 
-        record = {
+        self.meta['trial_config'].append({
             "trial": int(trial_n),
             "is_easy": bool(type),
             "side": str(side)
-            }
+            })
 
-        self.meta['trial_config'].append(record)
-        self._append_backup("trial_config", None, record)
+    def img_mark_configured(self):
+        self.meta['_img_tcp_state'] = "configured"
+
+    def img_can_start(self):
+        return self.meta.get('_img_tcp_state') in ('configured', 'stopped')
+
+    def img_can_stop(self):
+        return self.meta.get('_img_tcp_state') == "started"
+
+    def img_mark_started(self):
+        self.meta['_img_tcp_state'] = "started"
+
+    def img_mark_stopped(self):
+        self.meta['_img_tcp_state'] = "stopped"
 
     def add_evt(self, ts, payload):
         """Append a parsed behavioral event.
@@ -2083,7 +2003,6 @@ class SessionData:
         """
         self.evt["timestamps"].append(ts)
         self.evt["values"].append(payload)
-        self._append_backup("evt", ts, payload)
 
     def add_enc(self, ts, payload):
         """Append an encoder sample.
@@ -2094,7 +2013,6 @@ class SessionData:
         """
         self.enc["timestamps"].append(ts)
         self.enc["values"].append(payload)
-        self._append_backup("enc", ts, payload)
 
     def add_raw_cap(self, ts, payload):
         """Append a raw capacitive sensor sample when it parses as an integer.
@@ -2110,7 +2028,6 @@ class SessionData:
 
         self.raw["cap"]["timestamps"].append(ts)
         self.raw["cap"]["values"].append(v)
-        self._append_backup("raw_cap", ts, v)
     
     def add_raw_evt(self, ts, payload):
         """Append a raw event marker.
@@ -2121,7 +2038,6 @@ class SessionData:
         """
         self.raw["evt"]["timestamps"].append(ts)
         self.raw["evt"]["values"].append(str(payload))
-        self._append_backup("raw_evt", ts, str(payload))
 
     def any_data(self, field=None):
         """Check whether session data has been collected.
@@ -2206,63 +2122,6 @@ class SessionData:
             'img': _json_safe(self.img),
             'raw': _json_safe(self.raw)
             }
-
-    def close_backup_writer(self, timeout_s=5.0):
-        """
-        Signal the background writer thread to drain its queue and stop
-
-        Call this once the session loop has ended, before write_full_backup()
-        and before any decision to delete the local backups
-        """
-        self._backup_stop_evt.set()
-        self._backup_thread.join(timeout=timeout_s)
-
-    def write_full_backup(self):
-        """
-        Write the complete collected dataset to the aggregated local
-        .json backup file
-
-        Safe to call unconditionally and first-thing -- never raises,
-        and does nothing if nothing was collected
-        """
-        if not self.any_data():
-            return None
-
-        payload = self.to_dict()
-
-        try:
-            with open(self.backup_json_path, "w", encoding="utf-8") as f:
-                json.dump(payload, f, indent=4)
-                f.flush()
-                os.fsync(f.fileno())
-        except Exception:
-            try:
-                with open(ERROR_LOG_PATH, "a", encoding="utf-8") as err_f:
-                    err_f.write(f"{datetime.now().isoformat()} - full backup json write failed: "
-                                f"{traceback.format_exc()}\n")
-            except Exception:
-                pass
-
-            return None
-
-        return self.backup_json_path
-
-    def delete_local_backups(self):
-        """
-        Delete this session's local backup files after a confirmed successful
-        Google Sheets write (never raises)
-        """
-        for p in (self.backup_jsonl_path, self.backup_json_path):
-            try:
-                if p.exists():
-                    p.unlink()
-            except Exception:
-                try:
-                    with open(ERROR_LOG_PATH, "a", encoding="utf-8") as err_f:
-                        err_f.write(f"{datetime.now().isoformat()} - failed to delete {p}: "
-                                    f"{traceback.format_exc()}\n")
-                except Exception:
-                    pass
 
     @property
     def is_finished(self):
@@ -2825,6 +2684,10 @@ def _now():
     return int(time.time())
 
 
+def _utc_ts():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
 def _valid_phases():
     """Return the set of valid phase identifiers."""
     return {"0", "1"} | set(PHASE_CONFIG.keys())
@@ -2917,7 +2780,13 @@ def setup(interfaces=None):
             raise RuntimeError(f'No Arduino detected (required for phase {phase_id})')
 
         side_override = user_proxy.prompt_side() if phase_id == "4" else None
+
         imaging_active = user_proxy.prompt_imaging()
+        img_start_t = None
+        img_stop_t = None
+        if imaging_active and phase_id == "2":
+            img_start_t, img_stop_t = user_proxy.prompt_imaging_window()
+
         ephys_active = user_proxy.prompt_ephys()
 
         print('\nInitializing resources...', flush=True)
@@ -2930,8 +2799,18 @@ def setup(interfaces=None):
             
         link.send_config(phase_id, settings)
         link.send_ephys(ephys_active)
+
+        session_data = SessionData(animal_id, str(phase_id), _get_date())
+
+        session_data.meta['workbook_id'] = workbook_id
+        session_data.meta['imaging_requested'] = bool(imaging_active)
+        session_data.meta['img_start_t'] = img_start_t
+        session_data.meta['img_stop_t'] = img_stop_t
+        session_data.meta['ephys_active'] = bool(ephys_active)
+        session_data.meta['side_override'] = side_override
         
-        client = prairie_proxy.connect(imaging_active)
+        client = prairie_proxy.connect(imaging_active, session_data=session_data, verbose=link.verbose)
+        session_data.meta['imaging_active'] = bool(client is not None)
 
         is_easy = True
         if cfg and link.active:
@@ -2942,13 +2821,6 @@ def setup(interfaces=None):
                 link.send_and_wait(f"1 {'1' if is_easy else '0'}")
             except Exception as e:
                 raise RuntimeError(f'[ERROR] Failed during initial trial config handshake: {e}') from e
-        
-        session_data = SessionData(animal_id, str(phase_id), _get_date())
-
-        session_data.meta['workbook_id'] = workbook_id
-        session_data.meta['imaging_active'] = bool(client is not None)
-        session_data.meta['ephys_active'] = bool(ephys_active)
-        session_data.meta['side_override'] = side_override
 
         session_data.log_trial_config(trial_n=1, type=is_easy, side=side)
 
@@ -3156,7 +3028,67 @@ def main(link, session_data, cursor, client=None, interfaces=None):
     do_calibration = int(session_data.meta['phase']) > 4
     imaging_active = (bool(session_data.meta.get('imaging_active', False))
                       and (client is not None))
+    imaging_requested = bool(session_data.meta.get('imaging_requested', False))
+    dev_verbose = bool(getattr(link, 'verbose', False))
     ephys_active = bool(session_data.meta.get('ephys_active', False))
+
+    continuous_imaging = (str(session_data.meta['phase']) == "2")
+    img_start_t = session_data.meta.get('img_start_t')
+    img_stop_t = session_data.meta.get('img_stop_t')
+    img_start_timer = None
+    img_stop_timer = None
+
+    def _send_img_start(label, real_fn=None):
+        if not session_data.img_can_start():
+            if dev_verbose:
+                print(f"[{_utc_ts()}][DEV][IMG-TCP] {label} skipped "
+                      f"(state={session_data.meta.get('_img_tcp_state')!r})",
+                      flush=True)
+
+            return True
+
+        session_data.img_mark_started()
+
+        if client is not None and real_fn is not None:
+            return real_fn()
+
+        if dev_verbose:
+            print(f"[{_utc_ts()}][DEV][IMG-TCP] {label}", flush=True)
+
+        return True
+
+    def _send_img_stop(label, real_fn=None):
+        if not session_data.img_can_stop():
+            if dev_verbose:
+                print(f"[{_utc_ts()}][DEV][IMG-TCP] {label} skipped "
+                      f"(state={session_data.meta.get('_img_tcp_state')!r})",
+                      flush=True)
+
+            return True
+
+        session_data.img_mark_stopped()
+
+        if client is not None and real_fn is not None:
+            return real_fn()
+
+        if dev_verbose:
+            print(f"[{_utc_ts()}][DEV][IMG-TCP] {label}", flush=True)
+
+        return True
+
+    def _img_window_start():
+        """Fire the continuous-imaging start trigger once, at its scheduled offset."""
+        _send_img_start("start() (continuous window)", real_fn=client.start if client is not None else None)
+
+        if imaging_active:
+            link.start_imaging(delay_s=0.0)
+
+    def _img_window_stop():
+        """Fire the continuous-imaging stop trigger once, at its scheduled offset or session end."""
+        _send_img_stop("stop() (continuous window)", real_fn=client.stop if client is not None else None)
+
+        if imaging_active:
+            link.stop_imaging(delay_s=0.0)
 
     K = 5
     N = 20
@@ -3205,6 +3137,17 @@ def main(link, session_data, cursor, client=None, interfaces=None):
                 console_proxy.show_start()
                 console_proxy.show_header()
 
+                if (continuous_imaging and imaging_requested
+                    and img_start_t is not None and img_stop_t is not None):
+
+                    img_start_timer = Timer(img_start_t * 60.0, _img_window_start)
+                    img_start_timer.daemon=True
+                    img_start_timer.start()
+
+                    img_stop_timer = Timer(img_stop_t * 60.0, _img_window_stop)
+                    img_stop_timer.daemon=True
+                    img_stop_timer.start()
+
             if typ == "ERR":
                 if isinstance(payload, BaseException):
                     _cmd_run('echo.')
@@ -3232,9 +3175,9 @@ def main(link, session_data, cursor, client=None, interfaces=None):
                 if p == 'cue':
                     session_data.add_evt(ts, p)
 
-                    if imaging_active and first_trial:
-                        client_ok = client.start()
-                        ttl_ok = link.start_imaging(delay_s=0.0)
+                    if (imaging_active or imaging_requested) and first_trial and not continuous_imaging:
+                        client_ok = _send_img_start("start()", real_fn=client.start if client is not None else None)
+                        ttl_ok = link.start_imaging(delay_s=0.0) if imaging_active else True
 
                         if not (client_ok and ttl_ok):
                             raise RuntimeError('Initial START command failed')
@@ -3256,12 +3199,18 @@ def main(link, session_data, cursor, client=None, interfaces=None):
 
                     session_data.add_evt(ts, p)
 
-                    if imaging_active:
-                        client_stop_ok = client.stop_after(delay_s=1.0)
-                        ttl_stop_ok = link.stop_imaging(delay_s=1.0)
+                    if (imaging_active or imaging_requested) and not continuous_imaging:
+                        client_stop_ok = _send_img_stop(
+                            "stop_after(delay_s=1.0)",
+                            real_fn=(lambda: client.stop_after(delay_s=1.0)) if client is not None else None
+                            )
+                        ttl_stop_ok = link.stop_imaging(delay_s=1.0) if imaging_active else True
 
-                        client_start_ok = client.start_after(delay_s=3.0)
-                        ttl_start_ok = link.start_imaging(delay_s=3.0)
+                        client_start_ok = _send_img_start(
+                            "start_after(delay_s=3.0)",
+                            real_fn=(lambda: client.start_after(delay_s=3.0)) if client is not None else None
+                            )
+                        ttl_start_ok = link.start_imaging(delay_s=3.0) if imaging_active else True
 
                         if not (client_stop_ok and ttl_stop_ok and client_start_ok and ttl_start_ok):
                             raise RuntimeError('Failed to schedule imaging restart')
@@ -3299,10 +3248,14 @@ def main(link, session_data, cursor, client=None, interfaces=None):
                             early_exit = _is_early_exit(session_data.evt, trial_n, end_ms)
 
                             if early_exit:
-                                if imaging_active:
-                                    client.stop()
+                                if imaging_active or imaging_requested:
+                                    _send_img_stop("stop()", real_fn=client.stop if client is not None else None)
                                     time.sleep(1)
-                                    client.finish()
+        
+                                    if client is not None:
+                                        client.finish()
+                                    elif imaging_requested and dev_verbose:
+                                        print(f"[{_utc_ts()}][DEV][IMG-TCP] finish()", flush=True)
 
                                 link.stop_ephys(session_data, safe=True)
 
@@ -3357,8 +3310,16 @@ def main(link, session_data, cursor, client=None, interfaces=None):
 
         link.stop_ephys(session_data, safe=True)
 
-        if client is not None:
-            client.stop()
+        if img_start_timer is not None:
+            img_start_timer.cancel()
+        if img_stop_timer is not None:
+            img_stop_timer.cancel()
+
+        if continuous_imaging:
+            if session_data.img_can_stop():
+                _img_window_stop()
+        elif session_data.img_can_stop():
+            _send_img_stop("stop()", real_fn=client.stop if client is not None else None)
 
         dashboard_proxy.notify_finish()
 
@@ -3394,26 +3355,14 @@ if __name__ == "__main__":
         interfaces.exceptions.cache(e, '__main__')
         interfaces.console.show_exceptions()
     finally:
-        if session_data is not None:
-            try:
-                session_data.close_backup_writer()
-            except Exception as e:
-                interfaces.exceptions.cache(e, '__main__.close_backup_writer')
-
-            try:
-                session_data.write_full_backup()
-            except Exception as e:
-                interfaces.exceptions.cache(e, '__main__.write_full_backup')
-
         interfaces.console.show_summary(session_data)
         run_info = (animal_id_for_log, phase_id_for_log)
 
-        if prairie is not None:
-            try:
-                interfaces.prairie.finish(prairie, session_data)
-            except Exception as e:
-                interfaces.exceptions.cache(e, "__main__.prairie_finish")
-                ExceptionInterface(*run_info).log_and_commit(e)
+        try:
+            interfaces.prairie.finish(prairie, session_data, verbose=getattr(link, 'verbose', False))
+        except Exception as e:
+            interfaces.exceptions.cache(e, "__main__.prairie_finish")
+            ExceptionInterface(*run_info).log_and_commit(e)
 
         if cursor is not None:
             try:
@@ -3439,30 +3388,17 @@ if __name__ == "__main__":
         
         if session_data is not None and session_data.any_data():
             if session_data.meta.get('animal', None) not in {None, "DEV"}:
-                sheets_ok = False
-                attempted = False
-
                 try:
                     if interfaces.user.confirm_save():
                         if interfaces.saving.resolve_protocol(session_data):
-                            attempted = True
-                            interfaces.saving.save_data(session_data)
-                            sheets_ok = True
+                            interfaces.saving.save_raw(session_data)
+
+                            ok = interfaces.saving.save_session(session_data)
+                            if not ok:
+                                interfaces.console.warning("Google Sheets save failed (saving locally instead)")
                         else:
-                            print("Session exited without saving "
-                                  f"(local backup retained at {session_data.backup_json_path.name})", flush=True)
+                            print("Session exited without saving", flush=True)
                 except Exception as e:
                     interfaces.exceptions.cache(e, '__main__.safe_save')
 
-                if sheets_ok:
-                    session_data.delete_local_backups()
-                elif attempted:
-                    print(f"[WARNING] Google Sheets update was unsuccessful - a local "
-                          f"copy of the session data was retained at "
-                          f"{session_data.backup_json_path.name}", flush=True)
-            else:
-                print("DEV/unassigned-cohort session - local backup retained at "
-                      f"{session_data.backup_json_path.name}", flush=True)
-
         interfaces.console.show_exceptions()
-        interfaces.console.wait_for_key()
