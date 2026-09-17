@@ -9,6 +9,7 @@
 # ======================================================================
 # CONFIGURATION
 # ======================================================================
+$script:PYTHON_VERSION = "3.12"
 $script:ARDUINO_CLI = "arduino-cli"
 $script:CANDIDATE_BOARDS = @(
     [PSCustomObject]@{ Fqbn = "arduino:avr:mega"; Profile = "mega2560" },
@@ -26,6 +27,109 @@ function Exit-Fatal {
     param([string]$Message)
 
     throw $Message
+}
+
+function Check-Python310Available {
+    if (-not (Get-Command py -ErrorAction SilentlyContinue)) {
+        return $false
+    }
+
+    & py "-$script:PYTHON_VERSION" --version *> $null
+    return ($LASTEXITCODE -eq 0)
+}
+
+function Test-VenvPythonVersion {
+    if (-not (Test-Path $script:VENV_PYTHON)) {
+        return $false
+    }
+
+    $out = & $script:VENV_PYTHON --version 2>&1
+    return ($out -match [regex]::Escape($script:PYTHON_VERSION))
+}
+
+function Initialize-PythonVenv {
+    if (-not (Check-Python310Available)) {
+        Write-Host "Python $($script:PYTHON_VERSION) not found; attempting to install..."
+
+        if (Get-Command winget -ErrorAction SilentlyContinue) {
+            winget install --id Python.Python.$($script:PYTHON_VERSION) -e --source winget `
+                --accept-package-agreements `
+                --accept-source-agreements *> $null
+        }
+
+        if (-not (Check-Python310Available)) {
+            Write-Host "[ERROR] Python $($script:PYTHON_VERSION) still isn't available via the 'py' launcher"
+            return $false
+        }
+    }
+
+    if (-not (Test-VenvPythonVersion)) {
+        if (Test-Path $script:VENV_DIR) {
+            Write-Host "Existing virtual environment doesn't match Python $($script:PYTHON_VERSION); rebuilding virtual environment..."
+            Remove-Item -Recurse -Force $script:VENV_DIR
+        }
+        else {
+            Write-Host "Creating Python $($script:PYTHON_VERSION) virtual environment..."
+        }
+
+        & py "-$script:PYTHON_VERSION" -m venv $script:VENV_DIR
+        if ($LASTEXITCODE -ne 0 -or -not (Test-Path $script:VENV_PYTHON)) {
+            Write-Host "[ERROR] Failed to create virtual environment at $($script:VENV_DIR)"
+            return $false
+        }
+    }
+
+    return $true
+}
+
+function Check-PySpinAvailable {
+    & $script:VENV_PYTHON -c "import PySpin" *> $null
+    return ($LASTEXITCODE -eq 0)
+}
+
+function Get-ExpectedPySpinTag {
+    return "cp" + ($script:PYTHON_VERSION -replace '\.', '')
+}
+
+function Install-PySpinWheel {
+    if (Check-PySpinAvailable) {
+        return $true
+    }
+
+    $expectedTag = Get-ExpectedPySpinTag
+    $candidateWheels = Get-ChildItem -Path (Join-Path $script:SCRIPT_DIR "spinnaker_python-*.whl") -File -ErrorAction SilentlyContinue
+
+    if (-not $candidateWheels) {
+        return $false
+    }
+
+    $matchingWheel = $candidateWheels |
+        Where-Object { $_.Name -match [regex]::Escape($expectedTag) -and $_.Name -match "win_amd64" } |
+        Select-Object -First 1
+
+    if (-not $matchingWheel) {
+        Write-Host "[WARNING] Found PySpin wheel(s) in the project root, but none match Python $($script:PYTHON_VERSION) ($expectedTag/win_amd64):"
+        foreach ($wheel in $candidateWheels) {
+            Write-Host "`t$($wheel.Name)"
+        }
+
+        return $false
+    }
+
+    Write-Host "`tFound matching PySpin wheel: $($matchingWheel.Name)"
+    Write-Host "Installing PySpin..."
+    & $script:VENV_PYTHON -m pip install $matchingWheel.FullName -q
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "[WARNING] Failed to install $($matchingWheel.Name)"
+        return $false
+    }
+
+    if (-not (Check-PySpinAvailable)) {
+        Write-Host "[WARNING] Installed $($matchingWheel.Name), but PySpin still isn't importable"
+        return $false
+    }
+
+    return $true
 }
 
 function Get-MissingHeaders {
@@ -61,16 +165,16 @@ function Show-LibraryDiagnostics {
     param([string]$SketchDir)
 
     Write-Host "[DIAG] Full arduino-cli library list:"
-    arduino-cli lib list 2>&1 | ForEach-Object { Write-Host "  $_" }
+    arduino-cli lib list 2>&1 | ForEach-Object { Write-Host "`t$_" }
 
     Write-Host "[DIAG] arduino-cli config dump:"
-    arduino-cli config dump 2>&1 | ForEach-Object { Write-Host "  $_" }
+    arduino-cli config dump 2>&1 | ForEach-Object { Write-Host "`t$_" }
 
     foreach ($sketchConfigName in @("sketch.yaml", "sketch.json")) {
         $sketchConfigPath = Join-Path $SketchDir $sketchConfigName
         if (Test-Path $sketchConfigPath) {
             Write-Host "[DIAG] Found '$sketchConfigName' in sketch folder - contents:"
-            Get-Content $sketchConfigPath | ForEach-Object { Write-Host "  $_" }
+            Get-Content $sketchConfigPath | ForEach-Object { Write-Host "`t$_" }
             Write-Host "[DIAG] A sketch-level profile can pin its own library list, overriding whatever's globally installed"
         }
     }
@@ -90,9 +194,9 @@ function Resolve-MissingLibrary {
     }
 
     $libName = $script:HEADER_TO_LIBRARY[$HeaderName]
-    Write-Host "  Attempting to install library '$libName' for missing header '$HeaderName'..."
+    Write-Host "`tAttempting to install library '$libName' for missing header '$HeaderName'..."
     $installOutput = arduino-cli lib install $libName 2>&1
-    $installOutput | ForEach-Object { Write-Host "  $_" }
+    $installOutput | ForEach-Object { Write-Host "`t$_" }
 
     if ($LASTEXITCODE -ne 0) {
         Write-Host "[WARNING] arduino-cli reported a failure installing '$libName'"
@@ -102,8 +206,8 @@ function Resolve-MissingLibrary {
     if (-not (Test-LibraryInstalled -LibraryName $libName)) {
         Write-Host "[WARNING] arduino-cli reported success, but '$libName' isn't appearing in 'arduino-cli lib list'"
         Write-Host "[WARNING] Diagnostics:"
-        arduino-cli lib list 2>&1 | ForEach-Object { Write-Host "  $_" }
-        arduino-cli config dump 2>&1 | ForEach-Object { Write-Host "  $_" }
+        arduino-cli lib list 2>&1 | ForEach-Object { Write-Host "`t$_" }
+        arduino-cli config dump 2>&1 | ForEach-Object { Write-Host "`t$_" }
         return $false
     }
 
@@ -117,28 +221,174 @@ function Initialize-ArduinoCli {
         Write-Host "arduino-cli not found, attempting to install..."
 
         if (Get-Command winget -ErrorAction SilentlyContinue) {
-            winget install --id ArduinoSA.CLI -e --source winget --accept-package-agreements --accept-source-agreements *> $null
+            winget install --id ArduinoSA.CLI -e --source winget `
+                --accept-package-agreements `
+                --accept-source-agreements *> $null
         }
 
-        # Add common install locations to PATH
         if (Test-Path "$env:ProgramFiles\Arduino CLI\arduino-cli.exe") {
             $env:PATH = "$env:ProgramFiles\Arduino CLI;$env:PATH"
         }
 
-        if (-not (Get-Command arduino-cli -ErrorAction SilentlyContinue)) { return $false }
+        if (-not (Get-Command arduino-cli -ErrorAction SilentlyContinue)) {
+            return $false
+        }
     }
 
-    # Initialize configurations, make sure the AVR core and Servo library are present
-    arduino-cli config init *> $null
-    arduino-cli core update-index *> $null
+    # initialize config only if it does not exist
+    $arduinoConfig = Join-Path $env:LOCALAPPDATA "Arduino15\arduino-cli.yaml"
+    if (-not (Test-Path $arduinoConfig)) {
+        Write-Host "Arduino CLI not found; initializing..."
+        arduino-cli config init *> $null
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "[ERROR] Failed to initialize Arduino CLI configuration"
+            return $false
+        }
+    }
 
+    # verify AVR core initialization locally
     $coreList = arduino-cli core list 2>$null
-    if (-not ($coreList | Select-String -Pattern "arduino:avr" -Quiet)) {
+
+    if (-not ($coreList | Select-String -Pattern "^arduino:avr\s" -q)) {
+        Write-Host "Arduino AVR core not found; updating index and installing..."
+
+        arduino-cli core update-index *> $null
+        if ($LASTEXITCODE -ne 0) {
+            return $false
+        }
+
         arduino-cli core install arduino:avr *> $null
+        if ($LASTEXITCODE -ne 0) {
+            return $false
+        }
     }
 
-    arduino-cli lib update-index *> $null
-    arduino-cli lib install Servo *> $null
+    # verify/install libraries specified in sketch.yaml
+    $sketchDir = Join-Path $script:SCRIPT_DIR "behavioral_controller"
+    $sketchYamlPath = Join-Path $sketchDir "sketch.yaml"
+    if (-not (Test-Path $sketchYamlPath)) {
+        Write-Host "[ERROR] sketch.yaml not found at $sketchYamlPath"
+        return $false
+    }
+
+    $requiredLibraries = @()
+    $inLibrariesSection = $false
+    $librariesIndent = 0
+
+    foreach ($line in Get-Content $sketchYamlPath) {
+        if ($line -match '^(\s*)libraries:\s*$') {
+            $inLibrariesSection = $true
+            $librariesIndent = $matches[1].length
+            continue
+        }
+
+        if ($inLibrariesSection) {
+            if ($line -match '^\s*(#.*)?$') {
+                continue
+            }
+
+            $currentIndent = ([regex]::Match($line, '^\s*')).Value.length
+            if ($currentIndent -le $librariesIndent) {
+                $inLibrariesSection = $false
+            }
+            elseif ($line -match '^\s*-\s+(.+?)\s*$') {
+                $libraryEntry = $matches[1].Trim()
+
+                if ($libraryEntry -notmatch '^dir:\s*') {
+                    if ($libraryEntry -match '^dependency:\s*(.+)$') {
+                        $libraryEntry = $matches[1].Trim()
+                    }
+
+                    $requiredLibraries += $libraryEntry
+                }
+            }
+        }
+    }
+
+    $requiredLibraries = $requiredLibraries | Sort-Object -Unique
+
+    if ($requiredLibraries.Count -gt 0) {
+
+        $installedLibraryOutput = arduino-cli lib list --format json 2>$null
+
+        if ($LASTEXITCODE -ne 0 -or -not $installedLibraryOutput) {
+            Write-Host "[ERROR] Unable to query installed Arduino libraries"
+            return $false
+        }
+
+        try {
+            $installedLibraryJson = $installedLibraryOutput | ConvertFrom-Json
+        }
+        catch {
+            Write-Host "[ERROR] Unable to parse Arduino library list"
+            return $false
+        }
+
+        $missingLibraries = @()
+
+        foreach ($requiredLibrary in $requiredLibraries) {
+            if ($requiredLibrary -match '^(.*?)\s+\(([^)]+)\)\s*$') {
+                $libraryName = $matches[1].Trim()
+                $requiredVersion = $matches[2].Trim()
+            }
+            else {
+                $libraryName = $requiredLibrary.Trim()
+                $requiredVersion = $null
+            }
+
+            $installedMatch = $installedLibraryJson.installed_libraries |
+                Where-Object { $_.library.name -eq $libraryName } |
+                    Select-Object -First 1
+
+            if (-not $installedMatch) {
+                $missingLibraries += $requiredLibrary
+                continue
+            }
+
+            if ($requiredVersion) {
+                $installedVersion = $installedMatch.library.version
+
+                if ($installedVersion -ne $requiredVersion) {
+                    $missingLibraries += $requiredLibrary
+                }
+            }
+        }
+
+        if ($missingLibraries.Count -gt 0) {
+
+            Write-Host "Required Arduino libraries missing or incorrect version:"
+            foreach ($library in $missingLibraries) {
+                Write-Host "`t$library"
+            }
+
+            Write-Host "Updating Arduino library index..."
+            arduino-cli lib update-index *> $null
+
+            if ($LASTEXITCODE -ne 0) {
+                return $false
+            }
+
+            foreach ($library in $missingLibraries) {
+                if ($library -match '^(.*?)\s+\(([^)]+)\)\s*$') {
+                    $libraryName = $matches[1].Trim()
+                    $libraryVersion = $matches[2].Trim()
+                    $installSpec = "${libraryName}@${libraryVersion}"
+                }
+                else {
+                    $libraryName = $library.Trim()
+                    $installSpec = $libraryName
+                }
+
+                Write-Host "Installing $installSpec..."
+                arduino-cli lib install $installSpec *> $null
+
+                if ($LASTEXITCODE -ne 0) {
+                    Write-Host "[ERROR] Failed to install '$installSpec'"
+                    return $false
+                }
+            }
+        }
+    }
 
     return $true
 }
@@ -277,32 +527,56 @@ try {
     Clear-Host
     Start-Sleep -Seconds 2
 
-    Write-Host "Resolving script directory..."
+    Write-Host "`nResolving script directory..."
     $script:SCRIPT_DIR = $PSScriptRoot
     Set-Location $script:SCRIPT_DIR
 
-    Write-Host ""
-    $script:DO_UPDATE = Read-Host "Install/update required Python packages? [y/N]"
-    if (-not $script:DO_UPDATE) {
-        $script:DO_UPDATE = "N"
+    Write-Host "Validating virtual environment..."
+    $script:VENV_DIR = Join-Path $script:SCRIPT_DIR ".venv"
+    $script:VENV_PYTHON = Join-Path $script:VENV_DIR "Scripts\python.exe"
+
+    if (-not (Initialize-PythonVenv)) {
+        Exit-Fatal "Python $($script:PYTHON_VERSION) virtual environment setup failed"
     }
-    Write-Host ""
 
-    if ($script:DO_UPDATE -ieq "Y") {
-        Write-Host "Making sure pip is up to date..."
-        python -m pip install --upgrade pip -q
+    Write-Host "Making sure pip is up to date..."
+    & $script:VENV_PYTHON -m pip install --upgrade pip -q
 
-        Write-Host "Installing required packages..."
-        $requirementsPath = Join-Path $script:SCRIPT_DIR ".\requirements.txt"
-        if (-not (Test-Path $requirementsPath)) {
-            Write-Host "[ERROR] requirements.txt not found at $requirementsPath"
-            Exit-Fatal "requirements.txt missing"
+    if ($LASTEXITCODE -ne 0) {
+        Exit-Fatal "pip upgrade failed"
+    }
+
+    Write-Host "Installing required packages..."
+    $requirementsPath = Join-Path $script:SCRIPT_DIR ".\requirements.txt"
+    if (-not (Test-Path $requirementsPath)) {
+        Write-Host "[ERROR] requirements.txt not found at $requirementsPath"
+        Exit-Fatal "requirements.txt missing"
+    }
+
+    $requirementsLines = Get-Content $requirementsPath |
+        ForEach-Object { $_.Trim() } |
+        Where-Object { $_ -and -not $_.StartsWith("#") }
+
+    foreach ($requirement in $requirementsLines) {
+        if ($requirement -match '^([A-Za-z0-9_.\-]+)\s*==\s*(.+)$') {
+            $packageName = $matches[1]
+            $packageVersion = $matches[2]
+            Write-Host "`t$packageName ($packageVersion)"
+        }
+        else {
+            Write-Host "`t$requirement"
         }
 
-        python -m pip install -r $requirementsPath -q
+        & $script:VENV_PYTHON -m pip install $requirement -q
         if ($LASTEXITCODE -ne 0) {
+            Write-Host "[ERROR] Failed to install '$requirement'"
             Exit-Fatal "pip install failed"
         }
+    }
+
+    Write-Host "Checking for PySpin installation..."
+    if (-not (Install-PySpinWheel)) {
+        Write-Host "[WARNING] PySpin isn't importable in this venv"
     }
 
     if (-not (Initialize-ArduinoCli)) {
@@ -316,7 +590,7 @@ try {
         Exit-Fatal "Arduino not detected"
     }
     $script:PORT = $script:BOARD.Port
-    Write-Host "  Found $($script:BOARD.Fqbn) on $($script:PORT) - using profile '$($script:BOARD.Profile)'"
+    Write-Host "`tFound $($script:BOARD.Fqbn) on $($script:PORT) - using profile '$($script:BOARD.Profile)'"
 
     if (-not (Write-Sketch -SketchFolderName "behavioral_controller" -ProfileName $script:BOARD.Profile)) {
         Exit-Fatal "Arduino compile/upload failed"
@@ -324,7 +598,7 @@ try {
 
     Write-Host "Running Python script..."
     Start-Sleep -Seconds 1
-    python -m behavioral_master
+    & $script:VENV_PYTHON -m behavioral_master
 
     if ($LASTEXITCODE -ne 0) {
         Write-Host ""
@@ -334,9 +608,7 @@ try {
     Write-Host ""
 }
 catch {
-    Write-host ""
     Write-Host "[FATAL] $($_.Exception.Message)"
-    Write-Host ""
     $script:ExitCode = 1
 }
 finally {
