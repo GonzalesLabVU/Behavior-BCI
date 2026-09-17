@@ -162,7 +162,8 @@ static void applyPhaseDefaults(int phase_id) {
         trial_T = SECONDS(30);
         delay_T = SECONDS(3);
     } else if (phase_id == 1) {
-        session_T = MINUTES(10);
+        // session_T = MINUTES(10);
+        session_T = MINUTES(1);
         trial_T = SECONDS(5);
         delay_T = SECONDS(3);
     } else if (phase_id == 2) {
@@ -512,6 +513,12 @@ void writeSerial(const char* event) {
     }
     else if (strcmp(event, "r_cue") == 0) {
         logger.write("r_cue");
+        sent = true;
+    }
+
+    // trial_start
+    else if (strcmp(event, "trial_start") == 0) {
+        logger.write("trial_start");
         sent = true;
     }
 
@@ -882,8 +889,16 @@ void run_phase_1() {
                 session_timer.init(session_T);
                 session_timer.start();
 
-                phase_state = PhaseState::HIT;
+                phase_state = PhaseState::CUE;
             }
+
+            break;
+        }
+
+        case PhaseState::CUE: {
+            // entry
+            writeSerial("trial_start");
+            phase_state = PhaseState::TRIAL;
 
             break;
         }
@@ -951,7 +966,7 @@ void run_phase_1() {
         }
         
         case PhaseState::DELAY: {
-            phase_state = PhaseState::TRIAL;
+            phase_state = PhaseState::CUE;
 
             break;
         }
@@ -976,6 +991,7 @@ void run_phase_2() {
 
         case PhaseState::CUE: {
             // entry
+            writeSerial("trial_start");
             phase_state = PhaseState::TRIAL;
 
             break;
