@@ -8,6 +8,7 @@ import math
 import random
 import time
 import socket
+import struct
 import uuid
 import json
 from itertools import zip_longest
@@ -20,6 +21,7 @@ from threading import Thread, Event, Lock, Timer
 import serial
 import serial.tools.list_ports
 from cursor_utils import BCI, ABORT_EVT
+from camera_utils import FLIRCamera
 from dashboard_utils import write_fields
 from TCPClient import PrairieClient
 
@@ -41,6 +43,16 @@ import tempfile
 # ---------------------------
 # BASIC CONFIG
 # ---------------------------
+if os.name == "nt":
+    import ctypes
+
+    _kernel32 = ctypes.windll.kernel32
+    _stdout_handle = _kernel32.GetStdHandle(-11)
+    _console_mode = ctypes.c_uint32()
+
+    if _kernel32.GetConsoleMode(_stdout_handle, ctypes.byref(_console_mode)):
+        _kernel32.SetConsoleMode(_stdout_handle, _console_mode.value | 0x0004)
+
 os.environ["PYGAME_HIDE_SUPPORT_PROMPT"] = "1"
 warnings.filterwarnings("ignore",
                         category=UserWarning,
@@ -856,7 +868,7 @@ class EmailInterface(InterfaceObject):
             t_elapsed = f"{m}m {s}s"
 
             n_hits = sum(1 for e in evt['values'] if e == 'hit')
-            n_total = sum(1 for e in evt['values'] if e == 'cue')
+            n_total = sum(1 for e in evt['values'] if e in {'cue', 'trial_start'})
             hit_rate = ((n_hits / n_total) * 100) if n_total else 0.0
 
             lines = [
@@ -2648,9 +2660,57 @@ class FileLock:
 # ---------------------------
 # SHARED
 # ---------------------------
+NTP_SERVER = os.getenv("NTP_SERVER", "pool.ntp.org")
+_NTP_EPOCH_DELTA = 2208988800
+_NTP_QUERY_PACKET = b'\x1b' + 47 * b'\0'
+_NTP_OFFSET = 0.0
+
+
+def _query_ntp_offset(server=NTP_SERVER, port=123, timeout=2.0):
+    """Query an NTP server once and return (network_time - local_time) in seconds, or None on failure"""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.settimeout(timeout)
+            t1 = time.time()
+            sock.sendto(_NTP_QUERY_PACKET, (server, port))
+            data, _ = sock.recvfrom(48)
+            t4 = time.time()
+
+        fields = struct.unpack("!12I", data)
+        t2 = (fields[8] - _NTP_EPOCH_DELTA) + (fields[9] / 2**32)
+        t3 = (fields[10] - _NTP_EPOCH_DELTA) + (fields[11] / 2**32)
+
+        return ((t2 - t1) + (t3 - t4)) / 2.0
+    except Exception:
+        return None
+
+
+def _sync_ntp_offset(server=NTP_SERVER):
+    """
+    Refresh the global NTP offset used by _get_ts()
+    Safe to call from a background thread
+    """
+    global _NTP_OFFSET
+
+    offset = _query_ntp_offset(server)
+    if offset is not None:
+        _NTP_OFFSET = offset
+    else:
+        print(f"[WARNING] NTP sync with '{server}' failed; timestamps will use the local system clock", flush=True)
+
+    return offset is not None
+
+
+def _ntp_resync_loop(server=NTP_SERVER, interval_s=600):
+    """Background daemon loop: periodically re-sync the NTP offset to correct for local clock drift"""
+    while True:
+        time.sleep(interval_s)
+        _sync_ntp_offset(server)
+
+
 def _get_ts():
-    """Return the current local time as an HH:MM:SS.mmm timestamp string."""
-    t = time.time()
+    """Return the current NTP-corrected local time as an HH:MM:SS.mmm timestamp string"""
+    t = time.time() + _NTP_OFFSET
     base = time.strftime("%H:%M:%S", time.localtime(t))
     ms = int((t - int(t)) * 1000)
 
@@ -2745,6 +2805,9 @@ def setup(interfaces=None):
         Tuple of ArduinoLink, SessionData, cursor object, and Prairie client.
     """
     interfaces = interfaces or BehaviorInterfaces()
+
+    _sync_ntp_offset()
+    Thread(target=_ntp_resync_loop, daemon=True).start()
 
     system_proxy = interfaces.system
     user_proxy = interfaces.user
@@ -3098,6 +3161,7 @@ def main(link, session_data, cursor, client=None, interfaces=None):
     trial_stack = []
     calibrated = not do_calibration
     last_outcome = None
+    last_outcome_ms = None
 
     trial_start_ms = None
     trial_dt = 0.0
@@ -3172,7 +3236,7 @@ def main(link, session_data, cursor, client=None, interfaces=None):
                 except Exception:
                     pass
 
-                if p == 'cue':
+                if p in {'cue', 'trial_start'}:
                     session_data.add_evt(ts, p)
 
                     if (imaging_active or imaging_requested) and first_trial and not continuous_imaging:
@@ -3192,10 +3256,14 @@ def main(link, session_data, cursor, client=None, interfaces=None):
                     session_data.add_evt(ts, p)
                 
                 if p in {'hit', 'miss'}:
-                    if last_outcome == p:
+                    now_ms = _ts_to_ms(ts)
+                    is_duplicate = (p == last_outcome and last_outcome_ms is not None and now_ms is not None
+                                    and (now_ms - last_outcome_ms) < 100)
+                    if is_duplicate:
                         continue
 
                     last_outcome = p
+                    last_outcome_ms = now_ms
 
                     session_data.add_evt(ts, p)
 
@@ -3326,7 +3394,6 @@ def main(link, session_data, cursor, client=None, interfaces=None):
 
 if __name__ == "__main__":
     interfaces = BehaviorInterfaces()
-    interfaces.console.clear()
 
     link = None
     session_data = None
