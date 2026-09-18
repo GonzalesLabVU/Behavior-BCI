@@ -506,19 +506,23 @@ void writeSerial(const char* event) {
 
     bool sent = false;
 
+    // trial_start, trial_stop
+    if (strcmp(event, "trial_start") == 0) {
+        logger.write("trial_start");
+        sent = true;
+    }
+    else if (strcmp(event, "trial_stop") == 0) {
+        logger.write("trial_stop");
+        sent = true;
+    }
+
     // cue, r_cue
-    if (strcmp(event, "cue") == 0) {
+    else if (strcmp(event, "cue") == 0) {
         logger.write("cue");
         sent = true;
     }
     else if (strcmp(event, "r_cue") == 0) {
         logger.write("r_cue");
-        sent = true;
-    }
-
-    // trial_start
-    else if (strcmp(event, "trial_start") == 0) {
-        logger.write("trial_start");
         sent = true;
     }
 
@@ -930,6 +934,7 @@ void run_phase_1() {
                     reward_given = false;
 
                     // HIT -> DELAY
+                    writeSerial("trial_stop");
                     phase_state = PhaseState::DELAY;
                 }
             }
@@ -1082,6 +1087,7 @@ void run_phase_2() {
                     reward_given = false;
 
                     // HIT -> DELAY
+                    writeSerial("trial_stop");
                     phase_state = PhaseState::DELAY;
                 }
             }
@@ -1111,6 +1117,7 @@ void run_phase_2() {
                     phase_timer.reset();
 
                     // MISS -> DELAY
+                    writeSerial("trial_stop");
                     phase_state = PhaseState::DELAY;
                 }
             }
@@ -1264,6 +1271,7 @@ void run_phase_3() {
                     reward_given = false;
 
                     // HIT -> DELAY
+                    writeSerial("trial_stop");
                     phase_state = PhaseState::DELAY;
                 }
             }
@@ -1295,6 +1303,7 @@ void run_phase_3() {
                     phase_timer.reset();
 
                     // MISS -> DELAY
+                    writeSerial("trial_stop");
                     phase_state = PhaseState::DELAY;
                 }
             }
@@ -1475,6 +1484,7 @@ void run_phase_4_plus() {
                     reward_given = false;
 
                     // HIT -> DELAY
+                    writeSerial("trial_stop");
                     phase_state = PhaseState::DELAY;
                 }
             }
@@ -1507,6 +1517,7 @@ void run_phase_4_plus() {
                     phase_timer.reset();
 
                     // MISS -> DELAY
+                    writeSerial("trial_stop");
                     phase_state = PhaseState::DELAY;
                 }
             }
