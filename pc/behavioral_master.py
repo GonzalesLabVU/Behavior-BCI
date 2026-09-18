@@ -60,6 +60,7 @@ warnings.filterwarnings("ignore",
                         )
 
 SCRIPT_DIR = Path.cwd()
+VIDEO_BASE_DIR = Path(r"D:\Behavioral\DeepLabCut")
 ANIMAL_MAP_PATH = SCRIPT_DIR / "animal_map.json"
 ERROR_LOG_PATH = SCRIPT_DIR / "errors.log"
 
@@ -527,7 +528,7 @@ class TrainerInterface(InterfaceObject):
         Returns:
             True when imaging is active, otherwise False.
         """
-        imaging_raw = input('\nImaging active? [y/N]:  ')
+        imaging_raw = input('Imaging active? [y/N]:  ')
         return _is_affirmative(imaging_raw)
 
     def prompt_imaging_window(self):
@@ -558,6 +559,16 @@ class TrainerInterface(InterfaceObject):
         """
         ephys_raw = input("Ephys active? [y/N]:  ")
         return _is_affirmative(ephys_raw)
+
+    def prompt_video(self):
+        """
+        Prompt whether FLIR camera recording is active.
+
+        Returns:
+            True when video is active, otherwise False.
+        """
+        video_raw = input("\nVideo active? [y/N]:  ")
+        return _is_affirmative(video_raw)
 
     def confirm_meta(self, session_data):
         animal_map = self.system.animal_map
@@ -2819,6 +2830,7 @@ def setup(interfaces=None):
     link = None
     client = None
     cursor = None
+    camera = None
 
     animal_id = "DEV"
     phase_id = "3"
@@ -2843,6 +2855,8 @@ def setup(interfaces=None):
             raise RuntimeError(f'No Arduino detected (required for phase {phase_id})')
 
         side_override = user_proxy.prompt_side() if phase_id == "4" else None
+
+        video_active = user_proxy.prompt_video()
 
         imaging_active = user_proxy.prompt_imaging()
         img_start_t = None
@@ -2875,6 +2889,27 @@ def setup(interfaces=None):
         client = prairie_proxy.connect(imaging_active, session_data=session_data, verbose=link.verbose)
         session_data.meta['imaging_active'] = bool(client is not None)
 
+        if video_active:
+            date_str = str(session_data.meta.get('date', "")).strip()
+
+            try:
+                yyyy_mm_dd = datetime.strptime(date_str, "%m/%d/%Y").strftime("%Y-%m-%d")
+            except Exception:
+                yyyy_mm_dd = datetime.now().strftime("%Y-%m-%d")
+
+            video_dir = VIDEO_BASE_DIR / f"{yyyy_mm_dd}" / f"Animal {animal_id} - Phase {phase_id}"
+
+            try:
+                camera = FLIRCamera(output_dir=str(video_dir), ts_fcn=_get_ts)
+                camera.configure()
+            except Exception as e:
+                print(f"\n[WARNING] Video requested, but the camera could not be initialized"
+                      "\nContinuing without video...\n",
+                      flush=True)
+                camera = None
+
+        session_data.meta['video_active'] = bool(camera is not None)
+
         is_easy = True
         if cfg and link.active:
             cursor, is_easy = cursor_proxy.connect(phase_id, side)
@@ -2895,9 +2930,15 @@ def setup(interfaces=None):
 
         dashboard_proxy.notify_start(session_data)
 
-        return link, session_data, cursor, client
+        return link, session_data, cursor, client, camera
     except Exception as e:
         interfaces.exceptions.cache(e, 'setup')
+
+        if camera is not None:
+            try:
+                camera.close()
+            except Exception as e2:
+                interfaces.exceptions.cache(e2, 'setup._cleanup')
 
         if link is not None:
             try:
@@ -3071,7 +3112,7 @@ def _cleanup(link, msg, timeout_s=30.0):
         link.close()
 
 
-def main(link, session_data, cursor, client=None, interfaces=None):
+def main(link, session_data, cursor, client=None, camera=None, interfaces=None):
     """
     Run the behavioral session event loop.
 
@@ -3088,12 +3129,14 @@ def main(link, session_data, cursor, client=None, interfaces=None):
     dashboard_proxy = interfaces.dashboard
     cursor_proxy = interfaces.cursor
 
+    dev_verbose = bool(getattr(link, 'verbose', False))
+
     do_calibration = int(session_data.meta['phase']) > 4
     imaging_active = (bool(session_data.meta.get('imaging_active', False))
                       and (client is not None))
     imaging_requested = bool(session_data.meta.get('imaging_requested', False))
-    dev_verbose = bool(getattr(link, 'verbose', False))
     ephys_active = bool(session_data.meta.get('ephys_active', False))
+    video_active = bool(session_data.meta.get('video_active', False)) and camera is not None
 
     continuous_imaging = (str(session_data.meta['phase']) == "2")
     img_start_t = session_data.meta.get('img_start_t')
@@ -3239,6 +3282,9 @@ def main(link, session_data, cursor, client=None, interfaces=None):
                 if p in {'cue', 'trial_start'}:
                     session_data.add_evt(ts, p)
 
+                    if video_active:
+                        camera.start()
+
                     if (imaging_active or imaging_requested) and first_trial and not continuous_imaging:
                         client_ok = _send_img_start("start()", real_fn=client.start if client is not None else None)
                         ttl_ok = link.start_imaging(delay_s=0.0) if imaging_active else True
@@ -3257,6 +3303,9 @@ def main(link, session_data, cursor, client=None, interfaces=None):
 
                 if p == 'trial_stop':
                     session_data.add_evt(ts, p)
+
+                    if video_active:
+                        camera.stop()
 
                 if p in {'hit', 'miss'}:
                     now_ms = _ts_to_ms(ts)
@@ -3402,6 +3451,7 @@ if __name__ == "__main__":
     session_data = None
     cursor = None
     prairie = None
+    camera = None
 
     animal_id_for_log = "UNKNOWN"
     phase_id_for_log = "0"
@@ -3409,13 +3459,13 @@ if __name__ == "__main__":
     run_exc = None
 
     try:
-        link, session_data, cursor, prairie = setup(interfaces)
+        link, session_data, cursor, prairie, camera = setup(interfaces)
 
         if session_data is not None:
             animal_id_for_log = session_data.meta.get("animal", "UNKNOWN")
             phase_id_for_log = session_data.meta.get("phase", "0")
 
-        main(link, session_data, cursor, prairie, interfaces)
+        main(link, session_data, cursor, prairie, camera, interfaces)
     except SystemExit as e:
         pass
     except KeyboardInterrupt as e:
@@ -3446,6 +3496,13 @@ if __name__ == "__main__":
                 link.close()
             except Exception as e:
                 interfaces.exceptions.cache(e, '__main__.link_close')
+                ExceptionInterface(*run_info).log_and_commit(e)
+
+        if camera is not None:
+            try:
+                camera.close()
+            except Exception as e:
+                interfaces.exceptions.cache(e, '__main__.camera_close')
                 ExceptionInterface(*run_info).log_and_commit(e)
 
         if session_data is not None and session_data.is_finished:
