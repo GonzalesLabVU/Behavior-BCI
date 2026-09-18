@@ -35,7 +35,10 @@ def _get_ts():
 
 
 class FLIRCamera:
-    def __init__(self, output_dir):
+    def __init__(self, output_dir, ts_fcn=None):
+        # timestamp source function
+        self._get_ts = ts_fcn or _get_ts
+
         # system/camera handles
         self._system = None
         self._cam_list = None
@@ -182,7 +185,7 @@ class FLIRCamera:
                     continue
 
                 try:
-                    frame_ts = _get_ts()
+                    frame_ts = self._get_ts()
 
                     arr = img.GetNDArray()
                     if arr.dtype != np.uint8:
@@ -444,21 +447,14 @@ if __name__ == "__main__":
 
     n = 0
 
-    # while n < 3:
-    #     n += 1
+    while n < 3:
+        n += 1
 
-    #     print(f"Starting capture {n}...", end="")
-    #     cam.start()
-    #     time.sleep(3)
-    #     cam.stop()
-    #     print("Done")
-    #     time.sleep(1)
-
-    capture_mins = 10
-
-    print(f"Starting {capture_mins} minute capture...")
-    cam.start()
-    time.sleep(capture_mins*60)
-    cam.stop()
+        print(f"Starting capture {n}...", end="")
+        cam.start()
+        time.sleep(3)
+        cam.stop()
+        print("Done")
+        time.sleep(1)
 
     cam.close()
