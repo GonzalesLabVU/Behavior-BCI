@@ -3247,14 +3247,17 @@ def main(link, session_data, cursor, client=None, interfaces=None):
                             raise RuntimeError('Initial START command failed')
 
                         first_trial = False
-                    
+
                     trial_n += 1
                     last_outcome = None
                     trial_start_ms = _ts_to_ms(ts)
-                
+
                 if p == 'r_cue':
                     session_data.add_evt(ts, p)
-                
+
+                if p == 'trial_stop':
+                    session_data.add_evt(ts, p)
+
                 if p in {'hit', 'miss'}:
                     now_ms = _ts_to_ms(ts)
                     is_duplicate = (p == last_outcome and last_outcome_ms is not None and now_ms is not None
