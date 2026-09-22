@@ -61,6 +61,8 @@ warnings.filterwarnings("ignore",
 
 SCRIPT_DIR = Path.cwd()
 VIDEO_BASE_DIR = Path(r"D:\Behavioral\DeepLabCut")
+BACKUP_DIR = SCRIPT_DIR / "backup"
+
 ANIMAL_MAP_PATH = SCRIPT_DIR / "animal_map.json"
 ERROR_LOG_PATH = SCRIPT_DIR / "errors.log"
 
@@ -404,26 +406,17 @@ class ConsoleInterface(InterfaceObject):
         print(f"\nSession duration: {m}:{s:02d}\n", flush=True)
 
     def show_exceptions(self):
-        hline = 100 * "—"
-
         if not EXC_STACK:
+            hline = 100 * "—"
+
             _cmd_run("echo.")
             print(f"{hline}\n")
             print(f"{hline}\n")
             print("[Process exited with code 0]")
+
             return
 
-        print(hline + "\nEXCEPTION STACK (in order of occurrence):\n" + hline, flush=True)
-
-        for i, info in enumerate(EXC_STACK, start=1):
-            print(f"\n[{i}] {info['type']} in {info['caller']}:", flush=True)
-
-            exc = info['exc']
-            tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
-
-            print(f"\n{tb}", flush=True)
-            print(hline, flush=True)
-
+        print(_format_exc_stack(), flush=True)
         print("\n[Process exited with code 1]\n")
 
     def wait_for_key(self):
@@ -943,6 +936,11 @@ class EmailInterface(InterfaceObject):
 
         body = format_body(date, t_start, t_stop, dur_s, evt)
 
+        exc_stack = _format_exc_stack()
+        if exc_stack:
+            subject = f"[ERROR] {subject}"
+            body = f"{body}\n\n{exc_stack}"
+
         try:
             recipients = json.loads(smtp_to_addr)
             if isinstance(recipients, str):
@@ -965,6 +963,19 @@ class EmailInterface(InterfaceObject):
             subtype="html",
         )
 
+        backup_path = session_data.meta.get('_backup_path')
+        if backup_path and Path(backup_path).exists():
+            try:
+                with open(backup_path, 'rb') as bf:
+                    msg.add_attachment(bf.read(),
+                                       maintype='application',
+                                       subtype='json',
+                                       filename=Path(backup_path).name)
+            except Exception as e:
+                print(f"[WARNING] Could not attach local backup file to session summary email: "
+                      f"{type(e).__name__}: {e}",
+                      flush=True)
+
         with smtplib.SMTP(self.SMTP_SERVER, self.SMTP_PORT, timeout=30) as server:
             server.ehlo()
             server.starttls()
@@ -977,6 +988,9 @@ class SaveInterface(InterfaceObject):
     interface_name = "save"
 
     VALID_SESSION_S = 5 * 60
+
+    def __init__(self):
+        self._backup_writer = None
 
     def _build_rows(self, session_data, dtype):
         """
@@ -1068,6 +1082,90 @@ class SaveInterface(InterfaceObject):
             }
         
         wb.batch_update(req)
+
+    def start_backup(self, session_data):
+        """
+        Start this session's background, incremental local backup file.
+
+        Reuses fallback_save's old file naming convention (now with a
+        .json extension) inside BACKUP_DIR. All disk I/O for this backup
+        happens on BackupWriter's background thread.
+
+        Args:
+            session_data: SessionData instance to persist.
+
+        Returns:
+            Path to the local backup .json file.
+        """
+        animal = str(session_data.meta.get('animal', 'UNKNOWN'))
+        phase = str(session_data.meta.get('phase', '0'))
+        date = str(session_data.meta.get('date', '0000-00-00')).replace('/', '.')
+        rand = uuid.uuid4().hex[:6]
+
+        BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+        out_path = BACKUP_DIR / f"date={date}_animal={animal}_phase={phase}_id={rand}.json"
+
+        self._backup_writer = BackupWriter(out_path)
+        session_data.meta['_backup_path'] = str(out_path)
+
+        return out_path
+
+    def append_backup(self, session_data, trial_n=None):
+        """
+        Queue this trial's new events for the background backup writer.
+
+        Only the evt/enc/raw entries added since the previous call are
+        included (see SessionData.new_since_backup), so the backup file
+        stores one small, additive record per trial rather than a full
+        session snapshot every time. This call itself is non-blocking;
+        the disk write happens on BackupWriter's background thread.
+
+        Args:
+            session_data: SessionData instance to persist.
+            trial_n: Trial number this slice belongs to.
+
+        Returns:
+            True when nothing failed (including when there was nothing new
+            to queue), otherwise False.
+        """
+        if session_data is None or self._backup_writer is None:
+            return False
+
+        try:
+            diff = session_data.diff(trial_n)
+
+            if diff is not None:
+                self._backup_writer.enqueue(trial_n, diff)
+
+            return True
+        except Exception as e:
+            ExceptionInterface(session_data.meta.get('animal', 'UNKNOWN'),
+                               session_data.meta.get('phase', '0')
+                               ).cache(e, 'save.append_backup')
+
+            return False
+
+    def finish_backup(self, delete):
+        """
+        Stop the background backup writer, flushing any queued trial data
+        to disk first, then optionally delete the backup file.
+
+        Args:
+            delete: When True, remove the local backup file after flushing.
+        """
+        writer = self._backup_writer
+        if writer is None:
+            return
+
+        try:
+            writer.flush_and_stop()
+        except Exception:
+            pass
+
+        if delete:
+            writer.delete()
+
+        self._backup_writer = None
 
     def resolve_protocol(self, session_data):
         """
@@ -1466,7 +1564,9 @@ class SaveInterface(InterfaceObject):
 
     def save_session(self, session_data):
         """
-        Save session data to Google Sheets with local fallback on failure.
+        Save session data to Google Sheets. The local backup file (started
+        in setup() and populated per-trial) is deleted on success and
+        retained on failure -- it now serves the role fallback_save used to.
 
         Args:
             session_data: SessionData instance to persist.
@@ -1481,46 +1581,19 @@ class SaveInterface(InterfaceObject):
 
         try:
             self.save_data(session_data)
+            self.finish_backup(delete=True)
+
             return True
         except Exception as e:
-            try:
-                self.fallback_save(session_data)
-            except Exception as e2:
-                exc_proxy.log(e2)
-
+            self.finish_backup(delete=False)
             exc_proxy.log(e)
+
             return False
         finally:
             try:
                 exc_proxy.commit()
             except Exception:
                 pass
-
-    def fallback_save(self, session_data):
-        """
-        Save session data using the local fallback path.
-
-        Args:
-            session_data: SessionData instance to persist.
-
-        Returns:
-            Path to the local fallback file.
-        """
-        animal = str(session_data.meta.get('animal', 'UNKNOWN'))
-        phase = str(session_data.meta.get('phase', '0'))
-        date = str(session_data.meta.get('date', '0000-00-00')).replace('/', '.')
-        rand = uuid.uuid4().hex[:6]
-
-        out_path = SCRIPT_DIR / f"date={date}_animal={animal}_phase={phase}_id={rand}.json"
-        payload = session_data.to_dict()
-
-        with open(out_path, 'w', encoding='utf-8') as f:
-            json.dump(payload, f, indent=4)
-
-        print("\r\033[2K", end="", flush=True)
-        print(f"[WARNING] Saved session data locally to {out_path.name}", flush=True)
-
-        return out_path
 
 
 class PrairieInterface(InterfaceObject):
@@ -1988,6 +2061,15 @@ class SessionData:
             "cap": {"timestamps": [], "values": []}
             }
 
+        self._backup_cursor = {
+            "evt": 0,
+            "enc": 0,
+            "img_start": 0,
+            "img_stop": 0,
+            "raw_evt": 0,
+            "raw_cap": 0
+            }
+
     def _ensure_session_tracking(self):
         self.meta.setdefault("trial_config", [])
         self.meta.setdefault("K1", 5)
@@ -2092,6 +2174,70 @@ class SessionData:
         
         raise ValueError(f"Invalid field: {field!r} (Expected one of: None, 'evt', 'enc', 'raw')")
 
+    def diff(self, trial_n=None):
+        """
+        Return only the evt/enc/raw entries added since the last call to
+        this method (or since session start, on the first call), advancing
+        the internal backup cursor past them.
+
+        Args:
+            trial_n: Trial number to tag the returned slice with.
+
+        Returns:
+            A JSON-safe dict of the newly added entries, or None when
+            nothing new has been recorded since the last call.
+        """
+        def _slice(container, key):
+            if key == "img":
+                start_i = self._backup_cursor['img_start']
+                stop_i = self._backup_cursor['img_stop']
+
+                start_ts = list(container['start_ts'][start_i:])
+                stop_ts = list(container['stop_ts'][stop_i:])
+
+                self._backup_cursor['img_start'] = len(container['start_ts'])
+                self._backup_cursor['img_stop'] = len(container['stop_ts'])
+
+                return {"start_ts": start_ts, "stop_ts": stop_ts}
+
+            start = self._backup_cursor[key]
+
+            ts = list(container['timestamps'][start:])
+            vals = list(container['values'][start:])
+
+            self._backup_cursor[key] = len(container['timestamps'])
+
+            return {"timestamps": ts, "values": vals}
+
+        evt_slice = _slice(self.evt, "evt")
+        enc_slice = _slice(self.enc, "enc")
+        img_slice = _slice(self.img, "img")
+        raw_evt_slice = _slice(self.raw["evt"], "raw_evt")
+        raw_cap_slice = _slice(self.raw["cap"], "raw_cap")
+
+        has_new = any(
+            s['timestamps'] 
+            for s in (
+                evt_slice,
+                enc_slice,
+                raw_evt_slice,
+                raw_cap_slice
+                )
+            ) or img_slice['start_ts'] or img_slice['stop_ts']
+
+        if not has_new:
+            return None
+
+        return {
+            "trial": trial_n,
+            "written_at": _utc_ts(),
+            "evt": evt_slice,
+            "enc": enc_slice,
+            "img": img_slice,
+            "raw_evt": raw_evt_slice,
+            "raw_cap": raw_cap_slice
+            }
+
     def to_dict(self):
         """Convert the session data to JSON-safe dictionaries.
 
@@ -2181,6 +2327,60 @@ API_SCOPES = ["https://www.googleapis.com/auth/spreadsheets",
 API_CREDS = Credentials.from_service_account_file(str(SCRIPT_DIR / 'credentials.json'), scopes=API_SCOPES)
 API_CLIENT = gspread.authorize(API_CREDS)
 API_DRIVE = build('drive', 'v3', credentials=API_CREDS, cache_discovery=False)
+
+
+class BackupWriter:
+    def __init__(self, path):
+        self.path = Path(path)
+        self.data = {}
+        self.queue = Queue()
+        self.thread = Thread(target=self._run, daemon=True)
+
+        self.thread.start()
+
+    def _tmp_path(self):
+        return self.path.with_suffix(self.path.suffix + ".tmp")
+
+    def _write(self):
+        tmp_path = self._tmp_path()
+
+        with open(tmp_path, 'w', encoding='utf-8') as f:
+            json.dump(self.data, f, indent=4)
+            f.flush()
+            os.fsync(f.fileno())
+
+        os.replace(tmp_path, self.path)
+
+    def _run(self):
+        while True:
+            item = self.queue.get()
+            if item is None:
+                self.queue.task_done()
+                break
+
+            trial_key, diff = item
+
+            try:
+                self.data[trial_key] = diff
+                self._write()
+            except Exception:
+                pass
+            finally:
+                self.queue.task_done()
+
+    def enqueue(self, trial_n, diff):
+        self.queue.put_nowait((str(trial_n), diff))
+
+    def flush_and_stop(self, timeout_s=10.0):
+        self.queue.put_nowait(None)
+        self.thread.join(timeout=timeout_s)
+
+    def delete(self):
+        for p in (self.path, self._tmp_path()):
+            try:
+                p.unlink(missing_ok=True)
+            except Exception:
+                pass
 
 
 class FileLock:
@@ -2797,6 +2997,32 @@ def _is_affirmative(text):
     return str(text).strip().lower() in {"y", "yes"}
 
 
+def _format_exc_stack():
+    """
+    Build the same "EXCEPTION STACK (in order of occurrence)" text that
+    ConsoleInterface.show_exceptions prints to the console, so the session
+    summary email can include an identically formatted copy.
+
+    Returns:
+        The formatted exception-stack text, or "" when EXC_STACK is empty.
+    """
+    if not EXC_STACK:
+        return ""
+
+    hline = 100 * "—"
+    segments = [hline + "\nEXCEPTION STACK (in order of occurrence):\n" + hline]
+
+    for i, info in enumerate(EXC_STACK, start=1):
+        exc = info['exc']
+        tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+
+        segments.append(f"\n[{i}] {info['type']} in {info['caller']}:")
+        segments.append(f"\n{tb}")
+        segments.append(hline)
+
+    return "\n".join(segments)
+
+
 # ---------------------------
 # SETUP
 # ---------------------------
@@ -2832,6 +3058,7 @@ def setup(interfaces=None):
     cursor = None
     camera = None
 
+    session_data = None
     animal_id = "DEV"
     phase_id = "3"
 
@@ -2885,7 +3112,9 @@ def setup(interfaces=None):
         session_data.meta['img_stop_t'] = img_stop_t
         session_data.meta['ephys_active'] = bool(ephys_active)
         session_data.meta['side_override'] = side_override
-        
+
+        interfaces.saving.start_backup(session_data)
+
         client = prairie_proxy.connect(imaging_active, session_data=session_data, verbose=link.verbose)
         session_data.meta['imaging_active'] = bool(client is not None)
 
@@ -2933,6 +3162,12 @@ def setup(interfaces=None):
         return link, session_data, cursor, client, camera
     except Exception as e:
         interfaces.exceptions.cache(e, 'setup')
+
+        if session_data is not None and session_data.meta.get('_backup_path'):
+            try:
+                interfaces.saving.finish_backup(delete=True)
+            except Exception as e2:
+                interfaces.exceptions.cache(e2, 'setup._cleanup')
 
         if camera is not None:
             try:
@@ -3128,6 +3363,7 @@ def main(link, session_data, cursor, client=None, camera=None, interfaces=None):
     console_proxy = interfaces.console
     dashboard_proxy = interfaces.dashboard
     cursor_proxy = interfaces.cursor
+    saving_proxy = interfaces.saving
 
     dev_verbose = bool(getattr(link, 'verbose', False))
 
@@ -3307,6 +3543,8 @@ def main(link, session_data, cursor, client=None, camera=None, interfaces=None):
                     if video_active:
                         camera.stop()
 
+                    saving_proxy.append_backup(session_data, trial_n)
+
                 if p in {'hit', 'miss'}:
                     now_ms = _ts_to_ms(ts)
                     is_duplicate = (p == last_outcome and last_outcome_ms is not None and now_ms is not None
@@ -3441,6 +3679,7 @@ def main(link, session_data, cursor, client=None, camera=None, interfaces=None):
         elif session_data.img_can_stop():
             _send_img_stop("stop()", real_fn=client.stop if client is not None else None)
 
+        saving_proxy.append_backup(session_data, trial_n)
         dashboard_proxy.notify_finish()
 
 
@@ -3480,6 +3719,7 @@ if __name__ == "__main__":
 
         try:
             interfaces.prairie.finish(prairie, session_data, verbose=getattr(link, 'verbose', False))
+            interfaces.saving.append_backup(session_data, trial_n="img")
         except Exception as e:
             interfaces.exceptions.cache(e, "__main__.prairie_finish")
             ExceptionInterface(*run_info).log_and_commit(e)
@@ -3505,16 +3745,12 @@ if __name__ == "__main__":
                 interfaces.exceptions.cache(e, '__main__.camera_close')
                 ExceptionInterface(*run_info).log_and_commit(e)
 
-        if session_data is not None and session_data.is_finished:
-            if session_data.meta.get('animal', None) not in {None, "DEV"}:
-                try:
-                    interfaces.email.send_session_summary(session_data)
-                except Exception as e:
-                    interfaces.exceptions.cache(e, '__main__.send_email')
-                    ExceptionInterface(*run_info).log_and_commit(e)
-        
-        if session_data is not None and session_data.any_data():
-            if session_data.meta.get('animal', None) not in {None, "DEV"}:
+        if session_data is not None and session_data.meta.get('_backup_path'):
+            is_dev = session_data.meta.get('animal', None) in {None, "DEV"}
+
+            if is_dev or not session_data.any_data():
+                interfaces.saving.finish_backup(delete=True)
+            else:
                 try:
                     if interfaces.user.confirm_save():
                         if interfaces.saving.resolve_protocol(session_data):
@@ -3525,7 +3761,18 @@ if __name__ == "__main__":
                                 interfaces.console.warning("Google Sheets save failed (saving locally instead)")
                         else:
                             print("Session exited without saving", flush=True)
+                            interfaces.saving.finish_backup(delete=True)
+                    else:
+                        interfaces.saving.finish_backup(delete=True)
                 except Exception as e:
                     interfaces.exceptions.cache(e, '__main__.safe_save')
+
+        if session_data is not None and session_data.is_finished:
+            if session_data.meta.get('animal', None) not in {None, "DEV"}:
+                try:
+                    interfaces.email.send_session_summary(session_data)
+                except Exception as e:
+                    interfaces.exceptions.cache(e, '__main__.send_email')
+                    ExceptionInterface(*run_info).log_and_commit(e)
 
         interfaces.console.show_exceptions()
