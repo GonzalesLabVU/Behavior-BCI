@@ -389,6 +389,8 @@ class ConsoleInterface(InterfaceObject):
 
         print("|".join(cells))
 
+        return rate_str
+
     def show_summary(self, session_data):
         """Display a brief session duration summary.
 
@@ -634,21 +636,16 @@ class DashboardInterface(InterfaceObject):
     def notify_finish(self):
         self._safe_write({"status": "finished"}, timestamp=self._utc_iso())
 
-        original_read_key = keyboard.read_key
+    def notify_idle(self):
+        self._safe_write({
+            "status": "idle",
+            "animal": "",
+            "phase": ""
+            },
+            timestamp=self._utc_iso())
 
-        def _read_key_and_set_idle(*args, **kwargs):
-            try:
-                return original_read_key(*args, **kwargs)
-            finally:
-                self._safe_write({
-                    "status": "idle",
-                    "animal": "",
-                    "phase": ""
-                    }, timestamp=self._utc_iso())
-
-                keyboard.read_key = original_read_key
-
-        keyboard.read_key = _read_key_and_set_idle
+    def notify_performance(self, rate_str):
+        self._safe_write({"performance": rate_str}, timestamp=self._utc_iso())
 
 
 class ExceptionInterface(InterfaceObject):
@@ -3584,7 +3581,8 @@ def main(link, session_data, cursor, client=None, camera=None, interfaces=None):
                     n_hit = sum(1 for o in recent_outcomes if o == 'hit')
                     n_miss = sum(1 for o in recent_outcomes if o == 'miss')
 
-                    console_proxy.show_trial_info(trial_dt, n_hit, n_miss, p)
+                    rate_str = console_proxy.show_trial_info(trial_dt, n_hit, n_miss, p)
+                    dashboard_proxy.notify_performance(rate_str)
 
                     if do_calibration:
                         trial_stack.insert(0, p)
@@ -3766,6 +3764,8 @@ if __name__ == "__main__":
                         interfaces.saving.finish_backup(delete=True)
                 except Exception as e:
                     interfaces.exceptions.cache(e, '__main__.safe_save')
+
+        interfaces.dashboard.notify_idle()
 
         if session_data is not None and session_data.is_finished:
             if session_data.meta.get('animal', None) not in {None, "DEV"}:
