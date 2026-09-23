@@ -43,11 +43,26 @@ function Test-VenvPythonVersion {
         return $false
     }
 
-    $out = & $script:VENV_PYTHON --version 2>&1
-    return ($out -match [regex]::Escape($script:PYTHON_VERSION))
+    $pyvenvCfg = Join-Path $script:VENV_DIR "pyvenv.cfg"
+    if (-not (Test-Path $pyvenvCfg)) {
+        return $false
+    }
+
+    $versionLine = Get-Content $pyvenvCfg |
+        Where-Object { $_ -match '^\s*version\s*=' } | 
+        Select-Object -First 1
+    if (-not $versionLine) {
+        return $false
+    }
+
+    return ($versionLine -match [regex]::Escape($script:PYTHON_VERSION))
 }
 
 function Initialize-PythonVenv {
+    if (Test-VenvPythonVersion) {
+        return $true
+    }
+
     if (-not (Check-Python310Available)) {
         Write-Host "Python $($script:PYTHON_VERSION) not found; attempting to install..."
 
@@ -63,20 +78,18 @@ function Initialize-PythonVenv {
         }
     }
 
-    if (-not (Test-VenvPythonVersion)) {
-        if (Test-Path $script:VENV_DIR) {
-            Write-Host "Existing virtual environment doesn't match Python $($script:PYTHON_VERSION); rebuilding virtual environment..."
-            Remove-Item -Recurse -Force $script:VENV_DIR
-        }
-        else {
-            Write-Host "Creating Python $($script:PYTHON_VERSION) virtual environment..."
-        }
+    if (Test-Path $script:VENV_DIR) {
+        Write-Host "Existing virtual environment doesn't match Python $($script:PYTHON_VERSION); rebuilding virtual environment..."
+        Remove-Item -Recurse -Force $script:VENV_DIR
+    }
+    else {
+        Write-Host "Creating Python $($script:PYTHON_VERSION) virtual environment..."
+    }
 
-        & py "-$script:PYTHON_VERSION" -m venv $script:VENV_DIR
-        if ($LASTEXITCODE -ne 0 -or -not (Test-Path $script:VENV_PYTHON)) {
-            Write-Host "[ERROR] Failed to create virtual environment at $($script:VENV_DIR)"
-            return $false
-        }
+    & py "-$script:PYTHON_VERSION" -m venv $script:VENV_DIR
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path $script:VENV_PYTHON)) {
+        Write-Host "[ERROR] Failed to create virtual environment at $($script:VENV_DIR)"
+        return $false
     }
 
     return $true
@@ -118,7 +131,7 @@ function Install-PySpinWheel {
 
     Write-Host "`tFound matching PySpin wheel: $($matchingWheel.Name)"
     Write-Host "Installing PySpin..."
-    & $script:VENV_PYTHON -m pip install $matchingWheel.FullName -q
+    & $script:VENV_PYTHON -m pip install $matchingWheel.FullName -q --disable-pip-version-check
     if ($LASTEXITCODE -ne 0) {
         Write-Host "[WARNING] Failed to install $($matchingWheel.Name)"
         return $false
@@ -525,8 +538,6 @@ $script:ExitCode = 0
 
 try {
     Clear-Host
-    Start-Sleep -Seconds 2
-
     Write-Host "`nResolving script directory..."
     $script:SCRIPT_DIR = $PSScriptRoot
     Set-Location $script:SCRIPT_DIR
@@ -540,7 +551,7 @@ try {
     }
 
     Write-Host "Making sure pip is up to date..."
-    & $script:VENV_PYTHON -m pip install --upgrade pip -q
+    & $script:VENV_PYTHON -m pip install --upgrade pip -q --disable-pip-version-check
 
     if ($LASTEXITCODE -ne 0) {
         Exit-Fatal "pip upgrade failed"
@@ -557,20 +568,37 @@ try {
         ForEach-Object { $_.Trim() } |
         Where-Object { $_ -and -not $_.StartsWith("#") }
 
+    $displayByName = @{}
     foreach ($requirement in $requirementsLines) {
         if ($requirement -match '^([A-Za-z0-9_.\-]+)\s*==\s*(.+)$') {
             $packageName = $matches[1]
             $packageVersion = $matches[2]
-            Write-Host "`t$packageName ($packageVersion)"
+            $displayByName[$packageName.ToLowerInvariant()] = "$packageName ($packageVersion)"
         }
-        else {
-            Write-Host "`t$requirement"
+        elseif ($requirement -match '^([A-Za-z0-9_.\-]+)') {
+            $displayByName[$matches[1].ToLowerInvariant()] = $requirement
+        }
+    }
+
+    & $script:VENV_PYTHON -m pip install -r $requirementsPath --disable-pip-version-check 2>&1 |
+        ForEach-Object {
+            if ($_ -match '^(?:Collecting|Requirement already satisfied:)\s+([A-Za-z0-9_.\-]+)') {
+                $pkgKey = $matches[1].ToLowerInvariant()
+                if ($displayByName.ContainsKey($pkgKey)) {
+                    Write-Host "`t$($displayByName[$pkgKey])"
+                }
+            }
         }
 
-        & $script:VENV_PYTHON -m pip install $requirement -q
-        if ($LASTEXITCODE -ne 0) {
-            Write-Host "[ERROR] Failed to install '$requirement'"
-            Exit-Fatal "pip install failed"
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "[WARNING] Batched install failed; retrying package-by-package to isolate the failure..."
+
+        foreach ($requirement in $requirementsLines) {
+            & $script:VENV_PYTHON -m pip install $requirement -q --disable-pip-version-check
+            if ($LASTEXITCODE -ne 0) {
+                Write-Host "[ERROR] Failed to install '$requirement'"
+                Exit-Fatal "pip install failed"
+            }
         }
     }
 
@@ -597,7 +625,8 @@ try {
     }
 
     Write-Host "Running Python script..."
-    Start-Sleep -Seconds 1
+    Start-Sleep -Milliseconds 500
+    Clear-Host
     & $script:VENV_PYTHON -m behavioral_master
 
     if ($LASTEXITCODE -ne 0) {
