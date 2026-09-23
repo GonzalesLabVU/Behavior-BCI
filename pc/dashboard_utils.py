@@ -22,9 +22,11 @@ CLIENT_START_COLS = {
 FIELD_ROWS = {
     "status": 1,
     "animal": 2,
-    "phase": 3
+    "phase": 3,
+    "performance": 4
     }
 
+_REQUIRED_ROW_COUNT = max(FIELD_ROWS.values())
 _ENV_CACHE = None
 _CLIENT_CACHE = None
 
@@ -114,8 +116,8 @@ def _dashboard_worksheet():
                                            rows=13,
                                            cols=6)
 
-    if worksheet.row_count < 3:
-        worksheet.add_rows(3 - worksheet.row_count)
+    if worksheet.row_count < _REQUIRED_ROW_COUNT:
+        worksheet.add_rows(_REQUIRED_ROW_COUNT - worksheet.row_count)
 
     if worksheet.col_count < 6:
         worksheet.add_cols(6 - worksheet.col_count)
