@@ -123,6 +123,7 @@ static bool trial_hit = false;
 static bool reward_given = false;
 static long last_disp_mark = LONG_MIN;
 
+
 // ---------------------------
 // FORWARD DECLARATIONS
 // ---------------------------
@@ -133,22 +134,44 @@ bool sendPulseTrain(const String& eventType);
 // SERIAL HELPERS
 // ---------------------------
 static bool readLine(char* buf, size_t cap) {
-    if (!Serial.available()) return false;
+    static char line_buf[96];
+    static size_t line_len = 0;
 
-    size_t n = Serial.readBytesUntil('\n', buf, cap - 1);
-    if (n == 0) return false;
+    while (Serial.available()) {
+        char c = (char)Serial.read();
 
-    buf[n] = '\0';
+        if (c == '\n') {
+            size_t n = line_len;
 
-    while (n && (buf[n - 1] == '\r' || buf[n - 1] == ' ' || buf[n - 1] == '\t')) {
-        buf[--n] = '\0';
+            while (n && (line_buf[n-1] == '\r' || line_buf[n-1] == ' ' || line_buf[n-1] == '\t')) {
+                n--;
+            }
+
+            char* p = line_buf;
+            while (n && (*p == ' ' || *p == '\t')) {
+                p++;
+                n--;
+            }
+
+            size_t out_len = (n < cap - 1) ? n : (cap - 1);
+            memcpy(buf, p, out_len);
+            buf[out_len] = '\0';
+
+            line_len = 0;
+
+            if (buf[0] == '\0') return false;
+            return true;
+        }
+
+        if (line_len < sizeof(line_buf) - 1) {
+            line_buf[line_len++] = c;
+        }
+        else {
+            line_len = 0;
+        }
     }
 
-    char* p = buf;
-    while (*p == ' ' || *p == '\t') p++;
-    if (p != buf) memmove(buf, p, strlen(p) + 1);
-
-    return buf[0] != '\0';
+    return false;
 }
 
 static bool isSideChar(char c) {
@@ -408,7 +431,7 @@ static void waitForHandshake() {
                 logger.ack();
             }
         }
-    
+
     check_done:
         bool trial_required = (session_cfg.phase != 0 && session_cfg.phase != 1);
 
@@ -739,6 +762,7 @@ void setup() {
 
 void loop() {
     drainSerial();
+    brake.update();
 
     switch (session_state) {
         case SessionState::MAIN: {
