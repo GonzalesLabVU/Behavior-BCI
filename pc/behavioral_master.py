@@ -1,5 +1,6 @@
 import os
 import sys
+import signal
 import warnings
 import traceback
 
@@ -253,7 +254,7 @@ class SystemInterface(InterfaceObject):
                 print(f"\n[WARNING] {port} port is not open after initialization (continuing anyway)", flush=True)
                 return None, False
 
-            print(f"\nConnected to {port} port\n", flush=True)
+            print(f"\nConnected to {port} port", flush=True)
             return ser, True
         except Exception as e:
             print(f"\n[WARNING] Could not open Arduino port: {e}", flush=True)
@@ -615,6 +616,8 @@ class DashboardInterface(InterfaceObject):
         return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
     def _safe_write(self, fields, timestamp=None):
+        original_handler = signal.signal(signal.SIGINT, signal.SIG_IGN)
+
         try:
             return write_fields(self.client_id,
                                 fields,
@@ -623,6 +626,8 @@ class DashboardInterface(InterfaceObject):
             print(f"[WARNING] Dashboard update failed: {type(exc).__name__}: {exc}",
                   flush=True)
             return None
+        finally:
+            signal.signal(signal.SIGINT, original_handler)
 
     def notify_start(self, session_data):
         start_utc = self._utc_iso()
@@ -1785,7 +1790,7 @@ class ArduinoLink:
                     continue
 
                 if self.verbose:
-                    print(f"[RECV]  {line!r}", flush=True)
+                    print(f"[RECV]  {time.time():.3f}  {line!r}", flush=True)
 
                 if line == self.ACK_STRING:
                     self.ack_evt.set()
@@ -1898,22 +1903,28 @@ class ArduinoLink:
         except Exception:
             pass
 
-    def send_and_wait(self, text, timeout_s=5.0):
+    def send_and_wait(self, text, timeout_s=5.0, retries=2):
         if not self.active:
             return True
-        
-        if self.verbose:
-            print(f"[SEND]  {text!r}", flush=True)
 
         with self.write_lock:
-            self.ack_evt.clear()
-            self.ser.write((str(text).strip() + "\n").encode('utf-8'))
-            self.ser.flush()
+            for attempt in range(1, retries + 1):
+                if self.verbose:
+                    print(f"[SEND]  {time.time():.3f}  {text!r}", flush=True)
 
-            if not self.ack_evt.wait(timeout=float(timeout_s)):
-                raise TimeoutError(f"No ACK after sending: {text!r}")
+                self.ack_evt.clear()
+                self.ser.write((str(text).strip() + "\n").encode("utf-8"))
+                self.ser.flush()
 
-        return True
+                if self.ack_evt.wait(timeout=float(timeout_s)):
+                    return True
+
+                if attempt < retries:
+                    print(f"[WARNING] No ACK after sending: {text!r}; retrying "
+                          f"({attempt}/{retries})",
+                          flush=True)
+
+        raise TimeoutError(f"No ACK after {retries} attempt(s) sending: {text!r}")
 
     def send(self, text):
         if not self.active:
@@ -3438,6 +3449,7 @@ def main(link, session_data, cursor, client=None, camera=None, interfaces=None):
     calibrated = not do_calibration
     last_outcome = None
     last_outcome_ms = None
+    pending_next_cfg = None
 
     trial_start_ms = None
     trial_dt = 0.0
@@ -3536,11 +3548,20 @@ def main(link, session_data, cursor, client=None, camera=None, interfaces=None):
 
                 if p == 'trial_stop':
                     session_data.add_evt(ts, p)
+                    saving_proxy.append_backup(session_data, trial_n)
 
                     if video_active:
                         camera.stop()
 
-                    saving_proxy.append_backup(session_data, trial_n)
+                if p in {'cue', 'trial_start'} and pending_next_cfg is not None:
+                    pnext_trial_n, pnext_easy, pnext_side = pending_next_cfg
+                    pending_next_cfg = None
+
+                    link.send_and_wait(f"{pnext_trial_n} {'1' if pnext_easy else '0'}")
+                    session_data.log_trial_config(pnext_trial_n, pnext_easy, pnext_side)
+
+                    if cursor is not None:
+                        cursor_proxy.update_trial(cursor, pnext_easy, pnext_side)
 
                 if p in {'hit', 'miss'}:
                     now_ms = _ts_to_ms(ts)
@@ -3622,12 +3643,7 @@ def main(link, session_data, cursor, client=None, camera=None, interfaces=None):
                         next_easy = _get_easy(int(phase_id), next_trial_n, K)
                         next_side = session_data.meta.get('side_override') or PHASE_CONFIG[phase_id]['side']
 
-                        time.sleep(0.05)
-                        link.send_and_wait(f'{next_trial_n} {"1" if next_easy else "0"}')
-                        session_data.log_trial_config(next_trial_n, next_easy, next_side)
-
-                        if cursor is not None:
-                            cursor_proxy.update_trial(cursor, next_easy, next_side)
+                        pending_next_cfg = (next_trial_n, next_easy, next_side)
 
                 if p in {"hit", "lick"}:
                     session_data.add_raw_evt(ts, p)
@@ -3646,14 +3662,19 @@ def main(link, session_data, cursor, client=None, camera=None, interfaces=None):
                 except Exception:
                     pass
     except KeyboardInterrupt:
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+
         session_data.meta["aborted"] = True
 
         link.stop_ephys(session_data, safe=True)
         _cleanup(link, "\nTerminated by KeyboardInterrupt")
+
         raise
     except Exception as e:
         interfaces.exceptions.cache(e, 'main')
     finally:
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+
         if session_data.meta["t_start"] is None:
             session_data.meta["t_start"] = _ts_to_ms(_get_ts())
 
@@ -3679,6 +3700,9 @@ def main(link, session_data, cursor, client=None, camera=None, interfaces=None):
 
         saving_proxy.append_backup(session_data, trial_n)
         dashboard_proxy.notify_finish()
+
+        time.sleep(6)
+        signal.signal(signal.SIGINT, signal.default_int_handler)
 
 
 if __name__ == "__main__":
