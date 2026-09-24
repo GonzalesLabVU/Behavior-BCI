@@ -1,3 +1,10 @@
+"""
+    Must download/install the following SpinView dependencies
+    from the Teledyne website (login required) to use this module:
+        - Spinnaker SDK
+        - PySpin for Python 3.12
+"""
+
 import os
 import time
 import atexit
