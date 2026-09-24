@@ -21,13 +21,22 @@ class Brake {
         void init(unsigned long engage_us, unsigned long release_us);
         void engage();
         void release();
+        void update();
 
     private:
+        enum State : uint8_t {
+            IDLE,
+            HOLDING
+        };
+
         Servo servo_;
         unsigned long engage_us_;
         unsigned long release_us_;
         unsigned long hold_ms_;
         int engaged_;
+
+        State state_;
+        unsigned long hold_start_ms_;
 };
 
 #endif
