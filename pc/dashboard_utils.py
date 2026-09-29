@@ -13,6 +13,17 @@ CREDENTIALS_PATH = Path(__file__).resolve().parent / "credentials.json"
 API_SCOPES = ["https://www.googleapis.com/auth/spreadsheets",
               "https://www.googleapis.com/auth/drive"]
 
+SESSION_LOG_SHEET_NAME = "Recent Sessions"
+SESSION_LOG_HEADERS = ["Date", "Platform", "Animal", "Phase", "Performance", "Time"]
+SESSION_LOG_PLATFORM_NAMES = {
+    "BEHAVIOR": "Behavior",
+    "IMAGING": "Imaging",
+    "DEVELOPMENT": "Development"
+    }
+
+NOTIFICATIONS_SHEET_NAME = "Notifications"
+NOTIFICATIONS_HEADERS = ["Timestamp", "Message"]
+
 DB_SHEET_NAME = "Dashboard"
 CLIENT_START_COLS = {
     "BEHAVIOR": 1,
@@ -74,6 +85,21 @@ def _utc_iso():
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
+def _format_utc(start_utc):
+    if not start_utc:
+        return ""
+
+    try:
+        when = datetime.fromisoformat(str(start_utc).replace("Z", "+00:00"))
+    except ValueError:
+        return ""
+
+    when = when.astimezone()
+    hour12 = when.strftime("%I").lstrip("0") or "12"
+
+    return f"{hour12}:{when.strftime('%M %p')}"
+
+
 def _norm_client_id(client_id):
     client_id = str(client_id or "").strip().upper()
 
@@ -125,6 +151,36 @@ def _dashboard_worksheet():
     return worksheet
 
 
+def _session_log_worksheet():
+    dashboard_id = _get_env("DASHBOARD_ID")
+    workbook = _build_client().open_by_key(dashboard_id)
+
+    try:
+        worksheet = workbook.worksheet(SESSION_LOG_SHEET_NAME)
+    except Exception:
+        worksheet = workbook.add_worksheet(title=SESSION_LOG_SHEET_NAME,
+                                           rows=200,
+                                           cols=len(SESSION_LOG_HEADERS))
+        worksheet.append_row(SESSION_LOG_HEADERS, value_input_option="USER_ENTERED")
+
+    return worksheet
+
+
+def _notifications_worksheet():
+    dashboard_id = _get_env("DASHBOARD_ID")
+    workbook = _build_client().open_by_key(dashboard_id)
+
+    try:
+        worksheet = workbook.worksheet(NOTIFICATIONS_SHEET_NAME)
+    except Exception:
+        worksheet = workbook.add_worksheet(title=NOTIFICATIONS_SHEET_NAME,
+                                           rows=200,
+                                           cols=len(NOTIFICATIONS_HEADERS))
+        worksheet.append_row(NOTIFICATIONS_HEADERS, value_input_option="USER_ENTERED")
+
+    return worksheet
+
+
 def write_fields(client_id, fields, timestamp=None):
     client_id = _norm_client_id(client_id)
     start_col = CLIENT_START_COLS[client_id]
@@ -158,3 +214,40 @@ def write_fields(client_id, fields, timestamp=None):
         "timestamp": timestamp,
         "fields": fields
         }
+
+
+def log_session(client_id, animal, phase, performance, start_utc=None, timestamp=None):
+    performance = str(performance or "").strip()
+    if not performance:
+        return None
+
+    client_id = _norm_client_id(client_id)
+    platform = SESSION_LOG_PLATFORM_NAMES.get(client_id, client_id.title())
+
+    when = timestamp or datetime.now()
+    date_str = f"{when.month}/{when.day}/{when.strftime('%y')}"
+    time_str = _format_utc(start_utc)
+
+    row = [date_str, platform, str(animal or ""), str(phase or ""), performance, time_str]
+
+    worksheet = _session_log_worksheet()
+    worksheet.insert_row(row, index=2, value_input_option="USER_ENTERED")
+
+    return {"ok": True, "client_id": client_id, "row": row}
+
+
+def log_notification(message, timestamp=None):
+    message = str(message or "").strip()
+    if not message:
+        return None
+
+    when = timestamp or datetime.now()
+    hour12 = when.strftime("%I").lstrip("0") or "12"
+    display_ts = f"{when.month}/{when.day}/{when.year}, {hour12}:{when.strftime('%M:%S %p')}"
+
+    row = [display_ts, message]
+
+    worksheet = _notifications_worksheet()
+    worksheet.insert_row(row, index=2, value_input_option="USER_ENTERED")
+
+    return {"ok": True, "row": row}

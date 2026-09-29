@@ -23,7 +23,7 @@ import serial
 import serial.tools.list_ports
 from cursor_utils import BCI, ABORT_EVT
 from camera_utils import FLIRCamera
-from dashboard_utils import write_fields
+from dashboard_utils import write_fields, log_session, log_notification
 from TCPClient import PrairieClient
 
 import gspread
@@ -631,12 +631,18 @@ class DashboardInterface(InterfaceObject):
 
     def notify_start(self, session_data):
         start_utc = self._utc_iso()
+        animal = session_data.meta.get("animal", "")
+        phase = session_data.meta.get("phase", "")
+
+        session_data.meta['start_utc'] = start_utc
 
         self._safe_write({
             "status": "running",
-            "animal": session_data.meta.get("animal", ""),
-            "phase": session_data.meta.get("phase", "")
+            "animal": animal,
+            "phase": phase
             }, timestamp=start_utc)
+        self.record_notification(f"Started training for Animal {animal}, Phase {phase} "
+                                 f"on {self.client_id.lower()} rig")
 
     def notify_finish(self):
         self._safe_write({"status": "finished"}, timestamp=self._utc_iso())
@@ -651,6 +657,30 @@ class DashboardInterface(InterfaceObject):
 
     def notify_performance(self, rate_str):
         self._safe_write({"performance": rate_str}, timestamp=self._utc_iso())
+
+    def record_session(self, animal, phase, performance, start_utc=None):
+        original_handler = signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+        try:
+            return log_session(self.client_id, animal, phase, performance, start_utc=start_utc)
+        except Exception as e:
+            print(f"[WARNING] Dashboard session log update failed: {type(e).__name__}: {e}",
+                  flush=True)
+            return None
+        finally:
+            signal.signal(signal.SIGINT, original_handler)
+
+    def record_notification(self, message):
+        original_handler = signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+        try:
+            return log_notification(message)
+        except Exception as e:
+            print(f"[WARNING] Dashboard notification log update failed: {type(e).__name__}: {e}",
+                  flush=True)
+            return None
+        finally:
+            signal.signal(signal.SIGINT, original_handler)
 
 
 class ExceptionInterface(InterfaceObject):
@@ -3605,6 +3635,7 @@ def main(link, session_data, cursor, client=None, camera=None, interfaces=None):
 
                     rate_str = console_proxy.show_trial_info(trial_dt, n_hit, n_miss, p)
                     dashboard_proxy.notify_performance(rate_str)
+                    session_data.meta['performance'] = rate_str
 
                     if do_calibration:
                         trial_stack.insert(0, p)
@@ -3789,6 +3820,12 @@ if __name__ == "__main__":
                         interfaces.saving.finish_backup(delete=True)
                 except Exception as e:
                     interfaces.exceptions.cache(e, '__main__.safe_save')
+
+        if session_data is not None:
+            interfaces.dashboard.record_session(animal_id_for_log,
+                                                phase_id_for_log,
+                                                session_data.meta.get('performance', ""),
+                                                start_utc=session_data.meta.get('start_utc'))
 
         interfaces.dashboard.notify_idle()
 
