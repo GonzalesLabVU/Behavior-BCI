@@ -506,7 +506,7 @@ class TrainerInterface(InterfaceObject):
 
     def prompt_side(self):
         """
-        Prompt for target side to use (phase 4 only)
+        Prompt for target side to use (phases 4/5 only)
         
         Returns:
             'L' or 'R' selected by the trainer
@@ -3089,7 +3089,7 @@ def setup(interfaces=None):
         if not arduino_found:
             raise RuntimeError(f'No Arduino detected (required for phase {phase_id})')
 
-        side_override = user_proxy.prompt_side() if phase_id == "4" else None
+        side_override = user_proxy.prompt_side() if phase_id in {"4", "5"} else None
 
         video_active = user_proxy.prompt_video()
 
@@ -3202,7 +3202,8 @@ def setup(interfaces=None):
 # MAIN
 # ---------------------------
 def _update_easy_rate(session_data, trial_stack):
-    """Update the adaptive easy-trial spacing from recent hit count.
+    """
+    Update the adaptive easy-trial spacing from recent hit count.
 
     Args:
         session_data: SessionData instance used to record the K change event.
@@ -3213,9 +3214,9 @@ def _update_easy_rate(session_data, trial_stack):
     """
     n_hits = sum(1 for x in trial_stack if x == "hit")
 
-    if n_hits < 10:
+    if n_hits < 9:
         K = 3
-    elif n_hits == 10:
+    elif 9 <= n_hits <= 11:
         K = 5
     else:
         K = 7
@@ -3243,86 +3244,86 @@ def _is_early_exit(evt, index, end_ms, min_duration=20*60, min_trials=150):
     """
     return False
 
-    width = 5
+    # width = 5
 
-    buf = getattr(_is_early_exit, '_buf', None)
-    if buf is None:
-        buf = deque(maxlen=11)
-        setattr(_is_early_exit, '_buf', buf)
+    # buf = getattr(_is_early_exit, '_buf', None)
+    # if buf is None:
+    #     buf = deque(maxlen=11)
+    #     setattr(_is_early_exit, '_buf', buf)
     
-    new_xy = (None, None)
+    # new_xy = (None, None)
 
-    t0_ms = None
-    elapsed_s = None
+    # t0_ms = None
+    # elapsed_s = None
 
-    try:
-        ts_list = evt.get('timestamps', []) if isinstance(evt, dict) else []
-        vals_list = evt.get('values', []) if isinstance(evt, dict) else []
+    # try:
+    #     ts_list = evt.get('timestamps', []) if isinstance(evt, dict) else []
+    #     vals_list = evt.get('values', []) if isinstance(evt, dict) else []
 
-        for ts, val in zip(ts_list, vals_list):
-            if val == "cue":
-                t0_ms = _ts_to_ms(ts)
-                break
-    except Exception:
-        t0_ms = None
+    #     for ts, val in zip(ts_list, vals_list):
+    #         if val == "cue":
+    #             t0_ms = _ts_to_ms(ts)
+    #             break
+    # except Exception:
+    #     t0_ms = None
     
-    prev_t0 = getattr(_is_early_exit, '_t0_ms', None)
-    curr_t0 = int(t0_ms) if t0_ms is not None else None
+    # prev_t0 = getattr(_is_early_exit, '_t0_ms', None)
+    # curr_t0 = int(t0_ms) if t0_ms is not None else None
 
-    if curr_t0 is not None and (prev_t0 is None or prev_t0 != curr_t0):
-        setattr(_is_early_exit, '_t0_ms', curr_t0)
+    # if curr_t0 is not None and (prev_t0 is None or prev_t0 != curr_t0):
+    #     setattr(_is_early_exit, '_t0_ms', curr_t0)
 
-        buf = deque(maxlen=11)
-        setattr(_is_early_exit, '_buf', buf)
+    #     buf = deque(maxlen=11)
+    #     setattr(_is_early_exit, '_buf', buf)
     
-    if t0_ms is not None:
-        try:
-            dt_ms = int(end_ms) - int(t0_ms)
-            if dt_ms < 0:
-                dt_ms += 24 * 3600 * 1000
+    # if t0_ms is not None:
+    #     try:
+    #         dt_ms = int(end_ms) - int(t0_ms)
+    #         if dt_ms < 0:
+    #             dt_ms += 24 * 3600 * 1000
             
-            elapsed_s = max(0.0, dt_ms / 1000.0)
+    #         elapsed_s = max(0.0, dt_ms / 1000.0)
 
-            x = max(0.0, dt_ms / 60000.0)
-            y = int(index)
+    #         x = max(0.0, dt_ms / 60000.0)
+    #         y = int(index)
 
-            new_xy = (x, y) if int(index) >= min_trials else (None, None)
-        except Exception:
-            new_xy = (None, None)
+    #         new_xy = (x, y) if int(index) >= min_trials else (None, None)
+    #     except Exception:
+    #         new_xy = (None, None)
     
-    buf.append(new_xy)
+    # buf.append(new_xy)
 
-    exit_valid = not (index < min_trials
-                      or t0_ms is None
-                      or new_xy == (None, None)
-                      or len(buf) < 11
-                      or elapsed_s < float(min_duration))
+    # exit_valid = not (index < min_trials
+    #                   or t0_ms is None
+    #                   or new_xy == (None, None)
+    #                   or len(buf) < 11
+    #                   or elapsed_s < float(min_duration))
 
-    if not exit_valid:
-        return False
+    # if not exit_valid:
+    #     return False
     
-    buf = [xy for xy in buf if None not in xy]
-    if len(buf) < 11:
-        return False
+    # buf = [xy for xy in buf if None not in xy]
+    # if len(buf) < 11:
+    #     return False
     
-    rates = []
-    prev_xy = None
+    # rates = []
+    # prev_xy = None
     
-    for curr_xy in buf[-11:]:
-        if prev_xy is None:
-            prev_xy = curr_xy
-            continue
+    # for curr_xy in buf[-11:]:
+    #     if prev_xy is None:
+    #         prev_xy = curr_xy
+    #         continue
 
-        x1, y1 = prev_xy
-        x2, y2 = curr_xy
+    #     x1, y1 = prev_xy
+    #     x2, y2 = curr_xy
 
-        dx = float(x2) - float(x1)
-        dy = float(y2) - float(y1)
+    #     dx = float(x2) - float(x1)
+    #     dy = float(y2) - float(y1)
 
-        rates.append(float('inf') if dx <= 0.0 else (dy / dx))
-        prev_xy = curr_xy
+    #     rates.append(float('inf') if dx <= 0.0 else (dy / dx))
+    #     prev_xy = curr_xy
     
-    return sum(1 for r in rates if r < 4.0) >= 5
+    # return sum(1 for r in rates if r < 4.0) >= 5
 
 
 def _cleanup(link, msg, timeout_s=30.0):
