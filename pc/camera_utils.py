@@ -42,7 +42,13 @@ def _get_ts():
 
 
 class FLIRCamera:
-    def __init__(self, output_dir, ts_fcn=None):
+    def __init__(self, output_dir, animal_id=None, phase_id=None, date_str=None, ts_fcn=None):
+        # filename prefix
+        if None in (animal_id, phase_id, date_str):
+            self._file_prefix = "Trial "
+        else:
+            self._file_prefix = f"{date_str}_animal-{animal_id}_phase-{phase_id}_trial-"
+
         # timestamp source function
         self._get_ts = ts_fcn or _get_ts
 
@@ -360,7 +366,7 @@ class FLIRCamera:
 
             self._trial_number += 1
             trial_key = f"Trial {self._trial_number}"
-            output_path = os.path.join(self._output_dir, f"Trial {self._trial_number}{VIDEO_EXTENSION}")
+            output_path = os.path.join(self._output_dir, f"{self._file_prefix}{self._trial_number}{VIDEO_EXTENSION}")
 
             self._stop_event.clear()
             self._current_output_path = output_path

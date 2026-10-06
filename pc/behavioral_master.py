@@ -3167,7 +3167,11 @@ def setup(interfaces=None):
             video_dir = VIDEO_BASE_DIR / f"{yyyy_mm_dd}" / f"Animal {animal_id} - Phase {phase_id}"
 
             try:
-                camera = FLIRCamera(output_dir=str(video_dir), ts_fcn=_get_ts)
+                camera = FLIRCamera(output_dir=str(video_dir),
+                                    animal_id=animal_id,
+                                    phase_id=phase_id,
+                                    date_str=yyyy_mm_dd,
+                                    ts_fcn=_get_ts)
                 camera.configure()
             except Exception as e:
                 print(f"\n[WARNING] Video requested, but the camera could not be initialized"
