@@ -1,6 +1,6 @@
-# Behavioral Training System — README
+# Behavioral Training Platform
 
-Software and firmware for a rodent behavioral-training rig with optional behavior-camera video,
+Software and firmware for a mouse behavioral-training rig with optional behavior-camera video,
 two-photon imaging (Bruker / Prairie View), and electrophysiology (Open Ephys). The system spans
 **three computers and one microcontroller**:
 
