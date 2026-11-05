@@ -24,6 +24,7 @@ import serial.tools.list_ports
 from cursor_utils import BCI, ABORT_EVT
 from camera_utils import FLIRCamera
 from dashboard_utils import write_fields, log_session, log_notification
+from sheets_utils import ResilientHTTPClient
 from TCPClient import PrairieClient
 
 import gspread
@@ -68,6 +69,7 @@ ANIMAL_MAP_PATH = SCRIPT_DIR / "animal_map.json"
 ERROR_LOG_PATH = SCRIPT_DIR / "errors.log"
 
 load_dotenv(SCRIPT_DIR / ".env")
+load_dotenv(SCRIPT_DIR / "rig.env")
 
 BAUDRATE = 1_000_000
 EARLY_STRING = "E"
@@ -119,6 +121,7 @@ class SystemInterface(InterfaceObject):
         self.env_path = self.script_dir / ".env"
 
         load_dotenv(self.env_path)
+        load_dotenv(self.script_dir / "rig.env")
 
     @property
     def animal_map(self):
@@ -133,6 +136,11 @@ class SystemInterface(InterfaceObject):
                 raise ValueError("animal_map.json keys and values must be strings")
 
         return data
+
+    @property
+    def workbooks(self):
+        with open(self.script_dir / "workbooks.json", 'r', encoding='utf-8') as f:
+            return json.load(f)
 
     def require(self, name):
         """Read a required environment variable.
@@ -176,6 +184,9 @@ class SystemInterface(InterfaceObject):
         
         if not self.credentials_path.exists():
             raise FileNotFoundError("credentials.json not found in the script directory")
+
+        if not (self.script_dir / "workbooks.json").exists():
+            raise FileNotFoundError("workbooks.json not found in the script directory")
 
         return True
 
@@ -226,9 +237,11 @@ class SystemInterface(InterfaceObject):
             raise ValueError(f"No cohort assigned for animal {animal_id!r}")
 
         cohort_name = animal_map[map_key]
-        workbook_id = f"{cohort_name}_ID"
 
-        return self.require(workbook_id)
+        try:
+            return self.workbooks[cohort_name]
+        except KeyError:
+            raise ValueError(f"No workbook ID for {cohort_name!r} found in workbooks.json")
 
     def _find_arduino_port(self):
         ports = serial.tools.list_ports.comports()
@@ -608,26 +621,92 @@ class TrainerInterface(InterfaceObject):
 class DashboardInterface(InterfaceObject):
     interface_name = "dashboard"
 
+    MIN_PERF_INTERVAL_S = 5.0   # raise to ~10 if running >4 platforms
+
     def __init__(self, client_id=None):
         self.client_id = str(client_id or os.getenv("CLIENT_ID")).strip().upper()
+
+        self._q = Queue()
+        self._last_write = 0.0
+
+        Thread(target=self._run, daemon=True).start()
 
     @staticmethod
     def _utc_iso():
         return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
     def _safe_write(self, fields, timestamp=None):
-        original_handler = signal.signal(signal.SIGINT, signal.SIG_IGN)
+        self._q.put(("fields", dict(fields), timestamp or self._utc_iso()))
 
+    @staticmethod
+    def _perf_only(batch):
+        return all(kind == "fields" and set(payload) == {"performance"}
+                   for kind, payload, _ in batch)
+
+    def _run(self):
+        while True:
+            batch = [self._q.get()]
+
+            while self._perf_only(batch):
+                wait = self._last_write + self.MIN_PERF_INTERVAL_S - time.monotonic()
+                if wait <= 0:
+                    break
+
+                try:
+                    batch.append(self._q.get(timeout=wait))
+                except Empty:
+                    break
+
+            while True:
+                try:
+                    batch.append(self._q.get_nowait())
+                except Empty:
+                    break
+
+            fields, stamp, jobs, flushes = {}, None, [], []
+
+            for kind, payload, ts in batch:
+                if kind == "fields":
+                    fields.update(payload)
+                    stamp = ts
+                elif kind == "flush":
+                    flushes.append(payload)
+                else:
+                    jobs.append((kind, payload))
+
+            if fields:
+                self._send("Dashboard update",
+                           write_fields,
+                           self.client_id,
+                           fields,
+                           timestamp=stamp)
+
+            for kind, args in jobs:
+                if kind == "session":
+                    cid, animal, phase, perf, start_utc = args
+                    self._send("Dashboard session log update",
+                               log_session,
+                               cid,
+                               animal,
+                               phase,
+                               perf,
+                               start_utc=start_utc)
+                else:
+                    self._send("Dashboard notification log update",
+                               log_notification,
+                               *args)
+
+            self._last_write = time.monotonic()
+
+            for ev in flushes:
+                ev.set()
+
+    @staticmethod
+    def _send(label, fcn, *args, **kwargs):
         try:
-            return write_fields(self.client_id,
-                                fields,
-                                timestamp=timestamp or self._utc_iso())
-        except Exception as exc:
-            print(f"[WARNING] Dashboard update failed: {type(exc).__name__}: {exc}",
-                  flush=True)
-            return None
-        finally:
-            signal.signal(signal.SIGINT, original_handler)
+            fcn(*args, **kwargs)
+        except Exception as e:
+            print(f"[WARNING] {label} failed: {type(e).__name__}: {e}", flush=True)
 
     def notify_start(self, session_data):
         start_utc = self._utc_iso()
@@ -659,28 +738,21 @@ class DashboardInterface(InterfaceObject):
         self._safe_write({"performance": rate_str}, timestamp=self._utc_iso())
 
     def record_session(self, animal, phase, performance, start_utc=None):
-        original_handler = signal.signal(signal.SIGINT, signal.SIG_IGN)
-
-        try:
-            return log_session(self.client_id, animal, phase, performance, start_utc=start_utc)
-        except Exception as e:
-            print(f"[WARNING] Dashboard session log update failed: {type(e).__name__}: {e}",
-                  flush=True)
-            return None
-        finally:
-            signal.signal(signal.SIGINT, original_handler)
+        self._q.put(("session",
+                     (self.client_id, animal, phase, performance, start_utc),
+                     None))
 
     def record_notification(self, message):
-        original_handler = signal.signal(signal.SIGINT, signal.SIG_IGN)
+        self._q.put(("notification", (message,), None))
+
+    def flush(self, timeout_s=90.0):
+        done = Event()
+        self._q.put(("flush", done, None))
 
         try:
-            return log_notification(message)
-        except Exception as e:
-            print(f"[WARNING] Dashboard notification log update failed: {type(e).__name__}: {e}",
-                  flush=True)
-            return None
-        finally:
-            signal.signal(signal.SIGINT, original_handler)
+            return done.wait(timeout_s)
+        except KeyboardInterrupt:
+            return False
 
 
 class ExceptionInterface(InterfaceObject):
@@ -1612,7 +1684,21 @@ class SaveInterface(InterfaceObject):
         exc_proxy = ExceptionInterface(animal, phase)
 
         try:
-            self.save_data(session_data)
+            attempts = 3
+
+            for attempt in range(1, attempts + 1):
+                try:
+                    self.save_data(session_data)
+                    break
+                except Exception as e:
+                    if attempt == attempts:
+                        raise
+
+                    exc_proxy.log(e)
+                    print(f"\n[WARNING] Sheets save attempt {attempt} failed "
+                          f"({type(e).__name__}); retrying...", flush=True)
+                    time.sleep(20 * attempt + random.uniform(0, 10))
+
             self.finish_backup(delete=True)
 
             return True
@@ -1771,8 +1857,8 @@ class BehaviorInterfaces:
 # LOGGING
 # ---------------------------
 REPO_SLUG = "GonzalesLabVU/Behavior-BCI"
-REPO_BRANCH = "main"
-REPO_REL_PATH = Path("pc") / "config" / "errors.log"
+REPO_BRANCH = "error-logs"
+REPO_REL_PATH = Path("logs") / f"errors_{os.getenv('CLIENT_ID', 'unknown').strip().lower()}.log"
 
 ERROR_LOGGED = False
 LOG_COMMIT_FAIL = False
@@ -2363,7 +2449,7 @@ def _get_easy(phase, trial_n, K):
 API_SCOPES = ["https://www.googleapis.com/auth/spreadsheets",
               "https://www.googleapis.com/auth/drive"]
 API_CREDS = Credentials.from_service_account_file(str(SCRIPT_DIR / 'credentials.json'), scopes=API_SCOPES)
-API_CLIENT = gspread.authorize(API_CREDS)
+API_CLIENT = gspread.authorize(API_CREDS, http_client=ResilientHTTPClient)
 API_DRIVE = build('drive', 'v3', credentials=API_CREDS, cache_discovery=False)
 
 
@@ -2796,6 +2882,10 @@ class FileLock:
         Returns:
             Remaining lock lease time in seconds.
         """
+        remaining = int(self.expires or 0) - _now()
+        if remaining >= self.reset_s:
+            return remaining
+
         ws = self._get_resource("worksheet")
         meta = self._get_resource("meta", ws=ws)
 
@@ -2804,7 +2894,7 @@ class FileLock:
         created_ts = meta['created']
         expires_ts = meta['expires']
 
-        self._ensure_control(owner, token, err_msg='Lock lost during update')
+        self._ensure_control(owner, token, err_msg="Lock lost during update")
 
         self.created = int(created_ts or self.created)
         self.expires = int(expires_ts or 0)
@@ -3841,4 +3931,5 @@ if __name__ == "__main__":
                     interfaces.exceptions.cache(e, '__main__.send_email')
                     ExceptionInterface(*run_info).log_and_commit(e)
 
+        interfaces.dashboard.flush()
         interfaces.console.show_exceptions()

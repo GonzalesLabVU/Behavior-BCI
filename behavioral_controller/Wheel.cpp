@@ -1,0 +1,117 @@
+#include "Wheel.h"
+#include <math.h>
+#include <ctype.h>
+
+volatile long Wheel::current_pos_ = 0;
+volatile uint8_t* Wheel::s_b_in_reg_ = nullptr;
+uint8_t Wheel::s_b_mask_ = 0;
+
+Wheel::Wheel():
+    displacement(0.0f),
+    easy_counts_(0),
+    normal_counts_(0),
+    active_counts_(0),
+    init_pos_(0),
+    threshold_reached_(false),
+    threshold_missed_(false),
+    dir_(0),
+    reverse_(false)
+{}
+
+void Wheel::init(float easy_threshold, float normal_threshold, char side, bool reverse) {
+    pinMode(A_PIN, INPUT_PULLUP);
+    pinMode(B_PIN, INPUT_PULLUP);
+
+    s_b_in_reg_ = portInputRegister(digitalPinToPort(B_PIN));
+    s_b_mask_ = digitalPinToBitMask(B_PIN);
+
+    attachInterrupt(digitalPinToInterrupt(A_PIN), Wheel::isr_, RISING);
+
+    easy_counts_ = degToCounts_(easy_threshold);
+    normal_counts_ = degToCounts_(normal_threshold);
+
+    reverse_ = reverse;
+    dir_ = sideToDir_(side);
+    if (reverse_ && dir_ != 0) dir_ = (int8_t)(-dir_);
+
+    reset(true, side);
+}
+
+void Wheel::update() {
+    long curr, init;
+
+    noInterrupts();
+    curr = current_pos_;
+    init = init_pos_;
+    interrupts();
+
+    long counts = curr - init;
+    long centi = (counts >= 0)
+                 ? ((counts * 4500L + 64L) >> 7)
+                 : -(((-counts) * 4500L + 64L) >> 7);
+
+    float disp = centi * 0.01f;
+    displacement = reverse_ ? -disp : disp;
+
+    const long th = active_counts_;
+
+    if (dir_ == 0) {
+        if (counts >= th || counts <= -th) threshold_reached_ = true;
+        return;
+    }
+
+    long counts_proj = (long)dir_ * counts;
+
+    if (counts_proj >= th) threshold_reached_ = true;
+    if (counts_proj <= -th) threshold_missed_ = true;
+}
+
+bool Wheel::thresholdReached() {
+    if (threshold_reached_) {
+        threshold_reached_ = false;
+        return true;
+    }
+    return false;
+}
+
+bool Wheel::thresholdMissed() {
+    if (dir_ == 0) return false;
+    
+    if (threshold_missed_) {
+        threshold_missed_ = false;
+        return true;
+    }
+
+    return false;
+}
+
+void Wheel::reset(bool easy, char side) {
+    dir_ = sideToDir_(side);
+    if (reverse_ && dir_ != 0) dir_ = (int8_t)(-dir_);
+
+    active_counts_ = easy ? easy_counts_ : normal_counts_;
+
+    noInterrupts();
+    init_pos_ = current_pos_;
+    interrupts();
+
+    displacement = 0.0f;
+    threshold_reached_ = false;
+    threshold_missed_ = false;
+}
+
+int8_t Wheel::sideToDir_(char side) {
+    char a = (char)tolower((unsigned char)side);
+    if (a == 'r') return +1;
+    if (a == 'l') return -1;
+    return 0;
+}
+
+long Wheel::degToCounts_(float deg) {
+    long c = lroundf(deg * (1024.0f / 360.0f));
+    return (c >= 0) ? c : -c;
+}
+
+void Wheel::isr_() {
+    current_pos_ += (*s_b_in_reg_ & s_b_mask_) ? -1 : +1;
+}
