@@ -14,8 +14,8 @@ kept if the Sheets save fails).
 
 Upload this `.md` file together with `behavioral_master.py` to give a new chat session full
 context on how the system works, even without `cursor_utils.py`, `camera_utils.py`,
-`dashboard_utils.py`, `TCPClient.py`, `TCPServer.py`, the launcher scripts, or the TTL Record
-Panel plugin sources present.
+`dashboard_utils.py`, `sheets_utils.py`, `TCPClient.py`, `TCPServer.py`, the launcher scripts, or
+the TTL Record Panel plugin sources present.
 
 ---
 
@@ -26,31 +26,56 @@ Panel plugin sources present.
 | `behavioral_master.py` | Main entry point. Orchestrates the whole session: prompts the trainer, talks to the Arduino, runs the event loop, and saves data. |
 | `cursor_utils.py` | Runs a full-screen (or windowed) `pygame` visual-feedback widget ("cursor") that mirrors wheel position on screen during wheel-based phases, in its own thread. |
 | `dashboard_utils.py` | Thin helper that writes live session status (running/idle, animal, phase) to a shared "Dashboard" Google Sheet so multiple rigs' status can be monitored centrally. |
+| `sheets_utils.py` | `ResilientHTTPClient` — the `gspread` HTTP client used by both `behavioral_master.py` and `dashboard_utils.py`. Throttles requests per process and retries 429/5xx/timeouts with exponential backoff plus jitter (see §5.1). |
 | `TCPClient.py` | Raw-socket TCP client (`PrairieClient`) that drives a Bruker/Prairie View two-photon imaging rig over the local network, used to start/stop imaging in sync with trial outcomes. |
 | `camera_utils.py` | `FLIRCamera` — records one `.mp4` per trial from a FLIR (Spinnaker/PySpin) camera on a background thread, plus a `metadata.xml` of per-trial frame timestamps (see §7). |
 | `TCPServer.py` | Runs on the **microscope PC**. Listens for `PrairieClient`'s commands and drives the Prairie View GUI via UI automation (see §8). |
 | `behavioral_controller.ino` | Arduino Mega 2560 firmware: trial state machine, hardware I/O, and the record/event TTL lines (serial protocol in §2.2, TTL encoding in §9). |
 | `TTLRecordPanel*.h/.cpp`, `OpenEphysLib.cpp` → `ttl-record-panel.dll` | Custom Open Ephys plugin ("TTL Record Panel") on the **ephys PC**: gates recording from one TTL line and decodes pulse-count event trains from another (see §9). |
-| `run.bat`, `launcher.ps1` | Setup/launch scripts for the primary training PC: build the Python venv, install dependencies, compile/upload the Arduino sketch, then run `behavioral_master` (see §10). |
+| `run.bat`, `launcher.ps1` | Setup/launch scripts for the primary training PC: pull the latest code from GitHub (`git pull --ff-only`), build the Python venv, install dependencies, compile/upload the Arduino sketch, then run `behavioral_master` (see §10). |
 
 ### Rig computers
 | Computer | Runs |
 |---|---|
-| Primary training PC (used by the trainer) | `behavioral_master.py`, `cursor_utils.py`, `camera_utils.py`, `dashboard_utils.py`, `TCPClient.py`, `run.bat`/`launcher.ps1`. Connected by USB to the Arduino Mega 2560 and by a direct Ethernet cable to the microscope PC. |
+| Primary training PC (used by the trainer) | `behavioral_master.py`, `cursor_utils.py`, `camera_utils.py`, `dashboard_utils.py`, `sheets_utils.py`, `TCPClient.py`, `run.bat`/`launcher.ps1`. Connected by USB to the Arduino Mega 2560 and by a direct Ethernet cable to the microscope PC. |
 | Microscope PC (Prairie View / Bruker two-photon) | `TCPServer.py` |
 | Ephys PC (Open Ephys GUI) | `ttl-record-panel.dll` in the signal chain, receiving the Arduino's record/event TTL lines |
 
+### Repository layout
+The project folder on every machine is the root of the GitHub repo
+`GonzalesLabVU/Behavior-BCI` (branch `main`), so the layout is flat: the `.py` files,
+`run.bat`, `launcher.ps1`, `requirements.txt`, `animal_map.json`, `workbooks.json`,
+`behavioral_controller/` (the Arduino sketch), and `open-ephys/ttl-record-panel.dll`.
+`.gitignore` is an allow-list (`/*` ignores everything, then the paths above are re-included),
+so secrets, `.venv/`, `backup/`, logs, the Spinnaker wheel, and the Open Ephys build trees can
+never be committed by accident. Runtime errors are pushed by `ExceptionInterface` to the
+separate `error-logs` branch so they never interfere with `git push`/`git pull` on `main`.
+See §12 for the update workflow.
+
 ### External files/services this system expects at runtime
-- `.env` (same directory as the script) — environment variables such as `BRAKE_ENGAGE_MS`,
-  `BRAKE_RELEASE_MS`, `SPOUT_PULSE_MS`, `CLIENT_ID`, `DASHBOARD_ID`, `SMTP_USERNAME`,
-  `SMTP_PASSWORD`, `SMTP_TO_ADDR`, `GITHUB_TOKEN`, per-cohort `<COHORT>_ID` Google Sheets
-  workbook IDs, optionally `NTP_SERVER` (defaults to `pool.ntp.org`), and optionally
-  `GOOGLE_SERVICE_ACCOUNT_JSON`.
-- `credentials.json` — Google service-account credentials for the Sheets/Drive APIs.
-- `animal_map.json` — a dict mapping underscore-joined cohort keys (e.g. `"M1_M2_M3"`) to a
-  cohort name, used to look up which workbook an animal's data belongs to.
-- `errors.log` — local append-only error log, optionally pushed to a GitHub repo
-  (`GonzalesLabVU/Behavior-BCI`, `pc/config/errors.log`) if `GITHUB_TOKEN` is set.
+- `.env` (same directory as the script; **untracked, secrets only**) — `SMTP_USERNAME`,
+  `SMTP_PASSWORD`, `SMTP_TO_ADDR`, `GITHUB_TOKEN` (a fine-grained token with Contents
+  read/write on this repo only), `UPSTASH_REDIS_REST_URL`, `UPSTASH_REDIS_REST_TOKEN`, and
+  optionally `NTP_SERVER` (defaults to `pool.ntp.org`) and `GOOGLE_SERVICE_ACCOUNT_JSON`.
+- `rig.env` (same directory; **untracked, per machine**) — everything that differs between
+  rigs: `CLIENT_ID` (`BEHAVIOR`, `IMAGING`, or `DEVELOPMENT`), `SPOUT_PULSE_MS`,
+  `BRAKE_ENGAGE_MS`, `BRAKE_RELEASE_MS`, and optionally `SHEETS_MAX_REQ_PER_MIN` (per-process
+  Sheets request budget, default 30; use roughly 90 divided by the number of rigs). It is
+  loaded with `load_dotenv` right after `.env`, so `git pull` never overwrites it.
+- `workbooks.json` (**tracked, shared by all rigs**) — maps `"DASHBOARD"` and each cohort name
+  to a Google Sheets workbook ID, e.g. `{"DASHBOARD": "<id>", "COHORT1": "<id>", ...}`. A key
+  must be exactly the cohort name used as a value in `animal_map.json`. Sheet IDs are
+  identifiers, not credentials: the workbooks are "anyone with the link can view", and only
+  the service account and named people have edit access.
+- `credentials.json` — Google service-account credentials for the Sheets/Drive APIs
+  (untracked). All rigs share the same service account, so they share one per-user Sheets API
+  quota.
+- `animal_map.json` (**tracked**) — a dict mapping underscore-joined animal keys (e.g.
+  `"M1_M2_M3"`) to a cohort name (e.g. `"COHORT6"`), which `workbooks.json` then maps to a
+  workbook ID.
+- `errors.log` — local append-only error log, optionally pushed to the `error-logs` branch of
+  the GitHub repo (`GonzalesLabVU/Behavior-BCI`) as `logs/errors_<client>.log` if
+  `GITHUB_TOKEN` is set.
 - `backup/` — per-session incremental JSON backup files (see `SaveInterface`/`BackupWriter`),
   created at setup and deleted after a successful save.
 - `raw_cap_Animal=<id>_Phase=<phase>_<MM-DD-YYYY>.json` — local raw capacitive-sensor export
@@ -73,11 +98,12 @@ can be swapped out (e.g. for testing) without changing the control flow.
 
 ### 2.1 Interface classes
 
-- **`SystemInterface`** — environment/filesystem/hardware glue: loads `.env`, reads
-  `animal_map.json`, resolves an animal's Google Sheets workbook ID, finds and opens the
-  Arduino's serial port (`_find_arduino_port` looks for "arduino" or "usb serial" in the port
-  description), and builds phase-specific config dicts (brake/spout timing, wheel threshold,
-  side, reverse flag) by merging `.env` values with the hard-coded `PHASE_CONFIG` table.
+- **`SystemInterface`** — environment/filesystem/hardware glue: loads `.env` and `rig.env`,
+  reads `animal_map.json` and `workbooks.json`, resolves an animal's Google Sheets workbook ID
+  (animal → cohort name via `animal_map.json`, cohort name → ID via `workbooks.json`), finds and
+  opens the Arduino's serial port (`_find_arduino_port` looks for "arduino" or "usb serial" in
+  the port description), and builds phase-specific config dicts (brake/spout timing from
+  `rig.env`; wheel threshold, side, and reverse flag from the hard-coded `PHASE_CONFIG` table).
 - **`ConsoleInterface`** — all trainer-facing console output: session start banner, a
   live-updating trial-status table (trial count, elapsed time, hit/miss block indicators, hit
   rate), a duration summary, and formatted display of any exceptions collected in the global
@@ -90,29 +116,37 @@ can be swapped out (e.g. for testing) without changing the control flow.
   the live success-rate string (`performance`, updated after every hit/miss) to the shared
   Dashboard sheet via `dashboard_utils.write_fields`. It also appends a "started training"
   line to the Notifications sheet (`record_notification`) at session start and a row to the
-  Recent Sessions sheet (`record_session`) at the end. Every write is failure-safe (a
-  warning, not a crash) and ignores Ctrl-C while the write is in flight. `notify_idle()`
-  (status `idle`, animal/phase cleared) is called from the `__main__` driver after the
-  session has been saved/logged.
-- **`ExceptionInterface`** — collects exceptions into the module-level `EXC_STACK` (for
-  console display), appends formatted tracebacks to the local `errors.log`, and can commit/push
-  that log to a GitHub repo using a throwaway shallow clone (via `git` subprocess calls) when
-  `GITHUB_TOKEN` is configured.
+  Recent Sessions sheet (`record_session`) at the end. Every call just puts a job on an
+  internal `Queue`; a single daemon worker thread (`_run`) performs all the Sheets I/O, so the
+  main event loop never waits on the network. The worker merges queued `fields` updates
+  (latest value wins) and holds back performance-only updates until at least
+  `MIN_PERF_INTERVAL_S` (5 s) after the previous write, while status changes go out
+  immediately. Every write is failure-safe (a printed warning, not a crash). `flush()` blocks
+  (default 90 s) until the queue is drained and is called at the very end of the `__main__`
+  driver. `notify_idle()` (status `idle`, animal/phase cleared) is called from the `__main__`
+  driver after the session has been saved/logged.
+- **`ExceptionInterface`** — collects exceptions into the module-level `EXC_STACK` (for console
+  display), appends formatted tracebacks to the local `errors.log`, and can commit/push that log
+  to the `error-logs` branch of the GitHub repo (as `logs/errors_<client>.log`, one file per
+  rig) using a throwaway shallow clone (via `git` subprocess calls) when `GITHUB_TOKEN` is
+  configured.
 - **`EmailInterface`** — sends a plain-text/HTML session-summary email (date, start/stop
   time, duration, trial count, hit rate) via Gmail SMTP once a real (non-`DEV`) session
   finishes.
-- **`SaveInterface`** — the most complex interface; writes session data into a per-animal
-  Google Sheets workbook (see §11), plus a local raw capacitive-sensor JSON export
-  (`save_raw`). During the session, `start_backup`/`append_backup` stream an incremental
-  per-trial JSON backup (`backup/`) through a background `BackupWriter` thread: each trial
-  stores only the `SessionData.diff()` slice added since the previous trial, and the file is
-  rewritten atomically via a temp file. The backup is deleted after a successful Sheets save
-  and kept if the save fails (it replaces the old full-session fallback file).
-  `resolve_protocol()` handles same-day duplicate sessions: it prompts to overwrite, or
-  auto-overwrites when the earlier session was under 5 minutes and the new one is longer.
-  Note: `_build_rows` doesn't currently write a `duration_sec` row to the Metadata sheet, so
-  the existing-duration lookup behind that auto-overwrite rule finds nothing for sessions
-  saved with the current code.
+- **`SaveInterface`** — the most complex interface; writes session data into a per-animal Google
+  Sheets workbook (see §11), plus a local raw capacitive-sensor JSON export (`save_raw`). During
+  the session, `start_backup`/`append_backup` stream an incremental per-trial JSON backup
+  (`backup/`) through a background `BackupWriter` thread: each trial stores only the
+  `SessionData.diff()` slice added since the previous trial, and the file is rewritten
+  atomically via a temp file. The backup is deleted after a successful Sheets save and kept if
+  the save fails (it replaces the old full-session fallback file). `save_session()` calls
+  `save_data()` up to 3 times (waiting about 20 s, then 40 s, plus jitter) before giving up; a
+  retry is safe because `resolve_protocol()` has already set `overwrite_confirmed`, so a
+  partially written block is simply found and overwritten. `resolve_protocol()` handles same-day
+  duplicate sessions: it prompts to overwrite, or auto-overwrites when the earlier session was
+  under 5 minutes and the new one is longer. Note: `_build_rows` doesn't currently write a
+  `duration_sec` row to the Metadata sheet, so the existing-duration lookup behind that
+  auto-overwrite rule finds nothing for sessions saved with the current code.
 - **`PrairieInterface`** — wrapper for connecting to / finishing an imaging session via
   `PrairieClient`. `connect()` instantiates the client and sends `CONFIG`; if the connection
   or `CONFIG` fails it prints a warning and the session continues without imaging
@@ -187,9 +221,12 @@ itself** (there is no external lock server):
   any) and polls again after a jittered sleep.
 - Expired lock tabs (past their `expires` timestamp) are proactively deleted by whichever
   client notices them first.
-- `update()`/`reset()` are called periodically during a long save to refresh/extend the lease
-  (`reset_s`/`lease_s` thresholds) and to detect if the lock has been lost (e.g. deleted by
-  another client after expiry) — in which case a `RuntimeError` aborts the save.
+- `update()` returns immediately, with no API calls, while at least `reset_s` seconds of lease
+  remain (this removes about 40 reads from a typical save); once less remains it re-reads the
+  lock tab to confirm ownership. `update()`/`reset()` are called periodically during a long save
+  to refresh/extend the lease (`reset_s`/`lease_s` thresholds) and to detect if the lock has
+  been lost (e.g. deleted by another client after expiry) — in which case a `RuntimeError`
+  aborts the save.
 - `release()` deletes the lock worksheet, retrying a few times with jittered backoff, and
   treats "lock already gone / not owned" as a successful release (idempotent).
 - `_get_client_id()` generates a `hostname:pid:random` owner string so concurrent runs (even
@@ -243,7 +280,7 @@ Runs once at program start, before the main event loop:
 4. For phases `"4"` and `"5"`, additionally prompts for a target side override.
 5. Prompts whether video, imaging, and/or ephys are active (plus the continuous-imaging
    start/stop minutes when imaging is on in phase `"2"`).
-6. Builds the phase config (brake/spout timings from `.env`, wheel threshold/side/reverse from
+6. Builds the phase config (brake/spout timings from `rig.env`, wheel threshold/side/reverse from
    `PHASE_CONFIG`), sends the full config + ephys handshake to the Arduino, creates the
    `SessionData` and starts its incremental backup, connects to Prairie View if imaging is
    active (continuing without imaging on failure), initializes/configures the `FLIRCamera` if
@@ -328,8 +365,10 @@ Wraps `setup()` + `main()` in a top-level try/except/finally that:
   locally and the full session to Google Sheets; if the Sheets save fails, a warning is
   printed and the local backup file is kept.
 - Records the session's final success rate to the dashboard's Recent Sessions log, marks the
-  dashboard `idle`, and — if the session actually finished (`is_finished`) and wasn't the
-  `DEV` animal — emails a session summary.
+  dashboard `idle`, and — if the session actually finished (`is_finished`) and wasn't the `DEV`
+  animal — emails a session summary. Just before the exceptions are re-displayed it calls
+  `interfaces.dashboard.flush()` so the queued dashboard writes (status, Recent Sessions row)
+  finish uploading while the email is being sent.
 - Finally re-displays any collected exceptions along with a `[Process exited with code N]`
   line. The script itself no longer waits for a keypress; `launcher.ps1` pauses on "Press
   Enter to continue" so a double-clicked window doesn't vanish immediately.
@@ -383,14 +422,20 @@ recent-session and notification logs (distinct from the per-animal data workbook
 `SaveInterface` writes to).
 
 - Lazily loads `.env` (its own private cache, separate from `behavioral_master.py`'s
-  `dotenv`-based loading) and lazily builds/caches a `gspread` client from either
-  `credentials.json` or a `GOOGLE_SERVICE_ACCOUNT_JSON` environment variable.
+  `dotenv`-based loading) only for the optional `GOOGLE_SERVICE_ACCOUNT_JSON` fallback, and
+  lazily builds/caches a `gspread` client (using `ResilientHTTPClient`) from either
+  `credentials.json` or that variable. The dashboard workbook ID is the `"DASHBOARD"` entry in
+  `workbooks.json`.
+- The workbook and each worksheet are cached in module-level dicts (`_workbook()`,
+  `_get_worksheet()`), so steady-state dashboard updates make no read requests. Any failed write
+  calls `_invalidate_cache()` so the next call re-opens everything (e.g. after a sheet is
+  renamed or deleted). All calls are made from `DashboardInterface`'s single worker thread.
 - `CLIENT_START_COLS` maps three fixed client types (`BEHAVIOR`, `IMAGING`, `DEVELOPMENT` —
   with `BEH`/`IMG`/`DEV` shorthand accepted) to fixed starting columns on a single `"Dashboard"`
   worksheet; `FIELD_ROWS` maps `status`/`animal`/`phase`/`performance` to fixed rows.
-- `write_fields(client_id, fields, timestamp=None)` — normalizes the client ID, resolves (or
-  creates, if missing) the `"Dashboard"` worksheet, and batch-updates a `[timestamp, value]`
-  pair into the two-column block for each requested field/row. This is the function
+- `write_fields(client_id, fields, timestamp=None)` — normalizes the client ID, resolves (from
+  cache, or creates if missing) the `"Dashboard"` worksheet, and batch-updates a
+  `[timestamp, value]` pair into the two-column block for each requested field/row. This is the function
   `DashboardInterface._safe_write()` calls on the `behavioral_master.py` side to report
   `running`/`finished`/`idle` status plus the current animal/phase.
 
@@ -400,6 +445,22 @@ recent-session and notification logs (distinct from the per-animal data workbook
 - `log_notification(message)` — inserts a `[timestamp, message]` row at the top of a
   `"Notifications"` worksheet (also auto-created). `DashboardInterface.notify_start()` uses it
   to announce each session start.
+
+### 5.1 `sheets_utils.py` — Rate-limit-safe Sheets client
+
+`ResilientHTTPClient` subclasses `gspread`'s `HTTPClient` and is passed as `http_client=` to
+`gspread.authorize()` in both `behavioral_master.py` (`API_CLIENT`) and `dashboard_utils.py`.
+- **Throttle.** `_throttle()` keeps a sliding 60-second window of request timestamps for the
+  process and sleeps (with jitter) when it already holds `SHEETS_MAX_REQ_PER_MIN` (from
+  `rig.env`, default 30) requests. Google's Sheets quotas are per user per minute, and every
+  rig authenticates as the same service account, so size this as roughly 90 divided by the
+  number of rigs.
+- **Retry.** Up to 7 attempts; HTTP 408, 429, and >=500 responses and connection
+  errors/timeouts are retried after 2, 4, 8, ... up to 60 s plus jitter. Other errors (e.g.
+  404) are raised immediately.
+- Dashboard writes are made on a background thread (see `DashboardInterface`), so backoff
+  waits never stall the trial loop. Save-time calls (`SaveInterface`, `FileLock`) run on the
+  main thread after the session has ended.
 
 ---
 
@@ -563,6 +624,13 @@ Uno: 10/11).
 
 `run.bat` unblocks and runs `launcher.ps1` (PowerShell 5.1+) from its own folder; this is the
 normal way to start a session on the primary training PC. Each run:
+0. If the folder is a git checkout and `git` is on `PATH`, runs `git pull --ff-only` (via
+   `Update-FromGit`) so the Python code, `animal_map.json`, `workbooks.json`,
+   `requirements.txt`, and the Arduino sketch are current before anything else happens. A
+   missing `git`, no network, or a failed pull only prints a warning and the launch continues
+   with the local files. (Avoid editing `run.bat` after rollout: a batch file that is replaced
+   while it is running can misbehave. `launcher.ps1` is safe because PowerShell parses the whole
+   script first.)
 1. Ensures a Python 3.12 virtual environment (`.venv`), installing Python via `winget` if the
    `py` launcher doesn't have it, then upgrades pip and installs `requirements.txt`.
 2. Installs the PySpin wheel (`spinnaker_python-*.whl`, `cp312`/`win_amd64`) if PySpin isn't
@@ -573,8 +641,8 @@ normal way to start a session on the primary training PC. Each run:
    (auto-installing a missing library header such as `Servo.h` and retrying), and uploads it,
    so the firmware is re-flashed on every launch.
 5. Runs `python -m behavioral_master` from the project folder (which is why
-   `SCRIPT_DIR = Path.cwd()` finds `.env`, `credentials.json`, `animal_map.json`, and
-   `backup/`), then waits for Enter before closing.
+   `SCRIPT_DIR = Path.cwd()` finds `.env`, `rig.env`, `credentials.json`, `animal_map.json`,
+   `workbooks.json`, and `backup/`), then waits for Enter before closing.
 
 ---
 
@@ -604,3 +672,41 @@ normal way to start a session on the primary training PC. Each run:
   succeeds — a delayed `PrairieClient` start/stop failure is only recorded via
   `_set_pending_error` and, since `raise_pending_error()` is never polled, will not surface
   as a visible error during the session.
+- **Google Sheets rate limits.** The Sheets API allows roughly 60 reads and 60 writes per minute
+  per user, and all rigs share one service account. Three things keep the system under that:
+  cached dashboard worksheets plus coalesced, throttled dashboard writes; `FileLock.update()`
+  skipping the network while the lease is healthy; and `ResilientHTTPClient` throttling and
+  retrying every request. If saves still fail repeatedly, the local `backup/` file is kept,
+  exactly as before.
+- Session timestamps are stamped in `ArduinoLink`'s reader thread (not the main loop), so a
+  slow main loop would not corrupt timestamps, but it would delay imaging scheduling and
+  cursor updates. This is why all dashboard I/O is kept off the main loop.
+
+---
+
+## 12. Repository, Deployment, and Updating Rigs
+
+- **One repo, flat layout.** Each machine's project folder is a clone of
+  `https://github.com/GonzalesLabVU/Behavior-BCI` (branch `main`). Tracked: code,
+  `animal_map.json`, `workbooks.json`, `requirements.txt`, `run.bat`, `launcher.ps1`,
+  `behavioral_controller/`, `open-ephys/ttl-record-panel.dll`. Untracked (copy by hand once per
+  machine): `.env`, `rig.env`, `credentials.json`, and `spinnaker_python-*.whl`.
+- **Developer workflow** (from the project folder):
+  `git add -A`, `git commit -m "..."`, `git push`.
+- **Rigs** pick up changes by relaunching (`launcher.ps1` runs `git pull --ff-only`) or by
+  running `git pull --ff-only` manually. Firmware is re-flashed on every launch, so Arduino
+  changes arrive the same way.
+- **Adding a cohort:** add its animals to `animal_map.json` (`"X1_X2_X3": "COHORT9"`) and its
+  workbook ID to `workbooks.json` (`"COHORT9": "<id>"`) in one commit; no per-rig edits are
+  needed. Share the new workbook with the service account (Editor) and set general access to
+  "Anyone with the link: Viewer" (never Editor).
+- **Per-rig tuning:** edit that rig's `rig.env` only.
+- **Setting up a new rig:** clone the repo (or run `git init -b main`,
+  `git remote add origin <url>`, `git fetch origin`, `git checkout -f -B main origin/main` in an
+  existing folder), then create `.env`, `rig.env`, and `credentials.json`, and copy in the
+  Spinnaker wheel if the rig records video.
+- **Error logs** go to the `error-logs` branch (`logs/errors_<client>.log`), never to `main`.
+  The `GITHUB_TOKEN` in `.env` only needs Contents read/write on this repo.
+- If `git pull` warns about local changes that were never intended (usually CRLF/LF line-ending
+  noise), run `git status` on that rig; for pure line-ending changes, `git checkout -- .`
+  restores the committed versions.

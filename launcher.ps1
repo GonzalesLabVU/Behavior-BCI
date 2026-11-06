@@ -29,7 +29,36 @@ function Exit-Fatal {
     throw $Message
 }
 
-function Check-Python310Available {
+function Update-FromGit {
+    if (-not (Test-Path (Join-Path $script:SCRIPT_DIR ".git"))) {
+        Write-Host "`tNot a git checkout (skipping update)"
+        return
+    }
+
+    if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
+        Write-Host "[WARNING] git not found on PATH (skipping update)"
+        return
+    }
+
+    $env:GIT_TERMINAL_PROMPT = "0"
+
+    try {
+        $output = & git -C $script:SCRIPT_DIR pull --ff-only 2>&1 | ForEach-Object { "$_" }
+
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host "`t$($output | Select-Object -Last 1)"
+        }
+        else {
+            Write-Host "[WARNING] git pull failed (continuing with current local files):"
+            $output | ForEach-Object { Write-Host "`t$_" }
+        }
+    }
+    catch {
+        Write-Host "[WARNING] git pull failed: $($_.Exception.Message) (continuing with current local files)"
+    }
+}
+
+function Confirm-Python310Available {
     if (-not (Get-Command py -ErrorAction SilentlyContinue)) {
         return $false
     }
@@ -63,7 +92,7 @@ function Initialize-PythonVenv {
         return $true
     }
 
-    if (-not (Check-Python310Available)) {
+    if (-not (Confirm-Python310Available)) {
         Write-Host "Python $($script:PYTHON_VERSION) not found; attempting to install..."
 
         if (Get-Command winget -ErrorAction SilentlyContinue) {
@@ -72,7 +101,7 @@ function Initialize-PythonVenv {
                 --accept-source-agreements *> $null
         }
 
-        if (-not (Check-Python310Available)) {
+        if (-not (Confirm-Python310Available)) {
             Write-Host "[ERROR] Python $($script:PYTHON_VERSION) still isn't available via the 'py' launcher"
             return $false
         }
@@ -95,7 +124,7 @@ function Initialize-PythonVenv {
     return $true
 }
 
-function Check-PySpinAvailable {
+function Confirm-PySpinAvailable {
     & $script:VENV_PYTHON -c "import PySpin" *> $null
     return ($LASTEXITCODE -eq 0)
 }
@@ -105,7 +134,7 @@ function Get-ExpectedPySpinTag {
 }
 
 function Install-PySpinWheel {
-    if (Check-PySpinAvailable) {
+    if (Confirm-PySpinAvailable) {
         return $true
     }
 
@@ -137,7 +166,7 @@ function Install-PySpinWheel {
         return $false
     }
 
-    if (-not (Check-PySpinAvailable)) {
+    if (-not (Confirm-PySpinAvailable)) {
         Write-Host "[WARNING] Installed $($matchingWheel.Name), but PySpin still isn't importable"
         return $false
     }
@@ -541,6 +570,9 @@ try {
     Write-Host "`nResolving script directory..."
     $script:SCRIPT_DIR = $PSScriptRoot
     Set-Location $script:SCRIPT_DIR
+
+    Write-Host "Checking for updates..."
+    Update-FromGit
 
     Write-Host "Validating virtual environment..."
     $script:VENV_DIR = Join-Path $script:SCRIPT_DIR ".venv"
