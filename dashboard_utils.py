@@ -256,7 +256,7 @@ def log_session(client_id, animal, phase, performance, start_utc=None, timestamp
     row = [date_str, platform, str(animal or ""), str(phase or ""), performance, time_str]
 
     try:
-        _session_log_worksheet().insert_row(row, index=2, value_input_options="USER_ENTERED")
+        _session_log_worksheet().insert_row(row, index=2, value_input_option="USER_ENTERED")
     except Exception:
         _invalidate_cache()
         raise
