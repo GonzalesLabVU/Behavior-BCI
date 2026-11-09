@@ -71,6 +71,8 @@ ERROR_LOG_PATH = SCRIPT_DIR / "errors.log"
 load_dotenv(SCRIPT_DIR / ".env")
 load_dotenv(SCRIPT_DIR / "rig.env")
 
+OFFLINE_MODE = os.getenv("BCI_OFFLINE", "0").strip() == "1"
+
 BAUDRATE = 1_000_000
 EARLY_STRING = "E"
 
@@ -612,10 +614,16 @@ class TrainerInterface(InterfaceObject):
         Returns:
             True when the trainer accepts saving, otherwise False.
         """
-        save_choice = input('\nSave current session? [Y/n]:  ').strip().lower()
+        save_choice = input('\nSave session data to Google Sheets? [Y/n]:  ').strip().lower()
         _cmd_run('echo.')
 
         return save_choice in {"", "y", "yes"}
+
+    def confirm_local_save(self):
+        local_choice = input('Save session data locally instead? [y/N]:  ')
+        _cmd_run('echo.')
+
+        return _is_affirmative(local_choice)
 
 
 class DashboardInterface(InterfaceObject):
@@ -624,18 +632,23 @@ class DashboardInterface(InterfaceObject):
     MIN_PERF_INTERVAL_S = 5.0   # raise to ~10 if running >4 platforms
 
     def __init__(self, client_id=None):
+        self.enabled = not OFFLINE_MODE
         self.client_id = str(client_id or os.getenv("CLIENT_ID")).strip().upper()
 
         self._q = Queue()
         self._last_write = 0.0
 
-        Thread(target=self._run, daemon=True).start()
+        if self.enabled:
+            Thread(target=self._run, daemon=True).start()
 
     @staticmethod
     def _utc_iso():
         return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
     def _safe_write(self, fields, timestamp=None):
+        if not self.enabled:
+            return
+
         self._q.put(("fields", dict(fields), timestamp or self._utc_iso()))
 
     @staticmethod
@@ -738,14 +751,23 @@ class DashboardInterface(InterfaceObject):
         self._safe_write({"performance": rate_str}, timestamp=self._utc_iso())
 
     def record_session(self, animal, phase, performance, start_utc=None):
+        if not self.enabled:
+            return
+
         self._q.put(("session",
                      (self.client_id, animal, phase, performance, start_utc),
                      None))
 
     def record_notification(self, message):
+        if not self.enabled:
+            return
+
         self._q.put(("notification", (message,), None))
 
     def flush(self, timeout_s=90.0):
+        if not self.enabled:
+            return
+
         done = Event()
         self._q.put(("flush", done, None))
 
@@ -852,6 +874,9 @@ class ExceptionInterface(InterfaceObject):
         Returns:
             True when a commit and push occurred, otherwise False.
         """
+        if OFFLINE_MODE:
+            return False
+
         global ERROR_LOGGED
         global LOG_COMMIT_FAIL
 
@@ -1349,7 +1374,7 @@ class SaveInterface(InterfaceObject):
                 session_data.overwrite_confirmed = True
                 return True
 
-            wb = API_CLIENT.open_by_key(workbook_id)
+            wb = _sheets_client().open_by_key(workbook_id)
             existing = _find_existing_block(wb)
             if existing is None:
                 session_data.overwrite_confirmed = True
@@ -1371,7 +1396,7 @@ class SaveInterface(InterfaceObject):
                 session_data.overwrite_confirmed = True
                 return True
 
-            exit_raw = input("Exit this session without saving? [y/N]:  ")
+            exit_raw = input("Skip Google Sheets save and keep the local backup? [y/N]:  ")
             if _is_affirmative(exit_raw):
                 session_data.overwrite_confirmed = False
                 return False
@@ -1502,7 +1527,7 @@ class SaveInterface(InterfaceObject):
         try:
             lock = FileLock(workbook_id, owner=client_id).acquire()
 
-            wb = API_CLIENT.open_by_key(workbook_id)
+            wb = _sheets_client().open_by_key(workbook_id)
             lock.wb = wb
 
             sheet_map = (
@@ -1666,6 +1691,30 @@ class SaveInterface(InterfaceObject):
         print(f'Saved raw data locally to {out_path.name}', flush=True)
         return out_path
 
+    def save_local(self, session_data):
+        """Save a complete session JSON and retain the incremental backup"""
+        if session_data is None:
+            raise ValueError("No session data to save")
+
+        self.finish_backup(delete=False)
+
+        backup_path = Path(session_data.meta['_backup_path'])
+        out_path = backup_path.with_name(f"{backup_path.stem}_complete.json")
+        tmp_path = out_path.with_suffix(".json.tmp")
+
+        try:
+            with open(tmp_path, 'w', encoding='utf-8') as f:
+                json.dump(session_data.to_dict(), f, indent=4)
+                f.flush()
+                os.fsync(f.fileno())
+
+            os.replace(tmp_path, out_path)
+        except Exception:
+            tmp_path.unlink(missing_ok=True)
+            raise
+
+        return out_path
+
     def save_session(self, session_data):
         """
         Save session data to Google Sheets. The local backup file (started
@@ -1703,7 +1752,12 @@ class SaveInterface(InterfaceObject):
 
             return True
         except Exception as e:
-            self.finish_backup(delete=False)
+            try:
+                self.save_local(session_data)
+            except Exception as local_error:
+                self.finish_backup(delete=False)
+                exc_proxy.log(local_error)
+
             exc_proxy.log(e)
 
             return False
@@ -2448,9 +2502,23 @@ def _get_easy(phase, trial_n, K):
 # ---------------------------
 API_SCOPES = ["https://www.googleapis.com/auth/spreadsheets",
               "https://www.googleapis.com/auth/drive"]
-API_CREDS = Credentials.from_service_account_file(str(SCRIPT_DIR / 'credentials.json'), scopes=API_SCOPES)
-API_CLIENT = gspread.authorize(API_CREDS, http_client=ResilientHTTPClient)
-API_DRIVE = build('drive', 'v3', credentials=API_CREDS, cache_discovery=False)
+API_CLIENT = None
+
+
+def _sheets_client():
+    global API_CLIENT
+
+    if OFFLINE_MODE:
+        raise RuntimeError("Google Sheets is disabled in offline mode")
+
+    if API_CLIENT is None:
+        creds = Credentials.from_service_account_file(
+            str(SCRIPT_DIR / "credentials.json"),
+            scopes=API_SCOPES
+            )
+        API_CLIENT = gspread.authorize(creds, http_client=ResilientHTTPClient)
+
+    return API_CLIENT
 
 
 class BackupWriter:
@@ -2531,7 +2599,7 @@ class FileLock:
         self.reset_s = int(self.RESET_S)
         self.timeout_s = int(self.TIMEOUT_S)
 
-        self.client = API_CLIENT
+        self.client = _sheets_client()
         self.workbook_id = workbook_id
         self.owner = owner
         self.token = uuid.uuid4().hex
@@ -3171,8 +3239,11 @@ def setup(interfaces=None):
     """
     interfaces = interfaces or BehaviorInterfaces()
 
-    _sync_ntp_offset()
-    Thread(target=_ntp_resync_loop, daemon=True).start()
+    if not OFFLINE_MODE:
+        _sync_ntp_offset()
+        Thread(target=_ntp_resync_loop, daemon=True).start()
+    else:
+        print("[INFO] Offline mode: using local system clock", flush=True)
 
     system_proxy = interfaces.system
     user_proxy = interfaces.user
@@ -3199,7 +3270,10 @@ def setup(interfaces=None):
             link.send_flush(flush_active)
 
         animal_id, animal_map = user_proxy.prompt_animal()
-        workbook_id = system_proxy.get_workbook_id(animal_id, animal_map)
+        workbook_id = (
+            None if OFFLINE_MODE
+            else system_proxy.get_workbook_id(animal_id, animal_map)
+            )
 
         if animal_id == "DEV":
             link.verbose = True
@@ -3824,7 +3898,7 @@ def main(link, session_data, cursor, client=None, camera=None, interfaces=None):
         elif session_data.img_can_stop():
             _send_img_stop("stop()", real_fn=client.stop if client is not None else None)
 
-        saving_proxy.append_backup(session_data, trial_n)
+        saving_proxy.append_backup(session_data, trial_n="final")
         dashboard_proxy.notify_finish()
 
         time.sleep(6)
@@ -3896,11 +3970,17 @@ if __name__ == "__main__":
         if session_data is not None and session_data.meta.get('_backup_path'):
             is_dev = session_data.meta.get('animal', None) in {None, "DEV"}
 
-            if is_dev or not session_data.any_data():
+            if not session_data.any_data():
                 interfaces.saving.finish_backup(delete=True)
             else:
                 try:
-                    if interfaces.user.confirm_save():
+                    if OFFLINE_MODE:
+                        interfaces.saving.save_raw(session_data)
+                        out_path = interfaces.saving.save_local(session_data)
+                        print(f"Offline session saved to {out_path}", flush=True)
+                    elif is_dev:
+                        interfaces.saving.finish_backup(delete=True)
+                    elif interfaces.user.confirm_save():
                         if interfaces.saving.resolve_protocol(session_data):
                             interfaces.saving.save_raw(session_data)
 
@@ -3908,12 +3988,19 @@ if __name__ == "__main__":
                             if not ok:
                                 interfaces.console.warning("Google Sheets save failed (saving locally instead)")
                         else:
-                            print("Session exited without saving", flush=True)
-                            interfaces.saving.finish_backup(delete=True)
+                            out_path = interfaces.saving.save_local(session_data)
+                            print(f"Google Sheets save skipped; saved locally to {out_path}", flush=True)
                     else:
-                        interfaces.saving.finish_backup(delete=True)
+                        if interfaces.user.confirm_local_save():
+                            interfaces.saving.save_raw(session_data)
+                            out_path = interfaces.saving.save_local(session_data)
+                            print(f"Session data saved locally to {out_path}", flush=True)
+                        else:
+                            interfaces.saving.finish_backup(delete=True)
+                            print("Session exited without saving", flush=True)
                 except Exception as e:
                     interfaces.exceptions.cache(e, '__main__.safe_save')
+                    interfaces.saving.finish_backup(delete=False)
 
         if session_data is not None:
             interfaces.dashboard.record_session(animal_id_for_log,
@@ -3923,7 +4010,7 @@ if __name__ == "__main__":
 
         interfaces.dashboard.notify_idle()
 
-        if session_data is not None and session_data.is_finished:
+        if not OFFLINE_MODE and session_data is not None and session_data.is_finished:
             if session_data.meta.get('animal', None) not in {None, "DEV"}:
                 try:
                     interfaces.email.send_session_summary(session_data)

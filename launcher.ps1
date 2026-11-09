@@ -10,6 +10,7 @@
 # CONFIGURATION
 # ======================================================================
 $script:PYTHON_VERSION = "3.12"
+$script:OFFLINE_MODE = ($env:BCI_OFFLINE -eq "1")
 $script:ARDUINO_CLI = "arduino-cli"
 $script:CANDIDATE_BOARDS = @(
     [PSCustomObject]@{ Fqbn = "arduino:avr:mega"; Profile = "mega2560" },
@@ -160,7 +161,11 @@ function Install-PySpinWheel {
 
     Write-Host "`tFound matching PySpin wheel: $($matchingWheel.Name)"
     Write-Host "Installing PySpin..."
-    & $script:VENV_PYTHON -m pip install $matchingWheel.FullName -q --disable-pip-version-check
+    $pipOptions = @()
+    if ($script:OFFLINE_MODE) {
+        $pipOptions = @("--no-index")
+    }
+    & $script:VENV_PYTHON -m pip install $matchingWheel.FullName @pipOptions -q --disable-pip-version-check
     if ($LASTEXITCODE -ne 0) {
         Write-Host "[WARNING] Failed to install $($matchingWheel.Name)"
         return $false
@@ -225,6 +230,11 @@ function Show-LibraryDiagnostics {
 function Resolve-MissingLibrary {
     param([string]$HeaderName)
 
+    if ($script:OFFLINE_MODE) {
+        Write-Host "[ERROR] Missing Arduino header '$HeaderName'; install its library while online"
+        return $false
+    }
+
     if ($script:CORE_HEADERS -contains $HeaderName) {
         Write-Host "[WARNING] '$HeaderName' should ship with the arduino:avr core - reinstalling won't help"
         return $false
@@ -260,6 +270,11 @@ function Initialize-ArduinoCli {
     Write-Host "Verifying arduino-cli installation..."
 
     if (-not (Get-Command arduino-cli -ErrorAction SilentlyContinue)) {
+        if ($script:OFFLINE_MODE) {
+            Write-Host "[ERROR] Arduino CLI is not installed or is not on PATH"
+            return $false
+        }
+
         Write-Host "arduino-cli not found, attempting to install..."
 
         if (Get-Command winget -ErrorAction SilentlyContinue) {
@@ -292,6 +307,11 @@ function Initialize-ArduinoCli {
     $coreList = arduino-cli core list 2>$null
 
     if (-not ($coreList | Select-String -Pattern "^arduino:avr\s" -q)) {
+        if ($script:OFFLINE_MODE) {
+            Write-Host "[ERROR] Arduino AVR core is not installed locally"
+            return $false
+        }
+
         Write-Host "Arduino AVR core not found; updating index and installing..."
 
         arduino-cli core update-index *> $null
@@ -350,7 +370,6 @@ function Initialize-ArduinoCli {
     $requiredLibraries = $requiredLibraries | Sort-Object -Unique
 
     if ($requiredLibraries.Count -gt 0) {
-
         $installedLibraryOutput = arduino-cli lib list --format json 2>$null
 
         if ($LASTEXITCODE -ne 0 -or -not $installedLibraryOutput) {
@@ -397,6 +416,11 @@ function Initialize-ArduinoCli {
         }
 
         if ($missingLibraries.Count -gt 0) {
+            if ($script:OFFLINE_MODE) {
+                Write-Host "[ERROR] Requires Arduino libraries are not installed locally"
+                $missingLibraries | ForEach-Object { WRite-Host "  $_" }
+                return $false
+            }
 
             Write-Host "Required Arduino libraries missing or incorrect version:"
             foreach ($library in $missingLibraries) {
@@ -571,22 +595,32 @@ try {
     $script:SCRIPT_DIR = $PSScriptRoot
     Set-Location $script:SCRIPT_DIR
 
-    Write-Host "Checking for updates..."
-    Update-FromGit
+    if (-not $script:OFFLINE_MODE) {
+        Write-Host "Checking for updates..."
+        Update-FromGit
+    } else {
+        Write-Host "Offline mode: skipping Git updates"
+    }
 
     Write-Host "Validating virtual environment..."
     $script:VENV_DIR = Join-Path $script:SCRIPT_DIR ".venv"
     $script:VENV_PYTHON = Join-Path $script:VENV_DIR "Scripts\python.exe"
 
+    if ($script:OFFLINE_MODE -and -not (Test-VenvPythonVersion)) {
+        Exit-Fatal "Offline mode requires an existing Python $($script:PYTHON_VERSION) virtual environment"
+    }
+
     if (-not (Initialize-PythonVenv)) {
         Exit-Fatal "Python $($script:PYTHON_VERSION) virtual environment setup failed"
     }
 
-    Write-Host "Making sure pip is up to date..."
-    & $script:VENV_PYTHON -m pip install --upgrade pip -q --disable-pip-version-check
+    if (-not $script:OFFLINE_MODE) {
+        Write-Host "Making sure pip is up to date..."
+        & $script:VENV_PYTHON -m pip install --upgrade pip -q --disable-pip-version-check
 
-    if ($LASTEXITCODE -ne 0) {
-        Exit-Fatal "pip upgrade failed"
+        if ($LASTEXITCODE -ne 0) {
+            Exit-Fatal "pip upgrade failed"
+        }
     }
 
     Write-Host "Installing required packages..."
@@ -596,40 +630,55 @@ try {
         Exit-Fatal "requirements.txt missing"
     }
 
-    $requirementsLines = Get-Content $requirementsPath |
-        ForEach-Object { $_.Trim() } |
-        Where-Object { $_ -and -not $_.StartsWith("#") }
+    if ($script:OFFLINE_MODE) {
+        Write-Host "Verifying locally installed Python packages..."
+        & $script:VENV_PYTHON -m pip install --no-index --no-deps -r $requirementsPath -q --disable-pip-version-check
 
-    $displayByName = @{}
-    foreach ($requirement in $requirementsLines) {
-        if ($requirement -match '^([A-Za-z0-9_.\-]+)\s*==\s*(.+)$') {
-            $packageName = $matches[1]
-            $packageVersion = $matches[2]
-            $displayByName[$packageName.ToLowerInvariant()] = "$packageName ($packageVersion)"
+        if ($LASTEXITCODE -ne 0) {
+            Exit-Fatal "Required Python packages are missing or have incorrect versions"
         }
-        elseif ($requirement -match '^([A-Za-z0-9_.\-]+)') {
-            $displayByName[$matches[1].ToLowerInvariant()] = $requirement
+
+        & $script:VENV_PYTHON -m pip check
+        if ($LASTEXITCODE -ne 0) {
+            Exit-Fatal "Python dependency conflicts or missing dependencies detected"
         }
     }
+    else {
+        $requirementsLines = Get-Content $requirementsPath |
+            ForEach-Object { $_.Trim() } |
+            Where-Object { $_ -and -not $_.StartsWith("#") }
 
-    & $script:VENV_PYTHON -m pip install -r $requirementsPath --disable-pip-version-check 2>&1 |
-        ForEach-Object {
-            if ($_ -match '^(?:Collecting|Requirement already satisfied:)\s+([A-Za-z0-9_.\-]+)') {
-                $pkgKey = $matches[1].ToLowerInvariant()
-                if ($displayByName.ContainsKey($pkgKey)) {
-                    Write-Host "`t$($displayByName[$pkgKey])"
-                }
+        $displayByName = @{}
+        foreach ($requirement in $requirementsLines) {
+            if ($requirement -match '^([A-Za-z0-9_.\-]+)\s*==\s*(.+)$') {
+                $packageName = $matches[1]
+                $packageVersion = $matches[2]
+                $displayByName[$packageName.ToLowerInvariant()] = "$packageName ($packageVersion)"
+            }
+            elseif ($requirement -match '^([A-Za-z0-9_.\-]+)') {
+                $displayByName[$matches[1].ToLowerInvariant()] = $requirement
             }
         }
 
-    if ($LASTEXITCODE -ne 0) {
-        Write-Host "[WARNING] Batched install failed; retrying package-by-package to isolate the failure..."
+        & $script:VENV_PYTHON -m pip install -r $requirementsPath --disable-pip-version-check 2>&1 |
+            ForEach-Object {
+                if ($_ -match '^(?:Collecting|Requirement already satisfied:)\s+([A-Za-z0-9_.\-]+)') {
+                    $pkgKey = $matches[1].ToLowerInvariant()
+                    if ($displayByName.ContainsKey($pkgKey)) {
+                        Write-Host "`t$($displayByName[$pkgKey])"
+                    }
+                }
+            }
 
-        foreach ($requirement in $requirementsLines) {
-            & $script:VENV_PYTHON -m pip install $requirement -q --disable-pip-version-check
-            if ($LASTEXITCODE -ne 0) {
-                Write-Host "[ERROR] Failed to install '$requirement'"
-                Exit-Fatal "pip install failed"
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "[WARNING] Batched install failed; retrying package-by-package to isolate the failure..."
+
+            foreach ($requirement in $requirementsLines) {
+                & $script:VENV_PYTHON -m pip install $requirement -q --disable-pip-version-check
+                if ($LASTEXITCODE -ne 0) {
+                    Write-Host "[ERROR] Failed to install '$requirement'"
+                    Exit-Fatal "pip install failed"
+                }
             }
         }
     }
@@ -639,21 +688,27 @@ try {
         Write-Host "[WARNING] PySpin isn't importable in this venv"
     }
 
-    if (-not (Initialize-ArduinoCli)) {
+    if ($script:OFFLINE_MODE) {
+        Write-Host "Offline mode: using existing Arduino firmware"
+    }
+    else {
+        if (-not (Initialize-ArduinoCli)) {
             Exit-Fatal "arduino-cli installation failed or not found on PATH"
         }
 
-    Write-Host "Searching for Arduino Mega/Uno..."
-    $script:BOARD = Find-ArduinoBoard
-    if (-not $script:BOARD) {
-        Write-Host "[ERROR] No supported Arduino board detected"
-        Exit-Fatal "Arduino not detected"
-    }
-    $script:PORT = $script:BOARD.Port
-    Write-Host "`tFound $($script:BOARD.Fqbn) on $($script:PORT) - using profile '$($script:BOARD.Profile)'"
+        Write-Host "Searching for Arduino Mega/Uno..."
+        $script:BOARD = Find-ArduinoBoard
+        if (-not $script:BOARD) {
+            Write-Host "[ERROR] No supported Arduino board detected"
+            Exit-Fatal "Arduino not detected"
+        }
 
-    if (-not (Write-Sketch -SketchFolderName "behavioral_controller" -ProfileName $script:BOARD.Profile)) {
-        Exit-Fatal "Arduino compile/upload failed"
+        $script:PORT = $script:BOARD.Port
+        Write-Host "`tFound $($script:BOARD.Fqbn) on $($script:PORT) - using profile '$($script:BOARD.Profile)'"
+
+        if (-not (Write-Sketch -SketchFolderName "behavioral_controller" -ProfileName $script:BOARD.Profile)) {
+            Exit-Fatal "Arduino compile/upload failed"
+        }
     }
 
     Write-Host "Running Python script..."

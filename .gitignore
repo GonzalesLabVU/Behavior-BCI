@@ -6,6 +6,7 @@
 !/README.md
 !/requirements.txt
 !/run.bat
+!/run_offline.bat
 !/launcher.ps1
 !/*.py
 !/animal_map.json
