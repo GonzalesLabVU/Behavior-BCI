@@ -592,8 +592,30 @@ $script:ExitCode = 0
 try {
     Clear-Host
     Write-Host "`nResolving script directory..."
+
     $script:SCRIPT_DIR = $PSScriptRoot
     Set-Location $script:SCRIPT_DIR
+
+    if (-not $script:OFFLINE_MODE) {
+        try {
+            $profiles = @(Get-NetConnectionProfile -ErrorAction Stop)
+            $internetProfiles = @($profiles | Where-Object {
+                $_.IPv4Connectivity -eq "Internet" -or
+                $_.IPv6Connectivity -eq "Internet"
+            })
+
+            $script:OFFLINE_MODE = ($internetProfiles.Count -eq 0)
+        }
+        catch {
+            $script:OFFLINE_MODE = $true
+        }
+    }
+
+    $env:BCI_OFFLINE = if ($script:OFFLINE_MODE) { "1" } else { "0" }
+
+    if ($script:OFFLINE_MODE) {
+        Write-Host "[WARNING] Offline mode: no internet connection; cloud features disabled"
+    }
 
     if (-not $script:OFFLINE_MODE) {
         Write-Host "Checking for updates..."
@@ -714,6 +736,11 @@ try {
     Write-Host "Running Python script..."
     Start-Sleep -Milliseconds 500
     Clear-Host
+
+    if ($script:OFFLINE_MODE) {
+        Write-Host "[WARNING] Offline mode: no internet connection; cloud features disabled`n"
+    }
+
     & $script:VENV_PYTHON -m behavioral_master
 
     if ($LASTEXITCODE -ne 0) {

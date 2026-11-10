@@ -63,7 +63,8 @@ warnings.filterwarnings("ignore",
 
 SCRIPT_DIR = Path.cwd()
 VIDEO_BASE_DIR = Path(r"D:\Behavioral\DeepLabCut")
-BACKUP_DIR = SCRIPT_DIR / "backup"
+BACKUP_DIR = SCRIPT_DIR / "session data (backup)"
+RECOVERY_DIR = BACKUP_DIR / "_recovery"
 
 ANIMAL_MAP_PATH = SCRIPT_DIR / "animal_map.json"
 ERROR_LOG_PATH = SCRIPT_DIR / "errors.log"
@@ -72,6 +73,146 @@ load_dotenv(SCRIPT_DIR / ".env")
 load_dotenv(SCRIPT_DIR / "rig.env")
 
 OFFLINE_MODE = os.getenv("BCI_OFFLINE", "0").strip() == "1"
+_CONNECTION_LOST = Event()
+_OFFLINE_LOCK = Lock()
+
+
+def _switch_offline(initial=False):
+    global OFFLINE_MODE
+
+    with _OFFLINE_LOCK:
+        if OFFLINE_MODE:
+            return False
+
+        OFFLINE_MODE = True
+        os.environ["BCI_OFFLINE"] = "1"
+
+        if not initial:
+            _CONNECTION_LOST.set()
+
+        if initial:
+            print("[WARNING] No internet connection; starting in offline mode", flush=True)
+        else:
+            print("[WARNING] Internet connection lost; switching to offline mode. "
+                  "Cloud operations disabled for this session.",
+                  flush=True)
+
+        return True
+
+
+def _windows_has_internet():
+    """Check Windows connectivity without contacting an internet server"""
+    if os.name != "nt":
+        return True
+
+    command = (
+        "$p = @(Get-NetConnectionProfile -ErrorAction SilentlyContinue | "
+        "Where-Object { $_.IPv4Connectivity -eq 'Internet' -or "
+        "$_.IPv6Connectivity -eq 'Internet' }); "
+        "if ($p.Count -gt 0) { exit 0 } else { exit 1 }"
+        )
+
+    try:
+        result = subprocess.run(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                command
+                ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            check=False
+            )
+
+        return result.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def _is_connection_error(exc):
+    """Recognize common internet transport failures"""
+    markers = (
+        "connectionerror",
+        "connecttimeout",
+        "readtimeout",
+        "maxretryerror",
+        "newconnectionerror",
+        "name resolution",
+        "failed to establish a new",
+        "network is unreachable",
+        "no route to host",
+        "getaddrinfo failed",
+        "timed out",
+        "connection refused",
+        "connection reset"
+        )
+
+    seen = set()
+    current = exc
+
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+
+        if isinstance(current, (ConnectionError, TimeoutError, socket.gaierror, socket.timeout)):
+            return True
+
+        detail = f"{type(current).__name__}: {current}".lower()
+
+        if any(marker in detail for marker in markers):
+            return True
+
+        current = current.__cause__ or current.__context__
+
+    return False
+
+
+def _handle_cloud_error(exc):
+    """Switch offline after a cloud transport failure"""
+    if OFFLINE_MODE:
+        return _is_connection_error(exc)
+
+    if _is_connection_error(exc) or not _windows_has_internet():
+        _switch_offline()
+        return True
+
+    return False
+
+
+def _require_online():
+    if OFFLINE_MODE:
+        raise ConnectionError("Cloud operations are disabled in offline mode")
+
+
+def _watch_connection(interval_s=5):
+    """Monitor connectivity until the first loss is detected"""
+    while not OFFLINE_MODE:
+        time.sleep(interval_s)
+
+        if OFFLINE_MODE:
+            return
+
+        if not _windows_has_internet():
+            _switch_offline()
+            return
+
+
+def _start_connection_monitor():
+    if OFFLINE_MODE:
+        return
+
+    if not _windows_has_internet():
+        _switch_offline(initial=True)
+        return
+
+    Thread(target=_watch_connection,
+           name="internet-monitor",
+           daemon=True
+           ).start()
+
 
 BAUDRATE = 1_000_000
 EARLY_STRING = "E"
@@ -600,7 +741,11 @@ class TrainerInterface(InterfaceObject):
             if raw.isalnum():
                 if self.system.animal_exists(raw, animal_map):
                     session_data.meta['animal'] = raw
-                    session_data.meta['workbook_id'] = self.system.get_workbook_id(raw, animal_map)
+                    session_data.meta['workbook_id'] = (
+                        None if OFFLINE_MODE
+                        else self.system.get_workbook_id(raw, animal_map)
+                        )
+
                     return True
 
                 print("Please enter a valid animal")
@@ -628,7 +773,6 @@ class TrainerInterface(InterfaceObject):
 
 class DashboardInterface(InterfaceObject):
     interface_name = "dashboard"
-
     MIN_PERF_INTERVAL_S = 5.0   # raise to ~10 if running >4 platforms
 
     def __init__(self, client_id=None):
@@ -646,7 +790,7 @@ class DashboardInterface(InterfaceObject):
         return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
     def _safe_write(self, fields, timestamp=None):
-        if not self.enabled:
+        if not self.enabled or OFFLINE_MODE:
             return
 
         self._q.put(("fields", dict(fields), timestamp or self._utc_iso()))
@@ -716,9 +860,15 @@ class DashboardInterface(InterfaceObject):
 
     @staticmethod
     def _send(label, fcn, *args, **kwargs):
+        if OFFLINE_MODE:
+            return
+
         try:
             fcn(*args, **kwargs)
         except Exception as e:
+            if OFFLINE_MODE or _handle_cloud_error(e):
+                return
+
             print(f"[WARNING] {label} failed: {type(e).__name__}: {e}", flush=True)
 
     def notify_start(self, session_data):
@@ -751,7 +901,7 @@ class DashboardInterface(InterfaceObject):
         self._safe_write({"performance": rate_str}, timestamp=self._utc_iso())
 
     def record_session(self, animal, phase, performance, start_utc=None):
-        if not self.enabled:
+        if not self.enabled or OFFLINE_MODE:
             return
 
         self._q.put(("session",
@@ -759,13 +909,13 @@ class DashboardInterface(InterfaceObject):
                      None))
 
     def record_notification(self, message):
-        if not self.enabled:
+        if not self.enabled or OFFLINE_MODE:
             return
 
         self._q.put(("notification", (message,), None))
 
     def flush(self, timeout_s=90.0):
-        if not self.enabled:
+        if not self.enabled or OFFLINE_MODE:
             return
 
         done = Event()
@@ -1045,6 +1195,9 @@ class EmailInterface(InterfaceObject):
 
             return f'{h12}:{m:02d} {am_pm}'
 
+        if OFFLINE_MODE:
+            return
+
         smtp_username = SystemInterface().require("SMTP_USERNAME")
         smtp_password = SystemInterface().require("SMTP_PASSWORD")
         smtp_to_addr = SystemInterface().require("SMTP_TO_ADDR")
@@ -1105,6 +1258,9 @@ class EmailInterface(InterfaceObject):
                       f"{type(e).__name__}: {e}",
                       flush=True)
 
+        if OFFLINE_MODE:
+            return
+
         with smtplib.SMTP(self.SMTP_SERVER, self.SMTP_PORT, timeout=30) as server:
             server.ehlo()
             server.starttls()
@@ -1120,6 +1276,7 @@ class SaveInterface(InterfaceObject):
 
     def __init__(self):
         self._backup_writer = None
+        self.last_local_path = None
 
     def _build_rows(self, session_data, dtype):
         """
@@ -1231,8 +1388,8 @@ class SaveInterface(InterfaceObject):
         date = str(session_data.meta.get('date', '0000-00-00')).replace('/', '.')
         rand = uuid.uuid4().hex[:6]
 
-        BACKUP_DIR.mkdir(parents=True, exist_ok=True)
-        out_path = BACKUP_DIR / f"date={date}_animal={animal}_phase={phase}_id={rand}.json"
+        RECOVERY_DIR.mkdir(parents=True, exist_ok=True)
+        out_path = RECOVERY_DIR / f"date={date}_animal={animal}_phase={phase}_id={rand}.json"
 
         self._backup_writer = BackupWriter(out_path)
         session_data.meta['_backup_path'] = str(out_path)
@@ -1286,10 +1443,7 @@ class SaveInterface(InterfaceObject):
         if writer is None:
             return
 
-        try:
-            writer.flush_and_stop()
-        except Exception:
-            pass
+        writer.flush_and_stop()
 
         if delete:
             writer.delete()
@@ -1369,6 +1523,8 @@ class SaveInterface(InterfaceObject):
         session_data.overwrite_confirmed = False
 
         while True:
+            _require_online()
+
             workbook_id = session_data.meta.get('workbook_id')
             if not workbook_id:
                 session_data.overwrite_confirmed = True
@@ -1413,6 +1569,8 @@ class SaveInterface(InterfaceObject):
         Returns:
             True when saving completes, or None when no workbook is configured.
         """
+        _require_online()
+
         workbook_id = session_data.meta.get("workbook_id")
 
         if not workbook_id:
@@ -1526,6 +1684,7 @@ class SaveInterface(InterfaceObject):
 
         try:
             lock = FileLock(workbook_id, owner=client_id).acquire()
+            _require_online()
 
             wb = _sheets_client().open_by_key(workbook_id)
             lock.wb = wb
@@ -1538,6 +1697,8 @@ class SaveInterface(InterfaceObject):
                 )
 
             for dtype, sheet_name in sheet_map:
+                _require_online()
+
                 match dtype:
                     case "meta":
                         data_rows = self._build_rows(session_data, "meta")
@@ -1630,14 +1791,18 @@ class SaveInterface(InterfaceObject):
                 print("\r\033[2K", end="", flush=True)
             
             return True
+        except Exception as e:
+            _handle_cloud_error(e)
+            raise
         finally:
-            if lock is not None:
+            if lock is not None and not OFFLINE_MODE:
                 try:
                     lock.release()
                 except Exception as e:
-                    exc_proxy = ExceptionInterface(session_data.meta.get("animal", "UNKNOWN"),
-                                                   session_data.meta.get("phase", "0"))
-                    exc_proxy.log_and_commit(e)
+                    if not _handle_cloud_error(e):
+                        exc_proxy = ExceptionInterface(session_data.meta.get("animal", "UNKNOWN"),
+                                                       session_data.meta.get("phase", "0"))
+                        exc_proxy.log_and_commit(e)
 
     def save_raw(self, session_data):
         """Save raw capacitive sensor data to a local JSON file.
@@ -1692,19 +1857,59 @@ class SaveInterface(InterfaceObject):
         return out_path
 
     def save_local(self, session_data):
-        """Save a complete session JSON and retain the incremental backup"""
+        """
+        Save one completed session per animal, phase, and date
+        """
         if session_data is None:
             raise ValueError("No session data to save")
 
-        self.finish_backup(delete=False)
+        self.last_local_path = None
+        BACKUP_DIR.mkdir(parents=True, exist_ok=True)
 
-        backup_path = Path(session_data.meta['_backup_path'])
-        out_path = backup_path.with_name(f"{backup_path.stem}_complete.json")
-        tmp_path = out_path.with_suffix(".json.tmp")
+        date = str(session_data.meta.get("date", "")).replace("/", ".")
+        animal = str(session_data.meta.get("animal", "UNKNOWN"))
+        phase = str(session_data.meta.get("phase", "0"))
+
+        stem = f"date={date}_animal={animal}_phase={phase}"
+        out_path = BACKUP_DIR / f"{stem}_complete.json"
+
+        legacy = list(BACKUP_DIR.glob(f"{stem}_id=*_complete.json"))
+        existing = [p for p in [out_path, *legacy] if p.is_file()]
+
+        if existing:
+            previous = max(existing, key=lambda p: p.stat().st_mtime)
+
+            try:
+                old_data = json.loads(previous.read_text(encoding="utf-8"))
+                old_duration = float(old_data.get("meta", {}).get("duration_sec"))
+            except (OSError, ValueError, TypeError, AttributeError):
+                old_duration = None
+
+            new_duration = float(session_data.meta.get("duration_sec") or 0)
+            auto_overwrite = (old_duration is not None
+                              and old_duration < self.VALID_SESSION_S
+                              and new_duration > self.VALID_SESSION_S)
+
+            if not auto_overwrite:
+                choice = input("A local session already exists for this animal/phase today.\n"
+                               "Overwrite the earlier session? [y/N]:  ")
+
+                if not _is_affirmative(choice):
+                    self.finish_backup(delete=False)
+                    print("Existing complete session retained; "
+                          f"new recovery data kept in {RECOVERY_DIR}",
+                          flush=True)
+
+                    return None
+
+        payload = session_data.to_dict()
+        payload['meta'].pop("_backup_path", None)
+
+        tmp_path = BACKUP_DIR / f".{stem}_{uuid.uuid4().hex}.tmp"
 
         try:
-            with open(tmp_path, 'w', encoding='utf-8') as f:
-                json.dump(session_data.to_dict(), f, indent=4)
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=4)
                 f.flush()
                 os.fsync(f.fileno())
 
@@ -1713,59 +1918,100 @@ class SaveInterface(InterfaceObject):
             tmp_path.unlink(missing_ok=True)
             raise
 
+        self.last_local_path = out_path
+
+        try:
+            self.finish_backup(delete=True)
+        except Exception as e:
+            print(f"[WARNING] Complete JSON saved, but recovery cleanup failed: {e}",
+                  flush=True)
+
+        for old_path in legacy:
+            try:
+                old_path.unlink(missing_ok=True)
+                old_incremental = old_path.with_name(old_path.name.removesuffix("_complete.json") + ".json")
+                old_incremental.unlink(missing_ok=True)
+            except OSError as e:
+                print(f"[WARNING] Could not remove obsolete backup {old_path}: {e}",
+                      flush=True)
+
         return out_path
 
     def save_session(self, session_data):
         """
-        Save session data to Google Sheets. The local backup file (started
-        in setup() and populated per-trial) is deleted on success and
-        retained on failure -- it now serves the role fallback_save used to.
-
-        Args:
-            session_data: SessionData instance to persist.
-
-        Returns:
-            True when the primary save succeeds, otherwise False.
+        Save to Google Sheets or fall back to complete local JSON
         """
-        animal = session_data.meta.get('animal', 'UNKNOWN') if session_data else 'UNKNOWN'
-        phase = session_data.meta.get('phase', '0') if session_data else '0'
+        animal = session_data.meta.get("animal", "UNKNOWN")
+        phase = session_data.meta.get("phase", "0")
 
         exc_proxy = ExceptionInterface(animal, phase)
+        last_error = None
 
         try:
             attempts = 3
 
             for attempt in range(1, attempts + 1):
-                try:
-                    self.save_data(session_data)
+                if OFFLINE_MODE:
                     break
+
+                try:
+                    if self.save_data(session_data) is not True:
+                        raise RuntimeError("Google Sheets did not confirm a successful save")
+
+                    if OFFLINE_MODE:
+                        break
+
+                    try:
+                        self.finish_backup(delete=True)
+                    except Exception as cleanup_error:
+                        exc_proxy.log(cleanup_error)
+                        print("[WARNING] Google Sheets save succeeded, "
+                              f"but recovery cleanup failed: {cleanup_error}",
+                              flush=True)
+
+                    return True
                 except Exception as e:
-                    if attempt == attempts:
-                        raise
+                    last_error = e
+
+                    if OFFLINE_MODE or _handle_cloud_error(e):
+                        break
+
+                    if attempt == 3:
+                        break
 
                     exc_proxy.log(e)
-                    print(f"\n[WARNING] Sheets save attempt {attempt} failed "
-                          f"({type(e).__name__}); retrying...", flush=True)
+                    print(f"[WARNING] Sheets save attempt {attempt} failed "
+                          f"({type(e).__name__}); retrying...",
+                          flush=True)
+
                     time.sleep(20 * attempt + random.uniform(0, 10))
 
-            self.finish_backup(delete=True)
+            if last_error is not None and not OFFLINE_MODE:
+                exc_proxy.log(last_error)
 
-            return True
+            out_path = self.save_local(session_data)
+
+            if out_path is not None and not OFFLINE_MODE:
+                print(f"[WARNING] Google Sheets save failed; "
+                      f"session saved locally to {out_path}",
+                      flush=True)
+
+            return False
         except Exception as e:
-            try:
-                self.save_local(session_data)
-            except Exception as local_error:
-                self.finish_backup(delete=False)
-                exc_proxy.log(local_error)
-
             exc_proxy.log(e)
+
+            try:
+                self.finish_backup(delete=False)
+            except Exception as cleanup_error:
+                exc_proxy.log(cleanup_error)
 
             return False
         finally:
-            try:
-                exc_proxy.commit()
-            except Exception:
-                pass
+            if not OFFLINE_MODE:
+                try:
+                    exc_proxy.commit()
+                except Exception:
+                    pass
 
 
 class PrairieInterface(InterfaceObject):
@@ -2526,6 +2772,8 @@ class BackupWriter:
         self.path = Path(path)
         self.data = {}
         self.queue = Queue()
+        self.error = None
+        self._stop_requested = False
         self.thread = Thread(target=self._run, daemon=True)
 
         self.thread.start()
@@ -2555,8 +2803,8 @@ class BackupWriter:
             try:
                 self.data[trial_key] = diff
                 self._write()
-            except Exception:
-                pass
+            except Exception as e:
+                self.error = e
             finally:
                 self.queue.task_done()
 
@@ -2564,15 +2812,21 @@ class BackupWriter:
         self.queue.put_nowait((str(trial_n), diff))
 
     def flush_and_stop(self, timeout_s=10.0):
-        self.queue.put_nowait(None)
+        if not self._stop_requested:
+            self._stop_requested = True
+            self.queue.put_nowait(None)
+
         self.thread.join(timeout=timeout_s)
+
+        if self.thread.is_alive():
+            raise TimeoutError("Backup writer did not finish flushing")
+
+        if self.error is not None:
+            raise OSError("Incremental backup write failed") from self.error
 
     def delete(self):
         for p in (self.path, self._tmp_path()):
-            try:
-                p.unlink(missing_ok=True)
-            except Exception:
-                pass
+            p.unlink(missing_ok=True)
 
 
 class FileLock:
@@ -2711,6 +2965,8 @@ class FileLock:
             dur_s: Base sleep duration in seconds.
             jitter_ms: Maximum additional jitter in milliseconds.
         """
+        _require_online()
+
         if dur_s < 0:
             dur_s = 0.0
         
@@ -2718,6 +2974,7 @@ class FileLock:
             dur_s += random.random() * (jitter_ms / 1000.0)
         
         time.sleep(dur_s)
+        _require_online()
 
     def acquire(self):
         """Acquire the workbook lock, waiting until this client owns it.
@@ -2725,6 +2982,8 @@ class FileLock:
         Returns:
             This FileLock instance after acquisition.
         """
+        _require_online()
+
         wb = self._get_resource("workbook")
 
         deadline = time.monotonic() + self.timeout_s
@@ -2837,6 +3096,8 @@ class FileLock:
             return lock.get('owner') == self.owner and lock.get('token') == self.token
 
         while time.monotonic() < deadline:
+            _require_online()
+
             attempt += 1
             print(f'Acquiring lock...[TRIES={attempt}]', flush=True)
 
@@ -2950,6 +3211,8 @@ class FileLock:
         Returns:
             Remaining lock lease time in seconds.
         """
+        _require_online()
+
         remaining = int(self.expires or 0) - _now()
         if remaining >= self.reset_s:
             return remaining
@@ -2975,6 +3238,8 @@ class FileLock:
         Returns:
             Remaining lock lease time in seconds.
         """
+        _require_online()
+
         remaining = int(self.expires or 0) - _now()
         if remaining >= self.reset_s:
             return remaining
@@ -3099,9 +3364,18 @@ def _sync_ntp_offset(server=NTP_SERVER):
     """
     global _NTP_OFFSET
 
+    if OFFLINE_MODE:
+        return False
+
     offset = _query_ntp_offset(server)
+
+    if OFFLINE_MODE:
+        return False
+
     if offset is not None:
         _NTP_OFFSET = offset
+    elif not _windows_has_internet():
+        _switch_offline()
     else:
         print(f"[WARNING] NTP sync with '{server}' failed; timestamps will use the local system clock", flush=True)
 
@@ -3110,8 +3384,12 @@ def _sync_ntp_offset(server=NTP_SERVER):
 
 def _ntp_resync_loop(server=NTP_SERVER, interval_s=600):
     """Background daemon loop: periodically re-sync the NTP offset to correct for local clock drift"""
-    while True:
+    while not OFFLINE_MODE:
         time.sleep(interval_s)
+
+        if OFFLINE_MODE:
+            return
+
         _sync_ntp_offset(server)
 
 
@@ -3371,7 +3649,7 @@ def setup(interfaces=None):
 
         if session_data is not None and session_data.meta.get('_backup_path'):
             try:
-                interfaces.saving.finish_backup(delete=True)
+                interfaces.saving.finish_backup(delete=(not session_data.any_data()))
             except Exception as e2:
                 interfaces.exceptions.cache(e2, 'setup._cleanup')
 
@@ -3906,6 +4184,7 @@ def main(link, session_data, cursor, client=None, camera=None, interfaces=None):
 
 
 if __name__ == "__main__":
+    _start_connection_monitor()
     interfaces = BehaviorInterfaces()
 
     link = None
@@ -3974,33 +4253,66 @@ if __name__ == "__main__":
                 interfaces.saving.finish_backup(delete=True)
             else:
                 try:
+                    local_path = None
+
                     if OFFLINE_MODE:
-                        interfaces.saving.save_raw(session_data)
-                        out_path = interfaces.saving.save_local(session_data)
-                        print(f"Offline session saved to {out_path}", flush=True)
+                        local_path = interfaces.saving.save_local(session_data)
                     elif is_dev:
                         interfaces.saving.finish_backup(delete=True)
                     elif interfaces.user.confirm_save():
-                        if interfaces.saving.resolve_protocol(session_data):
-                            interfaces.saving.save_raw(session_data)
+                        if OFFLINE_MODE:
+                            local_path = interfaces.saving.save_local(session_data)
+                        elif interfaces.saving.resolve_protocol(session_data):
+                            if OFFLINE_MODE:
+                                local_path = interfaces.saving.save_local(session_data)
+                            else:
+                                saved = interfaces.saving.save_session(session_data)
 
-                            ok = interfaces.saving.save_session(session_data)
-                            if not ok:
-                                interfaces.console.warning("Google Sheets save failed (saving locally instead)")
+                                if saved:
+                                    interfaces.saving.save_raw(session_data)
+                                else:
+                                    local_path = interfaces.saving.last_local_path
                         else:
-                            out_path = interfaces.saving.save_local(session_data)
-                            print(f"Google Sheets save skipped; saved locally to {out_path}", flush=True)
+                            local_path = interfaces.saving.save_local(session_data)
                     else:
-                        if interfaces.user.confirm_local_save():
-                            interfaces.saving.save_raw(session_data)
-                            out_path = interfaces.saving.save_local(session_data)
-                            print(f"Session data saved locally to {out_path}", flush=True)
+                        if OFFLINE_MODE or interfaces.user.confirm_local_save():
+                            local_path = interfaces.saving.save_local(session_data)
                         else:
                             interfaces.saving.finish_backup(delete=True)
                             print("Session exited without saving", flush=True)
+
+                    if local_path is not None:
+                        if _CONNECTION_LOST.is_set():
+                            print("[WARNING] Internet connection lost; "
+                                  "session saved locally instead of Google Sheets: "
+                                  f"{local_path}",
+                                  flush=True)
+                        else:
+                            print(f"Session data saved locally to {local_path}", flush=True)
                 except Exception as e:
-                    interfaces.exceptions.cache(e, '__main__.safe_save')
-                    interfaces.saving.finish_backup(delete=False)
+                    cloud_error = _handle_cloud_error(e)
+
+                    if not cloud_error:
+                        interfaces.exceptions.cache(e, '__main__.safe_save')
+
+                    try:
+                        local_path = interfaces.saving.save_local(session_data)
+
+                        if local_path is not None:
+                            if _CONNECTION_LOST.is_set():
+                                print("[WARNING] Internet connection lost; "
+                                      "session saved locally instead of Google Sheets: "
+                                      f"{local_path}",
+                                      flush=True)
+                            else:
+                                print(f"Session data saved locally to {local_path}", flush=True)
+                    except Exception as local_error:
+                        interfaces.exceptions.cache(local_error, '__main__.safe_save')
+
+                        try:
+                            interfaces.saving.finish_backup(delete=False)
+                        except Exception as cleanup_error:
+                            interfaces.exceptions.cache(cleanup_error, '__main__.backup_cleanup')
 
         if session_data is not None:
             interfaces.dashboard.record_session(animal_id_for_log,
@@ -4015,8 +4327,9 @@ if __name__ == "__main__":
                 try:
                     interfaces.email.send_session_summary(session_data)
                 except Exception as e:
-                    interfaces.exceptions.cache(e, '__main__.send_email')
-                    ExceptionInterface(*run_info).log_and_commit(e)
+                    if not (OFFLINE_MODE or _handle_cloud_error(e)):
+                        interfaces.exceptions.cache(e, '__main__.send_email')
+                        ExceptionInterface(*run_info).log_and_commit(e)
 
         interfaces.dashboard.flush()
         interfaces.console.show_exceptions()
