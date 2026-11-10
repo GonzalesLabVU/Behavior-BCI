@@ -29,8 +29,8 @@ class Speaker {
         static constexpr unsigned int MISS_HZ_MIN = 1000;
         static constexpr unsigned int MISS_HZ_MAX = 4000;
 
-        static constexpr unsigned long MISS_STEP_US_MIN = 100;
-        static constexpr unsigned long MISS_STEP_US_MAX = 200;
+        static constexpr unsigned long MISS_STEP_US_MIN = 500;
+        static constexpr unsigned long MISS_STEP_US_MAX = 700;
 
         static constexpr unsigned long TONE_MS = 1000;
 
