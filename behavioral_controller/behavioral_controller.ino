@@ -1521,6 +1521,7 @@ void run_phase_4_plus() {
             if (!phase_timer.started()) {
                 writeSerial("miss");
 
+                speaker.stop();
                 brake.engage();
                 speaker.miss();
 

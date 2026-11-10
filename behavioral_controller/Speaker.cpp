@@ -181,7 +181,15 @@ void Speaker::stopTimer2_() {
 }
 
 void Speaker::onTick_() {
-    drivePin_(!pin_state_);
+    #if defined(ARDUINO_AVR_MEGA2560)
+        PINC = _BV(PC4);
+    #elif defined(ARDUINO_AVR_UNO)
+        PINB = _BV(PB1);
+    #else
+        digitalWrite(SPEAKER_PIN, !pin_state_);
+    #endif
+
+    pin_state_ = !pin_state_;
 
     elapsed_us_ += half_us_;
     since_step_us_ += half_us_;
