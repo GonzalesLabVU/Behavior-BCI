@@ -1904,6 +1904,7 @@ class SaveInterface(InterfaceObject):
 
         payload = session_data.to_dict()
         payload['meta'].pop("_backup_path", None)
+        payload['meta']['client'] = os.getenv("CLIENT_ID")
 
         tmp_path = BACKUP_DIR / f".{stem}_{uuid.uuid4().hex}.tmp"
 
