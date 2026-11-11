@@ -741,9 +741,9 @@ void setup() {
 
     spout.init(pulse_us);
 
-    for (int i = 0; i < 10; i++) {
+    for (int i = 0; i < 25; i++) {
         spout.flush(10);
-        delay(100);
+        delay(150);
     }
 
     lick.init(RAW_FLAG);
