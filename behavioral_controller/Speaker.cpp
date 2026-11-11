@@ -32,7 +32,9 @@ void Speaker::init(const String& side) {
     mode_ = IDLE;
     instance_ = this;
 
-    rng_ = (uint32_t)micros() | 1;
+    rng_ = (uint16_t)micros() | 1;
+
+    buildMissTable_();
 }
 
 void Speaker::cue() {
@@ -123,24 +125,46 @@ void Speaker::startTone_(Mode m, unsigned freq_hz, unsigned long duration_ms) {
 }
 
 void Speaker::startMiss_(unsigned long duration_ms) {
+    nextMissParams_();
+
+    unsigned long target_us = duration_ms * 1000UL;
+
     noInterrupts();
 
     mode_ = MISS;
 
-    uint32_t r = xorshift32_(rng_);
-    unsigned f0 = MISS_HZ_MIN + (r % (MISS_HZ_MAX - MISS_HZ_MIN + 1));
-
-    updateForFreq_(f0);
-
-    step_us_ = MISS_STEP_US_MIN + (xorshift32_(rng_) % (MISS_STEP_US_MAX - MISS_STEP_US_MIN + 1));
-    since_step_us_ = 0;
-
     elapsed_us_ = 0;
-    target_us_ = duration_ms * 1000UL;
+    target_us_ = target_us;
 
     startTimer2_();
 
     interrupts();
+}
+
+void Speaker::buildMissTable_() {
+    const unsigned long span_hz = MISS_HZ_MAX - MISS_HZ_MIN;
+
+    for (uint8_t i = 0; i < MISS_TABLE_SIZE; i++) {
+        unsigned long freq_hz = MISS_HZ_MIN + (span_hz * i) / (MISS_TABLE_SIZE - 1);
+        unsigned long ticks = (500000UL / freq_hz) / 4UL;
+
+        if (ticks < 1UL) ticks = 1UL;
+        if (ticks > 255UL) ticks = 255UL;
+
+        miss_ticks_[i] = (uint8_t)ticks;
+    }
+}
+
+void Speaker::nextMissParams_() {
+    uint16_t r = xorshift16_(rng_);
+
+    uint8_t ticks = miss_ticks_[r & (MISS_TABLE_SIZE - 1)];
+
+    ocr_val_ = ticks - 1;
+    half_us_ = (uint16_t)ticks << 2;
+
+    step_us_ = MISS_STEP_US_MIN + (uint16_t)(((r >> 8) * MISS_STEP_SPAN) >> 8);
+    since_step_us_ = 0;
 }
 
 void Speaker::updateForFreq_(unsigned freq_hz) {
@@ -184,7 +208,7 @@ void Speaker::onTick_() {
     #if defined(ARDUINO_AVR_MEGA2560)
         PINC = _BV(PC4);
     #elif defined(ARDUINO_AVR_UNO)
-        PINB = _BV(PB1);
+        PINB = _BV(PB2);
     #else
         digitalWrite(SPEAKER_PIN, !pin_state_);
     #endif
@@ -195,14 +219,8 @@ void Speaker::onTick_() {
     since_step_us_ += half_us_;
 
     if (mode_ == MISS && since_step_us_ >= step_us_) {
-        unsigned int freq_hz = MISS_HZ_MIN + (xorshift32_(rng_) % (MISS_HZ_MAX - MISS_HZ_MIN + 1));
-
-        updateForFreq_(freq_hz);
-
+        nextMissParams_();
         OCR2A = ocr_val_;
-
-        step_us_ = MISS_STEP_US_MIN + (xorshift32_(rng_) % (MISS_STEP_US_MAX - MISS_STEP_US_MIN + 1));
-        since_step_us_ = 0;
     }
 
     if (elapsed_us_ >= target_us_) {

@@ -29,8 +29,11 @@ class Speaker {
         static constexpr unsigned int MISS_HZ_MIN = 1000;
         static constexpr unsigned int MISS_HZ_MAX = 4000;
 
-        static constexpr unsigned long MISS_STEP_US_MIN = 500;
-        static constexpr unsigned long MISS_STEP_US_MAX = 700;
+        static constexpr unsigned long MISS_STEP_US_MIN = 100;
+        static constexpr unsigned long MISS_STEP_US_MAX = 300;
+        static constexpr uint16_t MISS_STEP_SPAN =
+            (uint16_t)(MISS_STEP_US_MAX - MISS_STEP_US_MIN + 1);
+        static constexpr uint8_t MISS_TABLE_SIZE = 64;
 
         static constexpr unsigned long TONE_MS = 1000;
 
@@ -57,13 +60,18 @@ class Speaker {
         volatile unsigned long step_us_;
         volatile unsigned long since_step_us_;
 
-        volatile uint32_t rng_;
+        volatile uint16_t rng_;
+
+        uint8_t miss_ticks_[MISS_TABLE_SIZE];
 
         void startTone_(Mode m,
                         unsigned freq_hz,
                         unsigned long duration_ms);
 
         void startMiss_(unsigned long duration_ms);
+
+        void buildMissTable_();
+        void nextMissParams_();
 
         void updateForFreq_(unsigned freq_hz);
 
@@ -74,12 +82,12 @@ class Speaker {
 
         inline void drivePin_(bool high);
 
-        static inline uint32_t xorshift32_(volatile uint32_t &s) {
-            uint32_t x = s;
+        static inline uint16_t xorshift16_(volatile uint16_t &s) {
+            uint16_t x = s;
 
-            x ^= x << 13;
-            x ^= x >> 17;
-            x ^= x << 5;
+            x ^= x << 7;
+            x ^= x >> 9;
+            x ^= x << 8;
 
             s = x;
 
